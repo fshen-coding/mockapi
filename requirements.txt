@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests
+PyMySQL
+Faker
+python-dotenv
+pydantic
+websockets
+psycopg[binary]
