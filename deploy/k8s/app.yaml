@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mockapi-data
+  namespace: mockapi
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mockapi
+  namespace: mockapi
+spec:
+  selector:
+    app: mockapi
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockapi
+  namespace: mockapi
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mockapi
+  template:
+    metadata:
+      labels:
+        app: mockapi
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: mockapi
+          image: ghcr.io/fshen1999/mockapi:main
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: mockapi-env
+          env:
+            - name: MOCKAPI_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: MOCKAPI_DATABASE_URL
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 3Gi
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            failureThreshold: 36
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /app/web/data
+            - name: shared-memory
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mockapi-data
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi

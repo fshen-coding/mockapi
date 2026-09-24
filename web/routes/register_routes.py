@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from web.models.requests import (
     Register3plLinkWaitRequest,
     Register3plRedirectRequest,
+    RegisterRemoveTestOfferSuffixRequest,
     RegisterAmazonRedirectRequest,
     RegisterAndRunMultiShopRequest,
     RegisterCreateOfferRequest,
@@ -125,6 +126,7 @@ async def register_create_offer(req: RegisterCreateOfferRequest):
         env=req.env,
         journey=req.journey,
         currency=req.currency,
+        yearly_repayment_amount=req.yearly_repayment_amount,
     )
     if result.get("success"):
         return ApiResponse(success=True, message="offer_id created", data=result)
@@ -139,8 +141,10 @@ async def register_amazon_redirect(req: RegisterAmazonRedirectRequest):
         WebDPUMockService.step_amazon_redirect_web,
         env=req.env,
         offer_id=req.offer_id,
+        phone_number=req.phone_number,
         currency=req.currency,
         funder_resource=req.funder_resource,
+        token=req.token,
     )
     if result.get("success"):
         return ApiResponse(success=True, message="amazon redirect activated", data=result)
@@ -281,10 +285,26 @@ async def register_3pl_redirect(req: Register3plRedirectRequest):
         WebDPUMockService.step_3pl_redirect_web,
         env=req.env,
         phone_number=req.phone_number,
+        currency=req.currency,
+        funder_resource=req.funder_resource,
     )
     if result.get("success"):
         return ApiResponse(success=True, message="3pl redirect ok", data=result)
     return ApiResponse(success=False, message=result.get("error", "3pl redirect failed"), data=result)
+
+
+@router.post("/register/remove-test-offer-suffix", response_model=ApiResponse)
+async def register_remove_test_offer_suffix(req: RegisterRemoveTestOfferSuffixRequest):
+    if req.username is not None:
+        require_valid_username(req.username)
+    result = await asyncio.to_thread(
+        WebDPUMockService.remove_test_offer_suffix_web,
+        env=req.env,
+        phone_number=req.phone_number,
+    )
+    if result.get("success"):
+        return ApiResponse(success=True, message="TESTOFFER suffix removed", data=result)
+    return ApiResponse(success=False, message=result.get("error", "remove TESTOFFER suffix failed"), data=result)
 
 
 @router.post("/register/attach-session-token", response_model=ApiResponse)

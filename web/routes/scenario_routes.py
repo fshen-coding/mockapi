@@ -34,6 +34,15 @@ log = logging.getLogger(__name__)
 # "admin 点保存 → 全员同步" behaviour work without a per-user migration — the
 # admin's own historical rows already live under this key.
 GLOBAL_CONFIG_OWNER = ADMIN_USERNAME
+MOCK_API_CONFIG_SCENARIO = "mockApi"
+MOCK_API_CONFIG_STEPS = {
+    "shop-performance-presets",
+    "dowsure-cny-company-templates",
+}
+
+
+def _is_mock_api_config(scenario_key: str, step_key: str) -> bool:
+    return scenario_key == MOCK_API_CONFIG_SCENARIO and step_key in MOCK_API_CONFIG_STEPS
 
 
 class ScenarioOverrideUpsertRequest(BaseModel):
@@ -305,12 +314,29 @@ def _find_step_source_blocks(endpoint: str) -> list[dict[str, Any]]:
 async def list_scenario_step_overrides(username: Optional[str] = None):
     caller = require_valid_username(username)
     rows = await asyncio.to_thread(audit_store.list_scenario_step_overrides, caller)
+    if caller != GLOBAL_CONFIG_OWNER:
+        global_rows = await asyncio.to_thread(
+            audit_store.list_scenario_step_overrides,
+            GLOBAL_CONFIG_OWNER,
+        )
+        rows = [
+            row
+            for row in rows
+            if not _is_mock_api_config(row.get("scenario_key", ""), row.get("step_key", ""))
+        ]
+        rows.extend(
+            row
+            for row in global_rows
+            if _is_mock_api_config(row.get("scenario_key", ""), row.get("step_key", ""))
+        )
     return ApiResponse(success=True, message=f"{len(rows)} overrides", data=rows)
 
 
 @router.post("", response_model=ApiResponse)
 async def upsert_scenario_step_override(req: ScenarioOverrideUpsertRequest):
     caller = require_valid_username(req.username)
+    if _is_mock_api_config(req.scenario_key, req.step_key):
+        caller = require_admin(req.username)
     try:
         row = await asyncio.to_thread(
             audit_store.upsert_scenario_step_override,
@@ -327,6 +353,8 @@ async def upsert_scenario_step_override(req: ScenarioOverrideUpsertRequest):
 @router.delete("", response_model=ApiResponse)
 async def delete_scenario_step_override(req: ScenarioOverrideDeleteRequest):
     caller = require_valid_username(req.username)
+    if _is_mock_api_config(req.scenario_key, req.step_key):
+        caller = require_admin(req.username)
     ok = await asyncio.to_thread(
         audit_store.delete_scenario_step_override,
         caller,

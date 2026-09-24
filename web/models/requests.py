@@ -69,14 +69,21 @@ class RegisterCreateOfferRequest(BaseModel):
     env: Literal["sit", "uat", "dev", "preprod", "reg", "local"]
     journey: Literal["200K", "500K", "2000K"] = "500K"
     currency: Literal["CNY", "USD"] = "USD"
+    # 显式指定上报给 generate-shop-performance 的年还款额。传入时直接使用该金额，
+    # 忽略 journey 档位映射（DS-CNY 场景固定用 950000）；不传时保持原档位行为。
+    yearly_repayment_amount: Optional[int] = None
     username: Optional[str] = None
 
 
 class RegisterAmazonRedirectRequest(BaseModel):
     env: Literal["sit", "uat", "dev", "preprod", "reg", "local"]
     offer_id: str = Field(..., min_length=1)
+    phone_number: str = Field(..., min_length=8, max_length=20)
     currency: Literal["CNY", "USD"] = "USD"
     funder_resource: Literal["FUNDPARK", "HSBC", "DOWSURE"] = "FUNDPARK"
+    # 用户登录 token，前端在 signup 后透传（${token}）。传入时 amazon/redirect 的
+    # GET/POST 会带上 Authorization: Bearer <token>；未解析/为空则不加该头。
+    token: Optional[str] = None
     username: Optional[str] = None
 
 
@@ -145,6 +152,14 @@ class Register3plLinkWaitRequest(BaseModel):
 class Register3plRedirectRequest(BaseModel):
     env: Literal["sit", "uat", "dev", "preprod", "reg", "local"]
     phone_number: str = Field(..., min_length=8, max_length=20)
+    currency: Optional[Literal["CNY", "USD"]] = None
+    funder_resource: Optional[Literal["FUNDPARK", "HSBC", "DOWSURE"]] = None
+    username: Optional[str] = None
+
+
+class RegisterRemoveTestOfferSuffixRequest(BaseModel):
+    env: Literal["sit", "uat", "dev", "preprod", "reg", "local"]
+    phone_number: str = Field(..., min_length=8, max_length=20)
     username: Optional[str] = None
 
 
@@ -177,20 +192,64 @@ class UnderwrittenRequest(MockBaseRequest):
     use_latest_submitted_limit_application: bool = False
 
 
-class DowsureMerchantAccountLimit(BaseModel):
-    merchantAccountId: str = Field(..., min_length=1)
-    merchantAccountLimit: Optional[float] = Field(None, ge=0)
-
-
-class UnderwrittenDowsureRequest(MockBaseRequest):
-    status: Literal["APPROVED", "REJECTED"]
-    merchant_accounts: list[DowsureMerchantAccountLimit] = Field(default_factory=list)
+class DowsureCreditResultItem(BaseModel):
+    offerId: str = Field(..., min_length=1)
+    sellerId: str = Field(..., min_length=1)
+    amount: float = Field(..., ge=0)
 
 
 class DowsureCreditResultRequest(MockBaseRequest):
-    application_code: str = Field(..., min_length=1)
-    amount: float = Field(..., gt=0)
-    credit_status: Literal["APPROVE", "REJECT"] = "APPROVE"
+    applicationCode: str = Field(..., min_length=1)
+    amount: float = Field(..., ge=0)
+    processingFee: float = Field(0.0, ge=0)
+    creditResultList: list[DowsureCreditResultItem] = Field(default_factory=list)
+
+
+class WebankSellerOffer(BaseModel):
+    applySellerId: str = Field(..., min_length=1)
+    applySellerBusinessSum: float = Field(..., ge=0)
+    sellerSiteCountryName: str = ""
+    admissionStatus: Literal["ADMITTED", "NOT_ADMITTED"] = "ADMITTED"
+
+
+class WebankCreditResultRequest(MockBaseRequest):
+    application_code: Optional[str] = None
+    businessSum: Optional[float] = Field(None, ge=0)
+    seller_offers: list[WebankSellerOffer] = Field(default_factory=list)
+
+
+class CgbCreditResultRequest(MockBaseRequest):
+    application_code: Optional[str] = None
+    amount: float = Field(..., ge=0)
+    processingFee: float = Field(0.0, ge=0)
+    creditStatus: str = Field("APPROVE", min_length=1, max_length=32)
+
+
+class CgbLoanResultRequest(MockBaseRequest):
+    application_code: Optional[str] = None
+    amount: float = Field(..., ge=0)
+    processingFee: float = Field(0.0, ge=0)
+
+
+class CgbRepaymentResultRequest(MockBaseRequest):
+    application_code: Optional[str] = None
+    loan_code: Optional[str] = None
+    payment_principal: float = Field(..., ge=0)
+    payment_interest: float = Field(..., ge=0)
+    payment_overdue_interest: float = Field(..., ge=0)
+
+
+class WebankDrawdownResultRequest(MockBaseRequest):
+    loan_amount: float = Field(..., ge=0)
+    service_fee_amount: float = Field(..., ge=0)
+
+
+class WebankRepaymentResultRequest(MockBaseRequest):
+    loan_code: Optional[str] = None
+    payment_principal: float = Field(..., ge=0)
+    payment_interest: float = Field(..., ge=0)
+    payment_penalty_interest: float = Field(..., ge=0)
+    remain_principal_amount: Optional[float] = Field(None, ge=0)
 
 
 class DowsureEsignDrawdownResultRequest(MockBaseRequest):
@@ -264,6 +323,7 @@ class RepaymentRequest(MockBaseRequest):
 
 class MultiShopBindingRequest(MockBaseRequest):
     state: str = Field(..., min_length=1)
+    platform_seller_id: Optional[str] = None
 
 
 class SpStatusUpdateRequest(MockBaseRequest):
@@ -290,11 +350,21 @@ class FpApplicationStepRequest(MockBaseRequest):
     funder_resource: Optional[Literal["FUNDPARK", "HSBC", "DOWSURE"]] = None
     nameCn: Optional[str] = None
     addressDetail: Optional[str] = None
+    # 企业中文名（business-info 的 bizDetail.cnName）。前端可在参数里选择，
+    # 仅 CNY+DOWSURE 分支使用；不传时保持默认「广州测试科技有限公司」。
+    cnName: Optional[str] = None
+    businessLicenseImageId: Optional[str] = None
+    directorIdFrontImageId: Optional[str] = None
+    directorIdBackImageId: Optional[str] = None
     use_latest_submitted_application: bool = False
 
 
 class ShopPerformanceUpdateRequest(MockBaseRequest):
     offer_id: Optional[str] = None
+    # 准入类型（webank准入 / ccb准入）。目前两者跑同一套经营数据 SQL；
+    # 后续提供 ccb 专属 SQL 后按此字段分支。
+    access_type: Optional[str] = None
+    custom_sql: Optional[str] = None
 
 
 class SystemEventRequest(MockBaseRequest):
@@ -408,6 +478,9 @@ class PromptTemplateExecuteRequest(BaseModel):
     user_input: str = Field(..., min_length=1)
     env: Optional[str] = None
     model: Optional[str] = None
+    # 分列参数：{占位符名: 值}。传入时后端直接机械替换 ${key}，跳过 AI 材料化，
+    # 适合超长脚本（如存储过程）避免 AI 截断/改写。为空时仍走 AI 流程。
+    params: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

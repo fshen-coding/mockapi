@@ -227,11 +227,13 @@ class SessionManager:
 
         try:
             rows = ctx.db_executor.execute_query_all(f"""
-                SELECT lender_loan_id, total_interest_rate, outstanding_amount, repayment_status, created_at, updated_at
+                SELECT lender_loan_id, lender_drawdown_id, total_interest_rate, outstanding_amount, repayment_status, created_at, updated_at
                 FROM dpu_drawdown
                 WHERE merchant_id = {self._sql_literal(ctx.merchant_id)}
-                AND lender_loan_id IS NOT NULL
-                AND lender_loan_id != ''
+                AND (
+                    (lender_loan_id IS NOT NULL AND lender_loan_id != '')
+                    OR (lender_drawdown_id IS NOT NULL AND lender_drawdown_id != '')
+                )
                 ORDER BY created_at DESC
             """)
             if isinstance(rows, dict):
@@ -242,7 +244,10 @@ class SessionManager:
                 "merchant_id": ctx.merchant_id,
                 "rows": rows,
                 "count": len(rows),
-                "default_selected_lender_loan_id": rows[0].get("lender_loan_id") if rows else None,
+                "default_selected_lender_loan_id": (
+                    (rows[0].get("lender_loan_id") or rows[0].get("lender_drawdown_id"))
+                    if rows else None
+                ),
             }
         except Exception as exc:
             log.warning("Query drawdown repayment rows failed | session_id=%s | merchant_id=%s | %s", session_id, ctx.merchant_id, exc)

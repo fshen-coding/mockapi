@@ -2,13 +2,19 @@
 """Web 适配器：将 DPUMockService 的 input() 调用改为参数传入，返回结构化结果"""
 import sys
 import json
+import os
 import random
 import logging
+import re
 import uuid
 import time
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode
+
+import pymysql
 
 # 确保能导入项目根目录的 mock_sit 模块
 _project_root = str(Path(__file__).resolve().parents[3])
@@ -31,11 +37,100 @@ log = logging.getLogger("mock_sit")
 class WebDPUMockService(DPUMockService):
     """Web 适配器：所有 input() 改为方法参数，所有方法返回结构化 dict"""
 
+    # 备用公司名。business-info 选了它时，director-info 自动套用「测近智」法人档案
+    # （身份证正反面走 DOWSURE_CNY_BACKUP_DIRECTOR_ID_*，回落到默认 DIRECTOR_ID_*）。
+    _DOWSURE_BACKUP_COMPANY_CN_NAME = "测广州市昆袄祝山脸从股份有限公司"
+
+    # 仓库内 DOWSURE CNY 测试证件图（营业执照 / 法人身份证正反）。运行时上传到当前
+    # 环境的 dpu-file 网关换取 objectKey，实现全环境自适应，不再依赖 .env 里会过期、
+    # 且绑死单一环境的固定 key。所有 user 共用同一份仓库图片（跟随镜像发布）。
+    _DOWSURE_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "dowsure_cny"
+    _DOWSURE_ASSET_FILES = {
+        "business_license": "business_license.png",
+        "director_id_front": "director_id_front.png",
+        "director_id_back": "director_id_back.png",
+    }
+
+    @staticmethod
+    def _remove_test_offer_suffix(db: DatabaseExecutor, phone_number: str) -> dict:
+        """Remove TESTOFFER from the latest 3PL authorization ID atomically."""
+        suffix = "TESTOFFER"
+        try:
+            db.conn.begin()
+            db.cursor.execute(
+                """
+                SELECT auth.authorization_id
+                FROM dpu_seller_center.dpu_auth_token AS auth
+                JOIN dpu_seller_center.dpu_users AS users
+                  ON users.merchant_id = auth.merchant_id
+                WHERE users.phone_number = %s
+                  AND auth.authorization_party = '3PL'
+                ORDER BY auth.created_at DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (phone_number,),
+            )
+            row = db.cursor.fetchone()
+            if not row or not row[0]:
+                raise ValueError("未找到手机号对应的 3PL authorization_id")
+
+            old_offer_id = str(row[0])
+            if not old_offer_id.endswith(suffix):
+                raise ValueError("3PL authorization_id 不包含 TESTOFFER 后缀")
+            new_offer_id = old_offer_id[:-len(suffix)]
+            if not new_offer_id:
+                raise ValueError("移除 TESTOFFER 后 authorization_id 为空")
+
+            db.cursor.execute(
+                """
+                UPDATE dpu_seller_center.dpu_auth_token
+                SET authorization_id = %s
+                WHERE authorization_id = %s AND authorization_party = '3PL'
+                """,
+                (new_offer_id, old_offer_id),
+            )
+            auth_rows = db.cursor.rowcount
+            db.cursor.execute(
+                """
+                UPDATE dpu_seller_center.dpu_3pl_shop_performance
+                SET amazon_3pl_offer_id = %s
+                WHERE amazon_3pl_offer_id = %s
+                """,
+                (new_offer_id, old_offer_id),
+            )
+            performance_rows = db.cursor.rowcount
+            db.cursor.execute(
+                """
+                UPDATE dpu_seller_center.dpu_shops
+                SET shop_reference_id = %s
+                WHERE shop_reference_id = %s
+                """,
+                (new_offer_id, old_offer_id),
+            )
+            shop_rows = db.cursor.rowcount
+            db.conn.commit()
+            return {
+                "old_offerid": old_offer_id,
+                "new_offerid": new_offer_id,
+                "updated_rows": {
+                    "authorization": auth_rows,
+                    "shop_performance": performance_rows,
+                    "shops": shop_rows,
+                },
+            }
+        except Exception:
+            if db.conn:
+                db.conn.rollback()
+            raise
+
     def __init__(self, phone_number: str, db_executor: DatabaseExecutor):
         # 将类变量覆盖为实例变量，避免多会话并发串扰
         self.selected_application_unique_id: Optional[str] = None
         self.generated_selling_partner_id: Optional[str] = None
         self.session_user_token: str = ""
+        # 已上传证件图的 objectKey 缓存，按 (env, asset) 复用，避免同环境同图重复上传。
+        self._dowsure_asset_cache = {}
         self.cached_lender_repayment_id: Optional[str] = None
         self.dowsure_application_code: Optional[str] = None
         self.dowsure_credit_contract_no: Optional[str] = None
@@ -159,22 +254,34 @@ class WebDPUMockService(DPUMockService):
     def _get_drawdown_info_for_repayment(self, loan_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
         resolved_loan_code = str(loan_code or "").strip()
         if not resolved_loan_code:
-            return self.get_drawdown_info()
+            if not self.merchant_id:
+                return None
+            sql = f"""
+                SELECT merchant_id, loan_id, lender_loan_id, lender_drawdown_id,
+                       outstanding_amount, total_interest_rate
+                FROM dpu_drawdown
+                WHERE merchant_id = {self._sql_literal(self.merchant_id)}
+                ORDER BY created_at DESC LIMIT 1
+            """
+            return self.db_executor.execute_query(sql)
 
         if not self.merchant_id:
             return None
         sql = f"""
-            SELECT merchant_id, loan_id, lender_loan_id, outstanding_amount, total_interest_rate
+            SELECT merchant_id, loan_id, lender_loan_id, lender_drawdown_id, outstanding_amount, total_interest_rate
             FROM dpu_drawdown
             WHERE merchant_id = {self._sql_literal(self.merchant_id)}
-            AND lender_loan_id = {self._sql_literal(resolved_loan_code)}
+            AND (
+                lender_loan_id = {self._sql_literal(resolved_loan_code)}
+                OR lender_drawdown_id = {self._sql_literal(resolved_loan_code)}
+            )
             ORDER BY created_at DESC LIMIT 1
         """
         drawdown_info = self.db_executor.execute_query(sql)
         if drawdown_info:
-            log.info("根据 lender_loan_id 查询放款记录成功: %s", drawdown_info)
+            log.info("根据还款选中 loanCode 查询放款记录成功: %s", drawdown_info)
         else:
-            log.error("未查询到指定放款记录 | merchant_id=%s | lender_loan_id=%s", self.merchant_id, resolved_loan_code)
+            log.error("未查询到指定放款记录 | merchant_id=%s | loanCode=%s", self.merchant_id, resolved_loan_code)
         return drawdown_info
 
     def _wait_for_drawdown_submitted(
@@ -422,7 +529,65 @@ class WebDPUMockService(DPUMockService):
             return manual_offer_row.get("platform_offer_id")
         return None
 
-    def update_shop_performance_cny_boost_web(self, offer_id: Optional[str] = None) -> dict:
+    @staticmethod
+    def _normalize_shop_performance_custom_sql(custom_sql: str, resolved_offer_id: str) -> tuple[bool, str, str]:
+        sql = (custom_sql or "").strip()
+        if not sql:
+            return False, "", "custom_sql is empty"
+        sql = sql.replace("${platform_offer_id}", resolved_offer_id).replace("${offer_id}", resolved_offer_id).strip()
+        if sql.endswith(";"):
+            sql = sql[:-1].strip()
+        if ";" in sql:
+            return False, sql, "自定义 SQL 只允许单条 UPDATE，不能包含多个语句。"
+        compact_sql = re.sub(r"\s+", " ", sql).strip()
+        if not re.match(r"^UPDATE\s+(?:dpu_seller_center\.)?dpu_3pl_shop_performance\s+SET\s+", compact_sql, re.IGNORECASE):
+            return False, sql, "自定义 SQL 必须更新 dpu_seller_center.dpu_3pl_shop_performance 表。"
+        if not re.search(r"\sWHERE\s+", compact_sql, re.IGNORECASE):
+            return False, sql, "自定义 SQL 必须包含 WHERE 条件。"
+        if not re.search(r"\bamazon_3pl_offer_id\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^\s,)]+)", compact_sql, re.IGNORECASE):
+            return False, sql, "WHERE 条件必须使用 amazon_3pl_offer_id = '...' 限定目标店铺。"
+        forbidden = re.search(r"\b(DELETE|INSERT|REPLACE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|CALL)\b", compact_sql, re.IGNORECASE)
+        if forbidden:
+            return False, sql, f"自定义 SQL 不允许包含 {forbidden.group(1).upper()}。"
+        runtime_offer_literal = "'" + str(resolved_offer_id).replace("\\", "\\\\").replace("'", "''") + "'"
+        sql = re.sub(
+            r"(\bamazon_3pl_offer_id\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s,)]+)",
+            lambda match: f"{match.group(1)}{runtime_offer_literal}",
+            sql,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return True, sql, ""
+
+    @staticmethod
+    def _explain_shop_performance_sql_error(exc: Exception) -> dict:
+        raw_error = str(exc)
+        lower_error = raw_error.lower()
+        suggestions = []
+        if "unknown column" in lower_error:
+            suggestions.append("字段名不存在或拼写不一致，请核对 dpu_3pl_shop_performance 表字段。")
+        if "syntax" in lower_error:
+            suggestions.append("SQL 语法错误，请确认 SET 字段之间使用英文逗号，字符串使用单引号。")
+        if "doesn't exist" in lower_error or "does not exist" in lower_error:
+            suggestions.append("表名或库名不存在，请确认使用 dpu_seller_center.dpu_3pl_shop_performance。")
+        if "truncated" in lower_error or "incorrect" in lower_error:
+            suggestions.append("字段类型不匹配，请确认数值字段不要传字符串，枚举/日期格式符合数据库要求。")
+        if "safe update" in lower_error:
+            suggestions.append("数据库开启安全更新，请确认 WHERE amazon_3pl_offer_id 条件存在且能命中记录。")
+        if not suggestions:
+            suggestions.append("请先检查 SQL 是否为单条 UPDATE，WHERE 是否限定 amazon_3pl_offer_id，字段名和字段类型是否正确。")
+        return {
+            "title": "数据库执行失败解析",
+            "raw_error": raw_error,
+            "suggestions": suggestions,
+        }
+
+    def update_shop_performance_cny_boost_web(
+        self,
+        offer_id: Optional[str] = None,
+        access_type: Optional[str] = None,
+        custom_sql: Optional[str] = None,
+    ) -> dict:
         resolved_offer_id = self._resolve_latest_platform_offer_id(offer_id)
         if not resolved_offer_id:
             return {
@@ -431,93 +596,599 @@ class WebDPUMockService(DPUMockService):
                 "offer_id": offer_id,
             }
 
-        sql = f"""
-UPDATE dpu_3pl_shop_performance
-SET
-    amazon_tenure = 1825,
-    marketplace_country = 'US',
-    primary_product_category = 'Electronics',
-    seller_status = 'NORMAL',
-    report_card_data_date = '2026-05-18 00:00:00',
-    year1_sales_value = 4000000.00,
-    year2_sales_value = 3500000.00,
-    year1_disbursements_value = 3800000.00,
-    year2_disbursements_value = 3200000.00,
-    quarter1_sales_value = 1210000.00,
-    quarter2_sales_value = 1020000.00,
-    quarter3_sales_value = 930000.00,
-    quarter4_sales_value = 870000.00,
-    quarter5_sales_value = 810000.00,
-    quarter6_sales_value = 750000.00,
-    quarter7_sales_value = 700000.00,
-    quarter8_sales_value = 650000.00,
-    quarter1_disbursements_value = 1150000.00,
-    quarter2_disbursements_value = 960000.00,
-    quarter3_disbursements_value = 880000.00,
-    quarter4_disbursements_value = 820000.00,
-    quarter5_disbursements_value = 760000.00,
-    quarter6_disbursements_value = 700000.00,
-    quarter7_disbursements_value = 650000.00,
-    quarter8_disbursements_value = 600000.00,
-    month1_sales_value = 440000.00,
-    month2_sales_value = 400000.00,
-    month3_sales_value = 370000.00,
-    month4_sales_value = 340000.00,
-    month5_sales_value = 310000.00,
-    month6_sales_value = 290000.00,
-    month7_sales_value = 270000.00,
-    month8_sales_value = 250000.00,
-    month9_sales_value = 230000.00,
-    month10_sales_value = 215000.00,
-    month11_sales_value = 200000.00,
-    month12_sales_value = 190000.00,
-    month1_disbursements_value = 420000.00,
-    month2_disbursements_value = 380000.00,
-    month3_disbursements_value = 350000.00,
-    month4_disbursements_value = 320000.00,
-    month5_disbursements_value = 300000.00,
-    month6_disbursements_value = 280000.00,
-    month7_disbursements_value = 260000.00,
-    month8_disbursements_value = 240000.00,
-    month9_disbursements_value = 220000.00,
-    month10_disbursements_value = 200000.00,
-    month11_disbursements_value = 190000.00,
-    month12_disbursements_value = 180000.00,
-    week1_sales_value = 125000.75,
-    week2_sales_value = 118000.00,
-    week3_sales_value = 110000.00,
-    week4_sales_value = 105000.00,
-    week5_sales_value = 98000.00,
-    week6_sales_value = 92000.00,
-    week1_disbursements_value = 118500.20,
-    week2_disbursements_value = 105000.00,
-    week3_disbursements_value = 98000.00,
-    week4_disbursements_value = 112000.00,
-    week5_disbursements_value = 95000.00,
-    week6_disbursements_value = 88000.00,
-    last13week_fba_rate = 85.5,
-    last3month_fba_inventory_value = 120000.00,
-    latest_fba_inventory_value = 115000.00,
-    primary_category_last3month_sales_value = 54000.10,
-    ttm_cancellations = 12,
-    ttm_feedback = 320,
-    ttm_late_shipments = 8,
-    ttm_negative_feedback = 9,
-    ttm_order_defects = 3,
-    ttm_orders = 1520,
-    ttm_returns = 45,
-    ttm_seller_warnings = 1,
-    updated_at = NOW()
-WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
-"""
+        offer_literal = self._sql_literal(resolved_offer_id)
+        normalized_access = (access_type or "").strip() or "webank准入ccb准入"
+        if custom_sql and custom_sql.strip():
+            is_valid, sql, validation_error = self._normalize_shop_performance_custom_sql(custom_sql, resolved_offer_id)
+            if not is_valid:
+                return {
+                    "success": False,
+                    "error": validation_error,
+                    "ai_error_analysis": {
+                        "title": "自定义 SQL 校验失败",
+                        "raw_error": validation_error,
+                        "suggestions": [
+                            "请提供单条 UPDATE dpu_seller_center.dpu_3pl_shop_performance 语句。",
+                            "必须包含 WHERE amazon_3pl_offer_id = '真实 offerId'。",
+                        ],
+                    },
+                    "offer_id": resolved_offer_id,
+                    "custom_sql": sql,
+                }
+            try:
+                self.db_executor.execute_sql(sql)
+            except Exception as exc:  # noqa: BLE001 - return analysis to UI
+                return {
+                    "success": False,
+                    "error": f"自定义 SQL 执行失败: {exc}",
+                    "ai_error_analysis": self._explain_shop_performance_sql_error(exc),
+                    "offer_id": resolved_offer_id,
+                    "custom_sql": sql,
+                }
+            return {
+                "success": True,
+                "offer_id": resolved_offer_id,
+                "access_type": normalized_access,
+                "access_type_effective": False,
+                "custom_sql_used": True,
+                "updated_table": "dpu_3pl_shop_performance",
+                "where": {"amazon_3pl_offer_id": resolved_offer_id},
+                "sql": sql.strip(),
+            }
+
+        # webank准入ccb准入：正常准入的经营数据（大额，真实店铺数据，NORMAL）。
+        webank_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 380000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 450,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+        # webank不准入ccb准入：webank 通过、ccb 不通过（小额、真实店铺数据、NORMAL）。
+        webank_only_set_clause = """SET amazon_tenure = 98915, last13week_fba_rate = 500,
+    last3month_fba_inventory_value = 304274, latest_fba_inventory_value = 3318967,
+    primary_category_last3month_sales_value = 32400,
+    marketplace_country = 'US', primary_product_category = 'Home Improvement',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 250000, year1_disbursements_value = 225000,
+    year2_sales_value = 0, year2_disbursements_value = 0,
+    quarter1_sales_value = 192631, quarter2_sales_value = 219249,
+    quarter3_sales_value = 54549.5, quarter4_sales_value = 0,
+    quarter5_sales_value = 0, quarter6_sales_value = 0,
+    quarter7_sales_value = 0, quarter8_sales_value = 0,
+    quarter1_disbursements_value = 185000, quarter2_disbursements_value = 205000,
+    quarter3_disbursements_value = 52000, quarter4_disbursements_value = 0,
+    quarter5_disbursements_value = 0, quarter6_disbursements_value = 0,
+    quarter7_disbursements_value = 0, quarter8_disbursements_value = 0,
+    month1_sales_value = 87312.5, month2_sales_value = 31739.5,
+    month3_sales_value = 58134.5, month4_sales_value = 83489,
+    month5_sales_value = 88879, month6_sales_value = 40981.5,
+    month7_sales_value = 45176.5, month8_sales_value = 29368.5,
+    month9_sales_value = 1348.5, month10_sales_value = 0,
+    month11_sales_value = 0, month12_sales_value = 0,
+    month1_disbursements_value = 84000, month2_disbursements_value = 30500,
+    month3_disbursements_value = 56000, month4_disbursements_value = 80000,
+    month5_disbursements_value = 85000, month6_disbursements_value = 39000,
+    month7_disbursements_value = 43000, month8_disbursements_value = 28000,
+    month9_disbursements_value = 1500, month10_disbursements_value = 0,
+    month11_disbursements_value = 0, month12_disbursements_value = 0,
+    week1_sales_value = 20341, week2_sales_value = 37790,
+    week3_sales_value = 11643, week4_sales_value = 17538.5,
+    week5_sales_value = 16195.5, week6_sales_value = 3248,
+    week1_disbursements_value = 19500, week2_disbursements_value = 36000,
+    week3_disbursements_value = 11000, week4_disbursements_value = 16500,
+    week5_disbursements_value = 15000, week6_disbursements_value = 3000,
+    ttm_orders = 17750, ttm_cancellations = 10, ttm_returns = 160,
+    ttm_feedback = 10, ttm_negative_feedback = 0,
+    ttm_late_shipments = 0, ttm_order_defects = 0, ttm_seller_warnings = 0"""
+
+        # webank不准入ccb不准入：两侧都拒绝（year1_disbursements 异常偏低=40000000）。
+        both_fail_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 40000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 450,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+
+        # 店铺7：销售/放款均为大额健康数据，但账号状态 SUSPENDED（封停）。
+        # 真实店铺样本，放款按真实月/周值，seller_status=SUSPENDED 是与其它分支的本质区别。
+        suspended_high_sales_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'SUSPENDED', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 380000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 450,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+
+        # 店铺5：大额健康数据，seller_status=NORMAL（与店铺7数值一致，仅状态不同）。真实店铺样本。
+        shop5_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 380000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 450,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+
+        # 店铺6：小额、近一年有销售、seller_status=NORMAL。真实店铺样本（销售逐月衰减到0）。
+        shop6_set_clause = """SET amazon_tenure = 98915, last13week_fba_rate = 500,
+    last3month_fba_inventory_value = 304274, latest_fba_inventory_value = 3318967,
+    primary_category_last3month_sales_value = 32400,
+    marketplace_country = 'US', primary_product_category = 'Home Improvement',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 932859, year1_disbursements_value = 900000,
+    year2_sales_value = 0, year2_disbursements_value = 0,
+    quarter1_sales_value = 192631, quarter2_sales_value = 219249,
+    quarter3_sales_value = 54549.5, quarter4_sales_value = 0,
+    quarter5_sales_value = 0, quarter6_sales_value = 0,
+    quarter7_sales_value = 0, quarter8_sales_value = 0,
+    quarter1_disbursements_value = 185000, quarter2_disbursements_value = 205000,
+    quarter3_disbursements_value = 52000, quarter4_disbursements_value = 0,
+    quarter5_disbursements_value = 0, quarter6_disbursements_value = 0,
+    quarter7_disbursements_value = 0, quarter8_disbursements_value = 0,
+    month1_sales_value = 87312.5, month2_sales_value = 31739.5,
+    month3_sales_value = 58134.5, month4_sales_value = 83489,
+    month5_sales_value = 88879, month6_sales_value = 40981.5,
+    month7_sales_value = 45176.5, month8_sales_value = 29368.5,
+    month9_sales_value = 1348.5, month10_sales_value = 0,
+    month11_sales_value = 0, month12_sales_value = 0,
+    month1_disbursements_value = 84000, month2_disbursements_value = 30500,
+    month3_disbursements_value = 56000, month4_disbursements_value = 80000,
+    month5_disbursements_value = 85000, month6_disbursements_value = 39000,
+    month7_disbursements_value = 43000, month8_disbursements_value = 28000,
+    month9_disbursements_value = 1500, month10_disbursements_value = 0,
+    month11_disbursements_value = 0, month12_disbursements_value = 0,
+    week1_sales_value = 20341, week2_sales_value = 37790,
+    week3_sales_value = 11643, week4_sales_value = 17538.5,
+    week5_sales_value = 16195.5, week6_sales_value = 3248,
+    week1_disbursements_value = 19500, week2_disbursements_value = 36000,
+    week3_disbursements_value = 11000, week4_disbursements_value = 16500,
+    week5_disbursements_value = 15000, week6_disbursements_value = 3000,
+    ttm_orders = 17750, ttm_cancellations = 10, ttm_returns = 160,
+    ttm_feedback = 10, ttm_negative_feedback = 0,
+    ttm_late_shipments = 0, ttm_order_defects = 0, ttm_seller_warnings = 0"""
+
+
+        # 店铺9：与店铺5数值一致，但 year1_disbursements=40000000（放款/销售严重不匹配），NORMAL。
+        shop9_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 40000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 450,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+
+        # 店铺11：与店铺5数值一致（大额、真实放款、NORMAL），但 ttm_returns=40000（退货异常）。
+        shop11_set_clause = """SET amazon_tenure = 666125, last13week_fba_rate = 427.5,
+    last3month_fba_inventory_value = 1200000, latest_fba_inventory_value = 11500000,
+    primary_category_last3month_sales_value = 5400010,
+    marketplace_country = 'US', primary_product_category = 'Electronics',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 400000000, year1_disbursements_value = 380000000,
+    year2_sales_value = 350000000, year2_disbursements_value = 320000000,
+    quarter1_sales_value = 60500000, quarter2_sales_value = 51000000,
+    quarter3_sales_value = 46500000, quarter4_sales_value = 43500000,
+    quarter5_sales_value = 40500000, quarter6_sales_value = 37500000,
+    quarter7_sales_value = 35000000, quarter8_sales_value = 32500000,
+    quarter1_disbursements_value = 57500000, quarter2_disbursements_value = 48000000,
+    quarter3_disbursements_value = 44000000, quarter4_disbursements_value = 41000000,
+    quarter5_disbursements_value = 38000000, quarter6_disbursements_value = 35000000,
+    quarter7_disbursements_value = 32500000, quarter8_disbursements_value = 30000000,
+    month1_sales_value = 22000000, month2_sales_value = 20000000,
+    month3_sales_value = 18500000, month4_sales_value = 17000000,
+    month5_sales_value = 15500000, month6_sales_value = 14500000,
+    month7_sales_value = 13500000, month8_sales_value = 12500000,
+    month9_sales_value = 11500000, month10_sales_value = 10750000,
+    month11_sales_value = 10000000, month12_sales_value = 9500000,
+    month1_disbursements_value = 21000000, month2_disbursements_value = 19000000,
+    month3_disbursements_value = 17500000, month4_disbursements_value = 16000000,
+    month5_disbursements_value = 15000000, month6_disbursements_value = 14000000,
+    month7_disbursements_value = 13000000, month8_disbursements_value = 12000000,
+    month9_disbursements_value = 11000000, month10_disbursements_value = 10000000,
+    month11_disbursements_value = 9500000, month12_disbursements_value = 9000000,
+    week1_sales_value = 6250037.5, week2_sales_value = 5900000,
+    week3_sales_value = 5500000, week4_sales_value = 5250000,
+    week5_sales_value = 4900000, week6_sales_value = 4600000,
+    week1_disbursements_value = 5925010, week2_disbursements_value = 5250000,
+    week3_disbursements_value = 4900000, week4_disbursements_value = 5600000,
+    week5_disbursements_value = 4750000, week6_disbursements_value = 4400000,
+    ttm_orders = 76000, ttm_cancellations = 120, ttm_returns = 40000,
+    ttm_feedback = 3200, ttm_negative_feedback = 90,
+    ttm_late_shipments = 80, ttm_order_defects = 30, ttm_seller_warnings = 5"""
+
+
+        # 店铺12：与店铺6数值一致（小额、衰减、NORMAL），但 ttm_returns=10000（退货异常）。
+        shop12_set_clause = """SET amazon_tenure = 98915, last13week_fba_rate = 500,
+    last3month_fba_inventory_value = 304274, latest_fba_inventory_value = 3318967,
+    primary_category_last3month_sales_value = 32400,
+    marketplace_country = 'US', primary_product_category = 'Home Improvement',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 932859, year1_disbursements_value = 900000,
+    year2_sales_value = 0, year2_disbursements_value = 0,
+    quarter1_sales_value = 192631, quarter2_sales_value = 219249,
+    quarter3_sales_value = 54549.5, quarter4_sales_value = 0,
+    quarter5_sales_value = 0, quarter6_sales_value = 0,
+    quarter7_sales_value = 0, quarter8_sales_value = 0,
+    quarter1_disbursements_value = 185000, quarter2_disbursements_value = 205000,
+    quarter3_disbursements_value = 52000, quarter4_disbursements_value = 0,
+    quarter5_disbursements_value = 0, quarter6_disbursements_value = 0,
+    quarter7_disbursements_value = 0, quarter8_disbursements_value = 0,
+    month1_sales_value = 87312.5, month2_sales_value = 31739.5,
+    month3_sales_value = 58134.5, month4_sales_value = 83489,
+    month5_sales_value = 88879, month6_sales_value = 40981.5,
+    month7_sales_value = 45176.5, month8_sales_value = 29368.5,
+    month9_sales_value = 1348.5, month10_sales_value = 0,
+    month11_sales_value = 0, month12_sales_value = 0,
+    month1_disbursements_value = 84000, month2_disbursements_value = 30500,
+    month3_disbursements_value = 56000, month4_disbursements_value = 80000,
+    month5_disbursements_value = 85000, month6_disbursements_value = 39000,
+    month7_disbursements_value = 43000, month8_disbursements_value = 28000,
+    month9_disbursements_value = 1500, month10_disbursements_value = 0,
+    month11_disbursements_value = 0, month12_disbursements_value = 0,
+    week1_sales_value = 20341, week2_sales_value = 37790,
+    week3_sales_value = 11643, week4_sales_value = 17538.5,
+    week5_sales_value = 16195.5, week6_sales_value = 3248,
+    week1_disbursements_value = 19500, week2_disbursements_value = 36000,
+    week3_disbursements_value = 11000, week4_disbursements_value = 16500,
+    week5_disbursements_value = 15000, week6_disbursements_value = 3000,
+    ttm_orders = 17750, ttm_cancellations = 10, ttm_returns = 10000,
+    ttm_feedback = 10, ttm_negative_feedback = 0,
+    ttm_late_shipments = 0, ttm_order_defects = 0, ttm_seller_warnings = 0"""
+
+
+        # 店铺14：小额、逐月单调递减、近一年销售、NORMAL。真实店铺样本。
+        shop14_set_clause = """SET amazon_tenure = 98915, last13week_fba_rate = 500,
+    last3month_fba_inventory_value = 304274, latest_fba_inventory_value = 3318967,
+    primary_category_last3month_sales_value = 28500,
+    marketplace_country = 'US', primary_product_category = 'Home Improvement',
+    seller_status = 'NORMAL', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 90000, year1_disbursements_value = 75000,
+    year2_sales_value = 0, year2_disbursements_value = 0,
+    quarter1_sales_value = 28500, quarter2_sales_value = 24000,
+    quarter3_sales_value = 19500, quarter4_sales_value = 15000,
+    quarter5_sales_value = 0, quarter6_sales_value = 0,
+    quarter7_sales_value = 0, quarter8_sales_value = 0,
+    quarter1_disbursements_value = 25500, quarter2_disbursements_value = 21000,
+    quarter3_disbursements_value = 16500, quarter4_disbursements_value = 12000,
+    quarter5_disbursements_value = 0, quarter6_disbursements_value = 0,
+    quarter7_disbursements_value = 0, quarter8_disbursements_value = 0,
+    month1_sales_value = 10000, month2_sales_value = 9500,
+    month3_sales_value = 9000, month4_sales_value = 8500,
+    month5_sales_value = 8000, month6_sales_value = 7500,
+    month7_sales_value = 7000, month8_sales_value = 6500,
+    month9_sales_value = 6000, month10_sales_value = 5500,
+    month11_sales_value = 5000, month12_sales_value = 4500,
+    month1_disbursements_value = 9000, month2_disbursements_value = 8500,
+    month3_disbursements_value = 8000, month4_disbursements_value = 7500,
+    month5_disbursements_value = 7000, month6_disbursements_value = 6500,
+    month7_disbursements_value = 6000, month8_disbursements_value = 5500,
+    month9_disbursements_value = 5000, month10_disbursements_value = 4500,
+    month11_disbursements_value = 4000, month12_disbursements_value = 3500,
+    week1_sales_value = 2500, week2_sales_value = 2400,
+    week3_sales_value = 2300, week4_sales_value = 2200,
+    week5_sales_value = 2100, week6_sales_value = 2000,
+    week1_disbursements_value = 2200, week2_disbursements_value = 2100,
+    week3_disbursements_value = 2000, week4_disbursements_value = 1900,
+    week5_disbursements_value = 1800, week6_disbursements_value = 1700,
+    ttm_orders = 17750, ttm_cancellations = 10, ttm_returns = 160,
+    ttm_feedback = 10, ttm_negative_feedback = 0,
+    ttm_late_shipments = 0, ttm_order_defects = 0, ttm_seller_warnings = 0"""
+
+
+        # 店铺16：与店铺14数值一致（小额、逐月递减），但 seller_status=SUSPENDED（封停）。
+        shop16_set_clause = """SET amazon_tenure = 98915, last13week_fba_rate = 500,
+    last3month_fba_inventory_value = 304274, latest_fba_inventory_value = 3318967,
+    primary_category_last3month_sales_value = 28500,
+    marketplace_country = 'US', primary_product_category = 'Home Improvement',
+    seller_status = 'SUSPENDED', report_card_data_date = '2026-07-22 00:00:00',
+    year1_sales_value = 90000, year1_disbursements_value = 75000,
+    year2_sales_value = 0, year2_disbursements_value = 0,
+    quarter1_sales_value = 28500, quarter2_sales_value = 24000,
+    quarter3_sales_value = 19500, quarter4_sales_value = 15000,
+    quarter5_sales_value = 0, quarter6_sales_value = 0,
+    quarter7_sales_value = 0, quarter8_sales_value = 0,
+    quarter1_disbursements_value = 25500, quarter2_disbursements_value = 21000,
+    quarter3_disbursements_value = 16500, quarter4_disbursements_value = 12000,
+    quarter5_disbursements_value = 0, quarter6_disbursements_value = 0,
+    quarter7_disbursements_value = 0, quarter8_disbursements_value = 0,
+    month1_sales_value = 10000, month2_sales_value = 9500,
+    month3_sales_value = 9000, month4_sales_value = 8500,
+    month5_sales_value = 8000, month6_sales_value = 7500,
+    month7_sales_value = 7000, month8_sales_value = 6500,
+    month9_sales_value = 6000, month10_sales_value = 5500,
+    month11_sales_value = 5000, month12_sales_value = 4500,
+    month1_disbursements_value = 9000, month2_disbursements_value = 8500,
+    month3_disbursements_value = 8000, month4_disbursements_value = 7500,
+    month5_disbursements_value = 7000, month6_disbursements_value = 6500,
+    month7_disbursements_value = 6000, month8_disbursements_value = 5500,
+    month9_disbursements_value = 5000, month10_disbursements_value = 4500,
+    month11_disbursements_value = 4000, month12_disbursements_value = 3500,
+    week1_sales_value = 2500, week2_sales_value = 2400,
+    week3_sales_value = 2300, week4_sales_value = 2200,
+    week5_sales_value = 2100, week6_sales_value = 2000,
+    week1_disbursements_value = 2200, week2_disbursements_value = 2100,
+    week3_disbursements_value = 2000, week4_disbursements_value = 1900,
+    week5_disbursements_value = 1800, week6_disbursements_value = 1700,
+    ttm_orders = 17750, ttm_cancellations = 10, ttm_returns = 160,
+    ttm_feedback = 10, ttm_negative_feedback = 0,
+    ttm_late_shipments = 0, ttm_order_defects = 0, ttm_seller_warnings = 0"""
+
+        if normalized_access == "webank不准入ccb准入":
+            set_clause = webank_only_set_clause
+        elif normalized_access == "webank准入ccb不准入":
+            # 与 webank准入ccb准入 相同，仅 ttm_returns 提高到 40000（退货异常触发 ccb 拒绝）。
+            set_clause = webank_set_clause.replace(
+                "ttm_returns = 450", "ttm_returns = 40000"
+            )
+        elif normalized_access == "webank不准入ccb不准入":
+            set_clause = both_fail_set_clause
+        elif normalized_access == "店铺7":
+            set_clause = suspended_high_sales_set_clause
+        elif normalized_access == "店铺5":
+            set_clause = shop5_set_clause
+        elif normalized_access == "店铺6":
+            set_clause = shop6_set_clause
+        elif normalized_access == "店铺8":
+            # 店铺8 与店铺6 数据一致，仅名称不同（复用 shop6_set_clause）。
+            set_clause = shop6_set_clause
+        elif normalized_access == "店铺9":
+            set_clause = shop9_set_clause
+        elif normalized_access == "店铺10":
+            # 店铺10 与店铺7 数据一致，仅名称不同（复用 suspended_high_sales_set_clause）。
+            set_clause = suspended_high_sales_set_clause
+        elif normalized_access == "店铺11":
+            set_clause = shop11_set_clause
+        elif normalized_access == "店铺12":
+            set_clause = shop12_set_clause
+        elif normalized_access == "店铺13":
+            # 店铺13 与店铺7 数据一致，仅名称不同（复用 suspended_high_sales_set_clause）。
+            set_clause = suspended_high_sales_set_clause
+        elif normalized_access == "店铺14":
+            set_clause = shop14_set_clause
+        elif normalized_access == "店铺15":
+            # 店铺15 与店铺14 数据一致，仅名称不同（复用 shop14_set_clause）。
+            set_clause = shop14_set_clause
+        elif normalized_access == "店铺16":
+            set_clause = shop16_set_clause
+        else:
+            # webank准入ccb准入 共用大额准入数据
+            set_clause = webank_set_clause
+
+        sql = (
+            "UPDATE dpu_3pl_shop_performance\n"
+            f"{set_clause}\n"
+            f"WHERE amazon_3pl_offer_id = {offer_literal}\n"
+        )
         self.db_executor.execute_sql(sql)
         return {
             "success": True,
             "offer_id": resolved_offer_id,
+            "access_type": normalized_access,
             "updated_table": "dpu_3pl_shop_performance",
             "where": {"amazon_3pl_offer_id": resolved_offer_id},
             "sql": sql.strip(),
         }
+
+    @classmethod
+    def list_shop_performance_builtin_presets_web(cls) -> list[dict]:
+        access_types = [
+            "webank准入ccb准入",
+            "webank不准入ccb准入",
+            "webank准入ccb不准入",
+            "webank不准入ccb不准入",
+            "店铺5",
+            "店铺6",
+            "店铺7",
+            "店铺8",
+            "店铺9",
+            "店铺10",
+            "店铺11",
+            "店铺12",
+            "店铺13",
+            "店铺14",
+            "店铺15",
+            "店铺16",
+        ]
+        placeholder_offer_id = "__PLATFORM_OFFER_ID__"
+
+        class _NoopDatabase:
+            @staticmethod
+            def execute_sql(sql: str):
+                return None
+
+        service = cls.__new__(cls)
+        service.db_executor = _NoopDatabase()
+        service._resolve_latest_platform_offer_id = lambda offer_id=None: placeholder_offer_id
+
+        presets = []
+        for access_type in access_types:
+            result = service.update_shop_performance_cny_boost_web(
+                offer_id=placeholder_offer_id,
+                access_type=access_type,
+            )
+            sql = str(result.get("sql") or "").replace(
+                f"'{placeholder_offer_id}'",
+                "'${platform_offer_id}'",
+            )
+            presets.append({
+                "name": access_type,
+                "custom_sql": sql,
+            })
+        return presets
+
+    def check_kiosk_seller_id_web(self, offer_id=None, timeout_seconds=300, interval_seconds=5):
+        resolved_offer_id = self._resolve_latest_platform_offer_id(offer_id)
+        if not resolved_offer_id:
+            return {"success": False, "error": "no offerId from previous steps", "offer_id": offer_id}
+        sql = ("SELECT seller_id FROM dpu_kiosk_query_record "
+               f"WHERE offer_id = {self._sql_literal(resolved_offer_id)} LIMIT 1")
+        deadline = time.time() + max(int(timeout_seconds), interval_seconds)
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                seller_id = self.db_executor.execute_sql(sql)
+            except Exception as exc:
+                return {"success": False, "error": f"query dpu_kiosk_query_record failed: {exc}",
+                        "offer_id": resolved_offer_id, "sql": sql, "attempts": attempts}
+            if seller_id is not None and str(seller_id).strip():
+                return {"success": True, "offer_id": resolved_offer_id, "seller_id": str(seller_id).strip(),
+                        "queried_table": "dpu_kiosk_query_record", "sql": sql, "attempts": attempts}
+            if time.time() >= deadline:
+                return {"success": False, "retryable": True, "retry_after": 15,
+                        "error": "timeout: dpu_kiosk_query_record has no seller_id for this offer yet",
+                        "offer_id": resolved_offer_id, "sql": sql, "attempts": attempts}
+            time.sleep(max(int(interval_seconds), 1))
 
     def ensure_application_context_web(
         self,
@@ -737,10 +1408,161 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
             "x-hsbc-countrycode": "ISO 3166-1 alpha-2",
         }, None
 
+    def _upload_dowsure_asset(
+        self,
+        asset: str,
+        common_headers: Optional[dict],
+        image_template_id: Optional[str] = None,
+    ) -> dict:
+        """把仓库内的 DOWSURE 证件图上传到当前环境的 dpu-file 网关，返回 objectKey + url。
+
+        用当前 session 的鉴权头（common_headers 里的 Authorization）上传，所以自动落到
+        当前环境（uat 传 uat、reg 传 reg），全环境自适应。同一 (env, asset) 在进程内只
+        上传一次，结果缓存复用。失败抛 RuntimeError，让上层步骤明确报错。
+        """
+        env = self.db_executor.env
+        selected_template_id = str(image_template_id or "").strip()
+        if selected_template_id.startswith("builtin:"):
+            selected_template_id = ""
+
+        filename = ""
+        content_type = "image/png"
+        file_data = None
+        source_version = "builtin"
+        if selected_template_id:
+            from web.services.audit_store import audit_store
+
+            try:
+                template_id = int(selected_template_id)
+            except ValueError as exc:
+                raise RuntimeError(f"图片模板 ID 无效: {selected_template_id}") from exc
+            image_template = audit_store.get_company_image_template(template_id)
+            if not image_template:
+                raise RuntimeError(f"图片模板不存在: {selected_template_id}")
+            if image_template.get("image_type") != asset:
+                raise RuntimeError(
+                    f"图片模板类型不匹配: 需要 {asset}，实际 {image_template.get('image_type')}"
+                )
+            filename = str(image_template.get("filename") or "image.png")
+            content_type = str(image_template.get("content_type") or "image/png")
+            file_data = image_template.get("file_data")
+            source_version = f"{selected_template_id}:{image_template.get('updated_at', '')}"
+
+        cache_key = (env, asset, source_version)
+        cached = self._dowsure_asset_cache.get(cache_key)
+        if cached and cached.get("file_key"):
+            return cached
+
+        file_path = None
+        if file_data is None:
+            filename = self._DOWSURE_ASSET_FILES.get(asset)
+            if not filename:
+                raise RuntimeError(f"未知的 DOWSURE 证件图: {asset}")
+            file_path = self._DOWSURE_ASSET_DIR / filename
+            if not file_path.is_file():
+                raise RuntimeError(f"仓库缺少证件图文件: {file_path}")
+
+        upload_url = f"{self.api_config.base_url}/dpu-file/files/upload/addFile"
+        # 复用申请单鉴权头，但去掉 content-type，交给 requests 生成 multipart boundary。
+        upload_headers = {k: v for k, v in (common_headers or {}).items() if k.lower() != "content-type"}
+        try:
+            if file_data is not None:
+                resp = http_requests.post(
+                    upload_url,
+                    headers=upload_headers,
+                    files={"files": (filename, file_data, content_type)},
+                    timeout=60,
+                )
+            else:
+                with open(file_path, "rb") as fh:
+                    resp = http_requests.post(
+                        upload_url,
+                        headers=upload_headers,
+                        files={"files": (filename, fh, content_type)},
+                        timeout=60,
+                    )
+        except http_requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"上传 {asset} 到 {upload_url} 失败: {exc}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"上传 {asset} 返回 HTTP {resp.status_code}: {(resp.text or '')[:300]}")
+        try:
+            payload = resp.json()
+        except Exception:
+            raise RuntimeError(f"上传 {asset} 响应非 JSON: {(resp.text or '')[:300]}")
+
+        file_key = self._extract_upload_object_key(payload)
+        if not file_key:
+            raise RuntimeError(f"上传 {asset} 未解析出 objectKey: {json.dumps(payload, ensure_ascii=False)[:300]}")
+        url = self._extract_upload_url(payload) or (
+            f"{self.api_config.base_url.split('//')[-1]}"  # 占位，仅在无 url 时退化
+        )
+        result = {
+            "file_key": file_key,
+            "url": url or "",
+            "filename": filename,
+            "content_type": content_type,
+        }
+        self._dowsure_asset_cache[cache_key] = result
+        return result
+
+    @staticmethod
+    def _extract_upload_object_key(payload) -> str:
+        key_names = ("objectKey", "fileKey", "object_key", "file_key", "key")
+
+        def _from_dict(d):
+            for name in key_names:
+                v = d.get(name)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        if isinstance(payload, dict):
+            direct = _from_dict(payload)
+            if direct:
+                return direct
+            data = payload.get("data")
+            if isinstance(data, dict):
+                nested = _from_dict(data)
+                if nested:
+                    return nested
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return _from_dict(data[0])
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return _from_dict(payload[0])
+        return ""
+
+    @staticmethod
+    def _extract_upload_url(payload) -> str:
+        url_names = ("url", "fileUrl", "thumbnailUrl", "presignedUrl")
+
+        def _from_dict(d):
+            for name in url_names:
+                v = d.get(name)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return ""
+
+        if isinstance(payload, dict):
+            direct = _from_dict(payload)
+            if direct:
+                return direct
+            data = payload.get("data")
+            if isinstance(data, dict):
+                return _from_dict(data)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return _from_dict(data[0])
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return _from_dict(payload[0])
+        return ""
+
     def _build_business_info_payload(
         self,
         currency: Optional[str] = None,
         funder_resource: Optional[str] = None,
+        cn_name: Optional[str] = None,
+        common_headers: Optional[dict] = None,
+        company_template: Optional[dict] = None,
+        business_license_image_id: Optional[str] = None,
     ) -> dict:
         if (currency or self.preferred_currency or "").upper() == "USD" and (funder_resource or "").upper() == "HSBC":
             # DMF (HSBC + USD) 注册场景下的邓白氏 business-info 提交。regNo 需要
@@ -774,22 +1596,68 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
                 "clear": True,
             }
         if (currency or self.preferred_currency or "").upper() == "CNY" and (funder_resource or "").upper() == "DOWSURE":
+            # 运行时把仓库内营业执照图上传到当前环境，拿该环境的 objectKey（全环境自适应）。
+            # 上传失败或拿不到鉴权头时，回落到 .env 里的固定 key，保证不中断流程。
+            business_license_file_key = ""
+            business_license_url = ""
+            business_license_filename = ""
+            try:
+                uploaded = self._upload_dowsure_asset(
+                    "business_license",
+                    common_headers,
+                    business_license_image_id,
+                )
+                business_license_file_key = uploaded.get("file_key", "")
+                business_license_url = uploaded.get("url", "")
+                business_license_filename = str(uploaded.get("filename") or "").strip()
+            except Exception as exc:
+                if business_license_image_id and not str(business_license_image_id).startswith("builtin:"):
+                    raise
+                log.warning("business_license 运行时上传失败，回落到 .env key: %s", exc)
+            if not business_license_file_key:
+                business_license_file_key = os.getenv("DOWSURE_CNY_BUSINESS_LICENSE_FILE_KEY", "").strip()
+            if not business_license_file_key:
+                raise RuntimeError("营业执照上传失败且未配置 DOWSURE_CNY_BUSINESS_LICENSE_FILE_KEY")
+            if not business_license_url:
+                business_license_url = os.getenv("DOWSURE_CNY_BUSINESS_LICENSE_URL", "").strip() or (
+                    "https://s3-dpu-sit.s3.ap-east-1.amazonaws.com/"
+                    f"{business_license_file_key}"
+                )
+            template = company_template if isinstance(company_template, dict) else {}
+            effective_cn_name = str(template.get("cnName") or cn_name or "").strip() or "广州测试科技有限公司"
+            # 记录本次 business-info 选择的公司名，供 director-info 自动跟随
+            # （选了备用公司则套用「测近智」法人档）。
+            self._dowsure_selected_company_cn_name = effective_cn_name
+            # 企业地址跟随公司：备用公司→甘肃省兰州市盘快饺题路247号301，默认→广州市天河区测试路1号。
+            is_backup_company = effective_cn_name == self._DOWSURE_BACKUP_COMPANY_CN_NAME
+            default_business_address = "甘肃省兰州市盘快饺题路247号301" if is_backup_company else "广州市天河区测试路1号"
+            business_address = str(template.get("address") or "").strip() or default_business_address
+            # 注册号跟随公司：备用公司→914401000747111984，默认→91440101MA5D6YRJ0X。
+            default_business_reg_no = "914401000747111984" if is_backup_company else "91440101MA5D6YRJ0X"
+            business_reg_no = str(template.get("regNo") or "").strip() or default_business_reg_no
+            contact_number = template.get("contactNumber") if isinstance(template.get("contactNumber"), dict) else {}
             return {
                 "step": "2",
                 "isDraft": False,
                 "data": {
                     "bizDetail": {
-                        "enName": "",
-                        "cnName": "广州测试科技有限公司",
-                        "regNo": "91440101MA5D6YRJ0X",
+                        "enName": str(template.get("enName") or ""),
+                        "cnName": effective_cn_name,
+                        "regNo": business_reg_no,
                         "contactNumber": {
-                            "countryCode": "+86",
+                            "countryCode": str(contact_number.get("countryCode") or "+86"),
                             "number": self.phone_number,
                         },
-                        "address": "广州市天河区测试路1号",
-                        "operationAddressFlag": True,
-                        "operationAddress": "",
+                        "address": business_address,
+                        "operationAddressFlag": template.get("operationAddressFlag") is not False,
+                        "operationAddress": str(template.get("operationAddress") or ""),
                         "id": "bac1c4e04d86407c8927b1fe9e072859",
+                        "businessDocName": (
+                            business_license_filename
+                            or str(template.get("businessDocName") or "营业执照.png")
+                        ),
+                        "businessLicenseFileKey": business_license_file_key,
+                        "businessLicenseUrl": business_license_url,
                     },
                 },
                 "clear": False,
@@ -845,13 +1713,23 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         journey: Optional[str] = None,
         currency: Optional[str] = None,
         funder_resource: Optional[str] = None,
+        cn_name: Optional[str] = None,
+        company_template: Optional[dict] = None,
+        business_license_image_id: Optional[str] = None,
     ) -> dict:
         steps = []
         common_headers, error = self._application_headers_or_error(steps, currency, funder_resource)
         if error:
             return error
         business_info_url = f"{self.api_config.base_url}/dpu-merchant/fundpark-application/business-info"
-        business_info_payload = self._build_business_info_payload(currency, funder_resource)
+        business_info_payload = self._build_business_info_payload(
+            currency,
+            funder_resource,
+            cn_name,
+            common_headers,
+            company_template,
+            business_license_image_id,
+        )
         business_info_result = self._do_post_custom(
             business_info_url,
             "提交 business-info",
@@ -954,13 +1832,25 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         funder_resource: Optional[str] = None,
         name_cn: Optional[str] = None,
         address_detail: Optional[str] = None,
+        director_template: Optional[dict] = None,
+        director_id_front_image_id: Optional[str] = None,
+        director_id_back_image_id: Optional[str] = None,
     ) -> dict:
         steps = []
         common_headers, error = self._application_headers_or_error(steps, currency, funder_resource)
         if error:
             return error
         director_info_url = f"{self.api_config.base_url}/dpu-merchant/fundpark-application/director-info"
-        director_info_payload = self._build_director_info_payload(currency, funder_resource, name_cn, address_detail)
+        director_info_payload = self._build_director_info_payload(
+            currency,
+            funder_resource,
+            name_cn,
+            address_detail,
+            common_headers,
+            director_template,
+            director_id_front_image_id,
+            director_id_back_image_id,
+        )
         director_info_result = self._do_post_custom(
             director_info_url,
             "提交 director-info",
@@ -1912,6 +2802,8 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         self,
         currency: Optional[str] = None,
         funder_resource: Optional[str] = None,
+        name_cn: Optional[str] = None,
+        contact_template: Optional[dict] = None,
     ) -> dict:
         """DMF (HSBC USD) 第 13 步：提交联系人信息。
 
@@ -1922,6 +2814,50 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         common_headers, error = self._application_headers_or_error(steps, currency, funder_resource)
         if error:
             return error
+
+        if (currency or self.preferred_currency or "").upper() == "CNY" and (funder_resource or "").upper() == "DOWSURE":
+            url = f"{self.api_config.base_url}/dpu-merchant/fundpark-application/contact-person"
+            template = contact_template if isinstance(contact_template, dict) else {}
+            # 联系人姓名/手机号沿用 director-info 缓存的法人信息：备用公司→测近智/19443548216，
+            # 默认公司→奉晓慧/18374816332。缓存缺失（例如跳过了 director-info）时，
+            # 按 business-info 选择的公司回落到对应固定手机号，两套都不使用注册手机号。
+            selected_company = getattr(self, "_dowsure_selected_company_cn_name", "") or ""
+            is_backup_company = selected_company.strip() == self._DOWSURE_BACKUP_COMPANY_CN_NAME
+            contact_mobile = (
+                str(template.get("mobileNumber") or "").strip()
+                or
+                getattr(self, "_dowsure_contact_mobile", "")
+                or ("19443548216" if is_backup_company else "18374816332")
+            )
+            contact_name = (
+                name_cn
+                or str(template.get("fullChineseName") or "").strip()
+                or getattr(self, "_dowsure_contact_name", "")
+            )
+            payload = {
+                "isDraft": bool(template.get("isDraft", False)),
+                "isExistingPerson": bool(template.get("isExistingPerson", False)),
+                "selectedPersonId": str(template.get("selectedPersonId") or ""),
+                "fullChineseName": contact_name,
+                "email": str(template.get("email") or "").strip() or f"{contact_mobile}@qq.com",
+                "mobileNumber": contact_mobile,
+                "phoneCountryCode": str(template.get("phoneCountryCode") or "+86"),
+            }
+            result = self._do_post_custom(
+                url,
+                "提交 contact-person",
+                json_data=payload,
+                headers=common_headers,
+            )
+            steps.append({
+                "step": "fundpark-application.contact-person",
+                "endpoint": url,
+                "payload": payload,
+                "result": result,
+            })
+            if not result.get("success"):
+                return {"success": False, "error": "contact-person 失败", "steps": steps}
+            return {"success": True, "application_unique_id": self.application_unique_id, "steps": steps}
 
         persons = getattr(self, "_dmf_director_persons", None) or []
         nature_person_id = (persons[0]["id"] if persons else str(uuid.uuid4()))
@@ -2395,6 +3331,10 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         funder_resource: Optional[str] = None,
         name_cn: Optional[str] = None,
         address_detail: Optional[str] = None,
+        common_headers: Optional[dict] = None,
+        director_template: Optional[dict] = None,
+        director_id_front_image_id: Optional[str] = None,
+        director_id_back_image_id: Optional[str] = None,
     ) -> dict:
         if (currency or self.preferred_currency or "").upper() == "USD" and (funder_resource or "").upper() == "HSBC":
             # DMF (HSBC + USD) 提交两名董事/股东（60% / 40%）。手机号与邮箱
@@ -2515,28 +3455,129 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
             }
 
         if (currency or self.preferred_currency or "").upper() == "CNY" and (funder_resource or "").upper() == "DOWSURE":
+            template = director_template if isinstance(director_template, dict) else {}
+            template_extend = (
+                template.get("dowsurePersonInfoExtend")
+                if isinstance(template.get("dowsurePersonInfoExtend"), dict)
+                else {}
+            )
+            # director-info 自动跟随 business-info 选择的公司：选了备用公司
+            # 「测广州市昆袄祝山脸从股份有限公司」就套用法人「测近智」这套档案。
+            selected_company = getattr(self, "_dowsure_selected_company_cn_name", "") or ""
+            is_backup_company = selected_company.strip() == self._DOWSURE_BACKUP_COMPANY_CN_NAME
+
+            if is_backup_company:
+                # 备用法人「测近智」档案（身份证图信息：出生1971.8.5、有效期2025.8.10-长期）。
+                default_name_cn = "测近智"
+                default_id_number = "620100197108054266"
+                default_date_of_birth = "05/08/1971"
+                default_id_card_start_date = "10/08/2025"
+                default_address_detail = "甘肃省兰州市盘快饺题路247号301"
+            else:
+                default_name_cn = "奉晓慧"
+                default_id_number = "431121199611248750"
+                default_date_of_birth = "03/06/2026"
+                default_id_card_start_date = "02/06/2026"
+                default_address_detail = "广州市天河区测试路1号"
+
+            resolved_name_cn = name_cn or str(template.get("nameCn") or "").strip() or default_name_cn
+            id_number = str(template_extend.get("idNumber") or "").strip() or default_id_number
+            date_of_birth = str(template.get("dateOfBirth") or "").strip() or default_date_of_birth
+            id_card_start_date = (
+                str(template_extend.get("idCardStartDate") or "").strip()
+                or default_id_card_start_date
+            )
+            resolved_address_detail = (
+                address_detail
+                or str(template_extend.get("addressDetail") or "").strip()
+                or default_address_detail
+            )
+            default_director_mobile = "19443548216" if is_backup_company else "18374816332"
+            template_mobile = template.get("mobileNumber") if isinstance(template.get("mobileNumber"), dict) else {}
+            director_mobile = str(template_mobile.get("number") or "").strip() or default_director_mobile
+
+            # 运行时把仓库内身份证正反图上传到当前环境换 objectKey（全环境自适应）；
+            # 备用与默认公司共用同一套「测近智」证件图。上传失败回落到 .env 固定 key。
+            front_file_key = ""
+            back_file_key = ""
+            front_doc_name = ""
+            back_doc_name = ""
+            try:
+                front_uploaded = self._upload_dowsure_asset(
+                    "director_id_front",
+                    common_headers,
+                    director_id_front_image_id,
+                )
+                back_uploaded = self._upload_dowsure_asset(
+                    "director_id_back",
+                    common_headers,
+                    director_id_back_image_id,
+                )
+                front_file_key = front_uploaded.get("file_key", "")
+                back_file_key = back_uploaded.get("file_key", "")
+                front_doc_name = str(front_uploaded.get("filename") or "").strip()
+                back_doc_name = str(back_uploaded.get("filename") or "").strip()
+            except Exception as exc:
+                selected_custom_image = any(
+                    image_id and not str(image_id).startswith("builtin:")
+                    for image_id in (director_id_front_image_id, director_id_back_image_id)
+                )
+                if selected_custom_image:
+                    raise
+                log.warning("director 身份证运行时上传失败，回落到 .env key: %s", exc)
+            if not front_file_key:
+                front_file_key = (
+                    os.getenv("DOWSURE_CNY_BACKUP_DIRECTOR_ID_FRONT_FILE_KEY", "").strip()
+                    or os.getenv("DOWSURE_CNY_DIRECTOR_ID_FRONT_FILE_KEY", "").strip()
+                )
+            if not back_file_key:
+                back_file_key = (
+                    os.getenv("DOWSURE_CNY_BACKUP_DIRECTOR_ID_BACK_FILE_KEY", "").strip()
+                    or os.getenv("DOWSURE_CNY_DIRECTOR_ID_BACK_FILE_KEY", "").strip()
+                )
+
+            if not front_file_key or not back_file_key:
+                raise RuntimeError(
+                    "身份证图上传失败且未配置 DOWSURE_CNY_DIRECTOR_ID_FRONT_FILE_KEY 或 "
+                    "DOWSURE_CNY_DIRECTOR_ID_BACK_FILE_KEY"
+                )
+            self._dowsure_contact_name = resolved_name_cn
+            # 缓存法人手机号，供后续 contact-person 步骤复用（与 director-info 一致）。
+            self._dowsure_contact_mobile = director_mobile
             return {
                 "step": "2",
                 "isDraft": False,
                 "data": {
                     "persons": [
                         {
-                            "position": "LEGAL_REPRESENTATIVE",
-                            "nameCn": "奉晓慧",
-                            "nameEn": "hui",
+                            "position": str(template.get("position") or "DIRECTOR_AND_LEGAL_REPRESENTATIVE"),
+                            "nameCn": resolved_name_cn,
+                            "nameEn": str(template.get("nameEn") or ""),
                             "mobileNumber": {
-                                "countryCode": "+86",
-                                "number": "18374816332",
+                                "countryCode": str(template_mobile.get("countryCode") or "+86"),
+                                "number": director_mobile,
                             },
                             "dowsurePersonInfoExtend": {
-                                "idNumber": "431121199611248750",
-                                "idCardStartDate": "02/06/2026",
-                                "idCardEndDate": "",
-                                "longTermFlag": "true",
-                                "addressDetail": address_detail or "           ",
+                                "idNumber": id_number,
+                                "idCardStartDate": id_card_start_date,
+                                "idCardEndDate": str(template_extend.get("idCardEndDate") or ""),
+                                "longTermFlag": str(template_extend.get("longTermFlag") or "true"),
+                                "addressDetail": resolved_address_detail,
                             },
-                            "dateOfBirth": "03/06/2026",
-                            "id": "73f006d1f66b4a18ac0ff3789055d33e",
+                            "dateOfBirth": date_of_birth,
+                            "frontDocName": (
+                                front_doc_name
+                                or str(template.get("frontDocName") or "身份证正面.png")
+                            ),
+                            "backDocName": (
+                                back_doc_name
+                                or str(template.get("backDocName") or "身份证反面.png")
+                            ),
+                            "idDocumentFrontUrl": front_file_key,
+                            "idDocumentBackUrl": back_file_key,
+                            "emailAddress": str(template.get("emailAddress") or "").strip() or f"{director_mobile}@qq.com",
+                            "idDocumentType": str(template.get("idDocumentType") or "PRC_RESIDENT_ID_CARD"),
+                            "id": str(uuid.uuid4()),
                         }
                     ],
                     "guarantorList": [],
@@ -3257,79 +4298,116 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
     # ======================== 2. 核保 ========================
 
     def get_dowsure_merchant_accounts(self) -> dict:
-        """Return the latest SP merchant accounts available for DOWSURE underwriting."""
-        auth_rows = self.db_executor.execute_query_all(
-            "SELECT authorization_id, merchant_account_id, status, created_at, updated_at "
+        """Return DOWSURE offer rows used by creditResultList."""
+        if not self.merchant_id:
+            return {"success": False, "error": "当前 session 没有 merchant_id，无法反查 DOWSURE 店铺 sellerId"}
+
+        tpl_token_sql = (
+            "SELECT authorization_id AS dpu_offer_id, merchant_account_id "
             "FROM dpu_auth_token "
             f"WHERE merchant_id = {self._sql_literal(self.merchant_id)} "
-            "AND authorization_party = 'SP' "
+            "AND authorization_party IN ('3PL', 'DPU_3PL') "
             "AND authorization_id IS NOT NULL "
-            "AND authorization_id != '' "
+            "AND authorization_id <> '' "
+            "AND merchant_account_id IS NOT NULL "
+            "AND merchant_account_id <> '' "
             "ORDER BY created_at DESC"
         )
-        accounts = []
-        seen_authorization_ids = set()
-        for row in auth_rows or []:
-            authorization_id = row.get("authorization_id")
-            if not authorization_id or authorization_id in seen_authorization_ids:
-                continue
-            seen_authorization_ids.add(authorization_id)
-            merchant_account_id = row.get("merchant_account_id")
-            limit_row = None
-            if merchant_account_id:
-                limit_row = self.db_executor.execute_query(
-                    "SELECT merchant_account_id, created_at, updated_at "
-                    "FROM dpu_merchant_account_limit "
-                    f"WHERE merchant_id = {self._sql_literal(self.merchant_id)} "
-                    f"AND merchant_account_id = {self._sql_literal(merchant_account_id)} "
-                    "ORDER BY created_at DESC LIMIT 1"
-                )
-            if not limit_row:
-                limit_row = self.db_executor.execute_query(
-                    "SELECT merchant_account_id, created_at, updated_at "
-                    "FROM dpu_merchant_account_limit "
-                    f"WHERE merchant_id = {self._sql_literal(self.merchant_id)} "
-                    f"AND merchant_account_id = {self._sql_literal(authorization_id)} "
-                    "ORDER BY created_at DESC LIMIT 1"
-                )
-            resolved_merchant_account_id = (
-                (limit_row or {}).get("merchant_account_id")
-                or merchant_account_id
-                or ""
-            )
-            accounts.append({
-                "merchantAccountId": authorization_id,
-                "merchant_account_id": resolved_merchant_account_id,
-                "status": row.get("status"),
-                "created_at": row.get("created_at"),
-                "updated_at": (limit_row or {}).get("updated_at") or row.get("updated_at"),
-                "merchantAccountLimit": None,
-            })
+        tpl_rows = self.db_executor.execute_query_all(tpl_token_sql) or []
+        if isinstance(tpl_rows, dict):
+            tpl_rows = [tpl_rows]
 
-        if not accounts:
-            limit_rows = self.db_executor.execute_query_all(
-                "SELECT merchant_account_id, created_at, updated_at "
-                "FROM dpu_merchant_account_limit "
-                f"WHERE merchant_id = {self._sql_literal(self.merchant_id)} "
-                "AND merchant_account_id IS NOT NULL "
-                "AND merchant_account_id != '' "
-                "ORDER BY created_at DESC"
-            )
-            for row in limit_rows or []:
-                merchant_account_id = row.get("merchant_account_id")
-                if not merchant_account_id:
-                    continue
-                accounts.append({
-                    "merchantAccountId": merchant_account_id,
-                    "merchant_account_id": merchant_account_id,
-                    "created_at": row.get("created_at"),
-                    "updated_at": row.get("updated_at"),
-                    "merchantAccountLimit": None,
-                })
+        dpu_offer_id_by_account = {}
+        merchant_account_ids = []
+        for row in tpl_rows:
+            merchant_account_id = str(row.get("merchant_account_id") or "").strip()
+            dpu_offer_id = str(row.get("dpu_offer_id") or "").strip()
+            if merchant_account_id and dpu_offer_id and merchant_account_id not in dpu_offer_id_by_account:
+                dpu_offer_id_by_account[merchant_account_id] = dpu_offer_id
+                merchant_account_ids.append(merchant_account_id)
+
+        if not merchant_account_ids:
+            return {
+                "success": True,
+                "merchant_id": self.merchant_id,
+                "source_sql": tpl_token_sql,
+                "accounts": [],
+                "count": 0,
+                "warning": "当前 merchant_id 未查询到 3PL/DPU_3PL dpu_auth_token，无法通过 DPU offerId 反查 merchant_account_id",
+            }
+
+        sp_token_sql = (
+            "SELECT merchant_account_id, authorization_id AS seller_id, status "
+            "FROM dpu_auth_token "
+            f"WHERE merchant_id = {self._sql_literal(self.merchant_id)} "
+            "AND merchant_account_id IN ("
+            + ", ".join(self._sql_literal(account_id) for account_id in merchant_account_ids)
+            + ") "
+            "AND authorization_party = 'SP' "
+            "AND authorization_id IS NOT NULL "
+            "AND authorization_id <> '' "
+            "ORDER BY merchant_account_id, (status = 'ACTIVE') DESC, updated_at DESC, created_at DESC"
+        )
+        sp_rows = self.db_executor.execute_query_all(sp_token_sql) or []
+        if isinstance(sp_rows, dict):
+            sp_rows = [sp_rows]
+
+        seller_id_by_account = {}
+        account_id_by_seller = {}
+        for row in sp_rows:
+            merchant_account_id = str(row.get("merchant_account_id") or "").strip()
+            seller_id = str(row.get("seller_id") or "").strip()
+            if merchant_account_id and seller_id and merchant_account_id not in seller_id_by_account:
+                seller_id_by_account[merchant_account_id] = seller_id
+                account_id_by_seller.setdefault(seller_id, merchant_account_id)
+
+        if not account_id_by_seller:
+            return {
+                "success": True,
+                "merchant_id": self.merchant_id,
+                "source_sql": {"dpu_3pl_token_sql": tpl_token_sql, "sp_token_sql": sp_token_sql},
+                "accounts": [],
+                "count": 0,
+                "warning": "已通过 DPU offerId 查询到 merchant_account_id，但未查询到对应 SP sellerId",
+            }
+
+        seller_ids = list(account_id_by_seller.keys())
+        dowsure_offer_sql = (
+            "SELECT offer_id, seller_id "
+            "FROM dsb_seller_center.t_offer "
+            "WHERE offer_source = 'DPU_3PL' "
+            "AND seller_id IN ("
+            + ", ".join(self._sql_literal(seller_id) for seller_id in seller_ids)
+            + ") "
+            "ORDER BY create_time DESC LIMIT 50"
+        )
+        dowsure_offer_rows = self._query_dowsure_seller_center(dowsure_offer_sql)
+
+        seen_offer_ids = set()
+        accounts = []
+        for row in dowsure_offer_rows or []:
+            offer_id = str(row.get("offer_id") or "").strip()
+            seller_id = str(row.get("seller_id") or "").strip()
+            merchant_account_id = account_id_by_seller.get(seller_id, "")
+            if not offer_id or not seller_id or offer_id in seen_offer_ids:
+                continue
+            seen_offer_ids.add(offer_id)
+            accounts.append({
+                "offerId": offer_id,
+                "sellerId": seller_id,
+                "amount": 100000,
+                "merchantAccountId": merchant_account_id,
+                "dpuOfferId": dpu_offer_id_by_account.get(merchant_account_id, ""),
+            })
 
         return {
             "success": True,
             "merchant_id": self.merchant_id,
+            "source_sql": {
+                "dpu_3pl_token_sql": tpl_token_sql,
+                "dowsure_offer_sql": dowsure_offer_sql,
+                "sp_token_sql": sp_token_sql,
+            },
             "accounts": accounts,
             "count": len(accounts),
         }
@@ -3516,8 +4594,20 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
     def send_dowsure_credit_result_web(
         self,
         application_code: str,
-        amount: float,
         credit_status: str = "APPROVE",
+        start_time: str = "2026-05-26 00:00:00",
+        end_time: str = "2027-05-26 00:00:00",
+        term: int = 12,
+        term_unit: str = "MONTH",
+        apr: float = 5.4,
+        credit_code: str = "CREDIT_HSEF_TEST_001",
+        credit_contract_no: str = "CONTRACT_HSEF_001",
+        amount: float = 0.0,
+        currency: str = "CNY",
+        processing_fee: float = 0.0,
+        reason: str = "",
+        is_lock: str = "YES",
+        credit_result_list: Optional[list] = None,
     ) -> dict:
         """Send DOWSURE credit-result callback without interactive input."""
         application_code = str(application_code or "").strip()
@@ -3528,23 +4618,49 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         credit_status = str(credit_status or "APPROVE").strip().upper()
         if credit_status not in {"APPROVE", "REJECT"}:
             return {"success": False, "error": "creditStatus must be APPROVE or REJECT"}
-        reason = "FAIL" if credit_status == "REJECT" else ""
+        reason = str(reason or ("FAIL" if credit_status == "REJECT" else ""))
+        term = int(term)
+        apr = float(apr)
+        term_unit = str(term_unit or "MONTH")
+        credit_code = str(credit_code or f"CREDIT_HSEF_TEST_{application_code}")
+        credit_contract_no = str(credit_contract_no or "")
+        currency = str(currency or "CNY")
+        processing_fee = float(processing_fee)
+        is_lock = str(is_lock or "YES")
+        credit_result_list = credit_result_list or []
         payload = {
             "applicationCode": application_code,
             "creditStatus": credit_status,
-            "startTime": "2026-05-26 00:00:00",
-            "endTime": "2027-05-26 00:00:00",
-            "term": 12,
-            "termUnit": "MONTH",
-            "apr": 5.4,
-            "creditCode": f"CREDIT_HSEF_TEST_{application_code}",
-            "creditContractNo": "",
+            "startTime": str(start_time or "2026-05-26 00:00:00"),
+            "endTime": str(end_time or "2027-05-26 00:00:00"),
+            "term": term,
+            "termUnit": term_unit,
+            "apr": apr,
+            "creditCode": credit_code,
+            "creditContractNo": credit_contract_no,
             "amount": amount,
-            "currency": "CNY",
-            "processingFee": 0.00,
+            "currency": currency,
+            "processingFee": processing_fee,
             "reason": reason,
-            "isLock": "NO",
-            "creditResultList": [],
+            "isLock": is_lock,
+            "creditResultList": [
+                {
+                    "offerId": str(item.get("offerId") or "").strip(),
+                    "sellerId": str(item.get("sellerId") or "").strip(),
+                    "creditStatus": credit_status,
+                    "term": term,
+                    "termUnit": term_unit,
+                    "apr": apr,
+                    "creditCode": credit_code,
+                    "creditContractNo": credit_contract_no,
+                    "amount": float(item.get("amount") or 0),
+                    "currency": currency,
+                    "processingFee": processing_fee,
+                    "isLock": is_lock,
+                }
+                for item in credit_result_list
+                if str(item.get("offerId") or "").strip() and str(item.get("sellerId") or "").strip()
+            ],
         }
 
         result = self._do_post_custom(
@@ -3555,14 +4671,869 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         )
         if result.get("success"):
             self.dowsure_application_code = application_code
+            self.dowsure_credit_contract_no = payload["creditContractNo"]
+        result.update({
+            "applicationCode": application_code,
+            "creditContractNo": payload["creditContractNo"],
+            "amount": amount,
+            "currency": payload["currency"],
+            "creditStatus": credit_status,
+            "reason": reason,
+            "payload": payload,
+        })
+        return result
+
+    def _query_dowsure_seller_center(self, sql: str) -> list:
+        """Run a read-only SELECT against the DOWSURE dsb_seller_center DB.
+
+        店铺数据在 Dowsure 库（dsb_seller_center），不在 session 的 DPU 库，
+        因此走 .env 里的 DOWSURE_SQL_* 凭据单独连一条只读连接。
+        """
+        from web.services.ai_service import load_external_sql_data_sources
+
+        sources = load_external_sql_data_sources()
+        source = sources.get("dowsure")
+        if source is None:
+            raise RuntimeError(
+                "未配置 DOWSURE_SQL_* 数据源（检查 mockapi/.env 的 DOWSURE_SQL_HOST/USER/PASSWORD）"
+            )
+
+        import pymysql
+
+        connection = pymysql.connect(
+            host=source.host,
+            port=source.port,
+            user=source.user,
+            password=source.password,
+            database=source.database or None,
+            charset=source.charset,
+            connect_timeout=15,
+            read_timeout=30,
+            cursorclass=pymysql.cursors.Cursor,
+            autocommit=True,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql)
+                columns = [desc[0] for desc in (cursor.description or [])]
+                rows = cursor.fetchall()
+                return [dict(zip(columns, row)) for row in rows] if columns else []
+        finally:
+            connection.close()
+
+    def get_webank_seller_offers(self) -> dict:
+        """Return the seller offers for the current merchant from the DOWSURE DB.
+
+        merchant_id 即 dsb_seller_center.t_external_user.ext_user_id；
+        先查 user_id，再查该 user 名下所有 t_offer 记录，
+        前端展示 offer_id / seller_id / marketplace_country。
+        """
+        merchant_id = str(self.merchant_id or "").strip()
+        if not merchant_id:
+            return {"success": False, "error": "当前会话缺少 merchant_id，无法查询店铺"}
+
+        try:
+            user_rows = self._query_dowsure_seller_center(
+                "SELECT user_id FROM t_external_user "
+                f"WHERE ext_user_id = {self._sql_literal(merchant_id)} "
+                "ORDER BY user_id DESC LIMIT 1"
+            )
+        except Exception as exc:  # noqa: BLE001 - 网络/凭据类异常回传前端
+            return {"success": False, "error": f"查询 t_external_user 失败: {exc}"}
+
+        if not user_rows:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "error": f"未在 dsb_seller_center.t_external_user 查到 ext_user_id={merchant_id} 的记录",
+            }
+
+        user_id = user_rows[0].get("user_id")
+        if user_id is None:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "error": "t_external_user.user_id 为空",
+            }
+
+        try:
+            offer_rows = self._query_dowsure_seller_center(
+                "SELECT offer_id, seller_id, marketplace_country FROM t_offer "
+                f"WHERE user_id = {self._sql_literal(str(user_id))} "
+                "ORDER BY offer_id DESC"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"查询 t_offer 失败: {exc}"}
+
+        offers = []
+        for row in offer_rows or []:
+            seller_id = row.get("seller_id")
+            if not seller_id:
+                continue
+            offers.append({
+                "offer_id": row.get("offer_id"),
+                "seller_id": seller_id,
+                "marketplace_country": row.get("marketplace_country") or "",
+            })
+
+        # application_code 也从 dowsure 库带出（取该 user 最新一条），前端无需手填
+        application_code = ""
+        try:
+            app_rows = self._query_dowsure_seller_center(
+                "SELECT application_code FROM t_application_serial "
+                f"WHERE user_id = {self._sql_literal(str(user_id))} "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            if app_rows:
+                application_code = str(app_rows[0].get("application_code") or "")
+        except Exception as exc:  # noqa: BLE001 - application_code 查不到不阻断店铺展示
+            log.warning(f"查询 t_application_serial.application_code(ORDER BY id) 失败，回退无排序查询: {exc}")
+            try:
+                app_rows = self._query_dowsure_seller_center(
+                    "SELECT application_code FROM t_application_serial "
+                    f"WHERE user_id = {self._sql_literal(str(user_id))} "
+                    "LIMIT 1"
+                )
+                if app_rows:
+                    application_code = str(app_rows[0].get("application_code") or "")
+            except Exception as exc2:  # noqa: BLE001
+                log.warning(f"查询 t_application_serial.application_code 失败: {exc2}")
+
+        return {
+            "success": True,
+            "merchant_id": merchant_id,
+            "user_id": user_id,
+            "application_code": application_code,
+            "offers": offers,
+            "count": len(offers),
+        }
+
+    def get_webank_application_code(self) -> dict:
+        """Return the latest applicationCode for the current merchant from the DOWSURE DB.
+
+        merchant_id 即 dsb_seller_center.t_external_user.ext_user_id；
+        先查 user_id，再取该 user 名下 t_application_serial 最新一条 application_code。
+        """
+        merchant_id = str(self.merchant_id or "").strip()
+        if not merchant_id:
+            return {"success": False, "error": "当前会话缺少 merchant_id，无法查询 applicationCode"}
+
+        try:
+            user_rows = self._query_dowsure_seller_center(
+                "SELECT user_id FROM t_external_user "
+                f"WHERE ext_user_id = {self._sql_literal(merchant_id)} "
+                "ORDER BY user_id DESC LIMIT 1"
+            )
+        except Exception as exc:  # noqa: BLE001 - 网络/凭据类异常回传前端
+            return {"success": False, "error": f"查询 t_external_user 失败: {exc}"}
+
+        if not user_rows:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "error": f"未在 dsb_seller_center.t_external_user 查到 ext_user_id={merchant_id} 的记录",
+            }
+
+        user_id = user_rows[0].get("user_id")
+        if user_id is None:
+            return {"success": False, "merchant_id": merchant_id, "error": "t_external_user.user_id 为空"}
+
+        try:
+            app_rows = self._query_dowsure_seller_center(
+                "SELECT application_code FROM t_application_serial "
+                f"WHERE user_id = {self._sql_literal(str(user_id))} "
+                "ORDER BY id DESC LIMIT 1"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"查询 t_application_serial 失败: {exc}"}
+
+        if not app_rows:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "user_id": user_id,
+                "error": f"未在 dsb_seller_center.t_application_serial 查到 user_id={user_id} 的记录",
+            }
+
+        application_code = str(app_rows[0].get("application_code") or "")
+        return {
+            "success": True,
+            "merchant_id": merchant_id,
+            "user_id": user_id,
+            "application_code": application_code,
+        }
+
+    def send_webank_credit_result_web(
+        self,
+        application_code: str,
+        business_sum: Optional[float] = None,
+        seller_offers: Optional[list] = None,
+    ) -> dict:
+        """Send WEBANK credit-result callback (reuses DOWSURE credit-result endpoint).
+
+        每家准入店铺一行 applySeller；标记为不准入的店铺不写入 applySellerList；
+        applySellerBusinessSum 与顶层 businessSum 由用户在前端输入；
+        businessSum 未传时兼容旧逻辑，自动回退为各准入店铺之和。
+        applicationCode 未传时从 DOWSURE 库按当前 merchant 自动带出，前端无需填写。
+        """
+        application_code = str(application_code or "").strip()
+        if not application_code:
+            lookup = self.get_webank_application_code()
+            if not lookup.get("success"):
+                return {"success": False, "error": lookup.get("error", "无法获取 applicationCode")}
+            application_code = str(lookup.get("application_code") or "").strip()
+        if not application_code:
+            return {"success": False, "error": "applicationCode is required"}
+
+        seller_offers = seller_offers or []
+        apply_seller_list = []
+        total = 0.0
+        for offer in seller_offers:
+            if str(offer.get("admissionStatus") or "ADMITTED").upper() == "NOT_ADMITTED":
+                continue
+            seller_id = str(offer.get("applySellerId") or "").strip()
+            if not seller_id:
+                continue
+            seller_business_sum = float(offer.get("applySellerBusinessSum") or 0)
+            total += seller_business_sum
+            country = str(offer.get("sellerSiteCountryName") or "").strip()
+            apply_seller_list.append({
+                "applySellerId": seller_id,
+                "applySellerBusinessSum": self._webank_amount_str(seller_business_sum),
+                "applySellerSiteList": [{"sellerSiteCountryName": country}],
+            })
+
+        if not apply_seller_list:
+            return {"success": False, "error": "至少需要一家准入店铺"}
+
+        credit_business_sum = float(business_sum) if business_sum is not None else total
+        total_str = self._webank_amount_str(credit_business_sum)
+        payload = {
+            "applicationCode": application_code,
+            "creditData": {
+                "repayAcctNo": "6225881415569016",
+                "repayAcctName": "fengshen测试微众还款账户",
+                "repayAcctBankName": "微众银行",
+                "repayAcctBankNo": "WEBANK",
+                "productList": [
+                    {
+                        "frontProductId": "501026D",
+                        "projectId": "MOCK001",
+                        "businessSum": total_str,
+                        "availableSum": total_str,
+                        "creditStatus": "4",
+                        "applyDate": "2026/07/29",
+                        "effectDate": "2026/07/29",
+                        "deadlineDate": "2027/07/29",
+                        "currency": "01",
+                        "nextUpdateDate": "2026/08/29",
+                        "creditSerialNo": f"WB_MOCK_CREDIT_{application_code}",
+                        "refuseReson": "",
+                        "applyPlatformList": [
+                            {
+                                "applyPlatformId": "amazon",
+                                "applyPlatformBusinessSum": total_str,
+                                "applyPlatformAvailableSum": total_str,
+                                "applySellerList": apply_seller_list,
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-merchant/v1/test/webank/credit-result",
+            "WEBANK授信结果",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        if result.get("success"):
+            self.dowsure_application_code = application_code
             self.dowsure_credit_contract_no = ""
         result.update({
             "applicationCode": application_code,
             "creditContractNo": "",
-            "amount": amount,
+            "amount": credit_business_sum,
             "currency": "CNY",
-            "creditStatus": credit_status,
-            "reason": reason,
+            "payload": payload,
+        })
+        return result
+
+    def get_application_code_options(self) -> dict:
+        """List selectable applicationCode values for the current phone, newest first.
+
+        三个 credit-result（CCB / WEBANK / CGB）共用这一份下拉数据，
+        列表按 t_application.id 倒序，前端默认选中第一条（最新一条）。
+        """
+        phone_number = str(self.phone_number or "").strip()
+        if not phone_number:
+            return {"success": False, "error": "当前 Session 缺少手机号，无法查询 applicationCode"}
+
+        application_sql = (
+            "SELECT application_code "
+            "FROM dsb_seller_center.t_application "
+            "WHERE user_id IN ("
+            "SELECT id FROM dsb_seller_center.t_user "
+            f"WHERE tel = {self._sql_literal(phone_number)}"
+            ") ORDER BY id DESC"
+        )
+        try:
+            application_rows = self._query_dowsure_seller_center(application_sql)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"查询 applicationCode 失败: {exc}",
+                "sql": application_sql,
+                "application_codes": [],
+            }
+
+        application_codes: list[str] = []
+        for row in application_rows or []:
+            code = str(row.get("application_code") or "").strip()
+            if code and code not in application_codes:
+                application_codes.append(code)
+        if not application_codes:
+            return {
+                "success": False,
+                "error": f"手机号 {phone_number} 未查询到 applicationCode",
+                "sql": application_sql,
+                "application_codes": [],
+            }
+        return {
+            "success": True,
+            "phone_number": phone_number,
+            "application_codes": application_codes,
+            "application_code": application_codes[0],
+            "count": len(application_codes),
+            "sql": application_sql,
+        }
+
+    def get_cgb_application_code(self, application_code: Optional[str] = None) -> dict:
+        """Resolve the CGB applicationCode, preferring the value chosen in the UI."""
+        override = str(application_code or "").strip()
+        if override:
+            return {
+                "success": True,
+                "phone_number": str(self.phone_number or ""),
+                "application_code": override,
+                "sql": "",
+            }
+
+        lookup = self.get_application_code_options()
+        if not lookup.get("success"):
+            return lookup
+        return {
+            "success": True,
+            "phone_number": lookup.get("phone_number"),
+            "application_code": lookup.get("application_code"),
+            "sql": lookup.get("sql"),
+        }
+
+    @staticmethod
+    def _cgb_amount_number(value: float) -> int | float:
+        numeric_value = float(value)
+        return int(numeric_value) if numeric_value.is_integer() else numeric_value
+
+    def send_cgb_credit_result_web(
+        self,
+        amount: float,
+        processing_fee: float,
+        credit_status: str = "APPROVE",
+        application_code: Optional[str] = None,
+    ) -> dict:
+        """Query applicationCode by the current phone and submit a CGB credit result."""
+        lookup = self.get_cgb_application_code(application_code)
+        if not lookup.get("success"):
+            return lookup
+        phone_number = str(lookup.get("phone_number") or "")
+        application_code = str(lookup.get("application_code") or "")
+        application_sql = str(lookup.get("sql") or "")
+        amount_value = float(amount)
+        processing_fee_value = float(processing_fee)
+        credit_status_value = str(credit_status or "APPROVE").strip().upper()
+        if credit_status_value not in {"APPROVE", "REJECT"}:
+            return {"success": False, "error": "creditStatus must be APPROVE or REJECT"}
+        amount_number = self._cgb_amount_number(amount_value)
+        processing_fee_number = self._cgb_amount_number(processing_fee_value)
+        credit_code = f"CGB-CREDIT-{application_code}"
+        credit_contract_no = f"CGB-CONTRACT-{application_code}"
+        payload = {
+            "applicationCode": application_code,
+            "creditStatus": credit_status_value,
+            "startTime": "2026-08-20 20:10:00",
+            "endTime": "2027-08-20 20:10:00",
+            "term": 12,
+            "termUnit": "MONTH",
+            "apr": 0.12,
+            "creditCode": credit_code,
+            "creditContractNo": credit_contract_no,
+            "amount": amount_number,
+            "currency": "CNY",
+            "processingFee": processing_fee_number,
+            "creditStatus": credit_status_value,
+            "isLock": "YES",
+        }
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-lending-common/v1/credit/result?lenderId=23",
+            "CGB授信结果",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        result.update({
+            "phone_number": phone_number,
+            "applicationCode": application_code,
+            "creditCode": credit_code,
+            "creditContractNo": credit_contract_no,
+            "amount": amount_number,
+            "processingFee": processing_fee_number,
+            "application_code_sql": application_sql,
+            "payload": payload,
+        })
+        return result
+
+    def send_cgb_loan_result_web(
+        self,
+        amount: float,
+        processing_fee: float,
+        application_code: Optional[str] = None,
+    ) -> dict:
+        """Query applicationCode and submit a CGB loan result."""
+        lookup = self.get_cgb_application_code(application_code)
+        if not lookup.get("success"):
+            return lookup
+        phone_number = str(lookup.get("phone_number") or "")
+        application_code = str(lookup.get("application_code") or "")
+        application_sql = str(lookup.get("sql") or "")
+        amount_number = self._cgb_amount_number(amount)
+        processing_fee_number = self._cgb_amount_number(processing_fee)
+        credit_code = f"CGB-CREDIT-{application_code}"
+        credit_contract_no = f"CGB-CONTRACT-{application_code}"
+        loan_code = f"CGB-LOAN-{application_code}"
+        loan_contract_no = f"CGB-LOAN-CONTRACT-{application_code}"
+        start_at = datetime.now()
+        try:
+            end_at = start_at.replace(year=start_at.year + 1)
+        except ValueError:
+            end_at = start_at.replace(year=start_at.year + 1, day=28)
+        payload = {
+            "applicationCode": application_code,
+            "creditCode": credit_code,
+            "creditContractNo": credit_contract_no,
+            "loanCode": loan_code,
+            "loanContractNo": loan_contract_no,
+            "amount": amount_number,
+            "startTime": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": end_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "term": 12,
+            "termUnit": "MONTH",
+            "apr": 0.12,
+            "currency": "CNY",
+            "processingFee": processing_fee_number,
+        }
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-lending-common/v1/credit/loan?lenderId=23",
+            "CGB支用回传",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        result.update({
+            "phone_number": phone_number,
+            "applicationCode": application_code,
+            "creditCode": credit_code,
+            "creditContractNo": credit_contract_no,
+            "loanCode": loan_code,
+            "loanContractNo": loan_contract_no,
+            "amount": amount_number,
+            "processingFee": processing_fee_number,
+            "application_code_sql": application_sql,
+            "payload": payload,
+        })
+        return result
+
+    def _get_cgb_loan_repayment_context(self, loan_code: Optional[str] = None) -> dict:
+        """Resolve the DPU drawdown and DOWSURE loan fields needed by CGB repayment."""
+        drawdown_info = self._get_drawdown_info_for_repayment(loan_code)
+        if not drawdown_info:
+            return {
+                "success": False,
+                "error": f"未查询到 dpu_drawdown 放款记录，loanCode={loan_code or ''}",
+            }
+
+        lender_loan_id = str(drawdown_info.get("lender_loan_id") or "").strip()
+        lender_drawdown_id = str(drawdown_info.get("lender_drawdown_id") or "").strip()
+        dpu_loan_id = str(drawdown_info.get("loan_id") or "").strip()
+        if not lender_drawdown_id:
+            return {"success": False, "error": "dpu_drawdown.lender_drawdown_id 为空，无法回传 CGB 还款"}
+        if not dpu_loan_id:
+            return {"success": False, "error": f"loanCode={lender_drawdown_id} 未找到对应 dpu_loan_id"}
+
+        repayment_count_sql = (
+            "SELECT COUNT(*) AS repayment_count "
+            "FROM dpu_repayment "
+            f"WHERE dpu_loan_id = {self._sql_literal(dpu_loan_id)}"
+        )
+        try:
+            repayment_count_row = self.db_executor.execute_query(repayment_count_sql) or {}
+            repayment_count = int(repayment_count_row.get("repayment_count") or 0)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"查询 dpu_repayment 记录数失败: {exc}",
+                "sql": repayment_count_sql,
+            }
+        current_term = repayment_count or 1
+
+        if not lender_loan_id:
+            return {"success": False, "error": "dpu_drawdown.lender_loan_id 为空，无法回传 CGB 还款"}
+        loan_sql = (
+            "SELECT partner_loan_code, contract_number "
+            "FROM t_loan "
+            f"WHERE partner_loan_code = {self._sql_literal(lender_loan_id)} "
+            "LIMIT 1"
+        )
+        try:
+            loan_rows = self._query_dowsure_seller_center(loan_sql)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": f"查询 DOWSURE t_loan 失败: {exc}",
+                "sql": loan_sql,
+            }
+        if not loan_rows:
+            return {
+                "success": False,
+                "error": f"DOWSURE t_loan 未找到 partner_loan_code={lender_loan_id}",
+                "sql": loan_sql,
+            }
+
+        loan_row = loan_rows[0]
+        partner_loan_code = str(loan_row.get("partner_loan_code") or "").strip()
+        if not partner_loan_code:
+            return {
+                "success": False,
+                "error": f"DOWSURE t_loan.partner_loan_code 为空，lender_loan_id={lender_loan_id}",
+                "sql": loan_sql,
+            }
+        loan_contract_no = str(loan_row.get("contract_number") or "").strip()
+        if not loan_contract_no:
+            return {
+                "success": False,
+                "error": f"DOWSURE t_loan.contract_number 为空，partner_loan_code={partner_loan_code}",
+                "sql": loan_sql,
+            }
+        outstanding_amount = drawdown_info.get("outstanding_amount")
+        if outstanding_amount is None:
+            return {
+                "success": False,
+                "error": f"dpu_drawdown.outstanding_amount 为空，loanCode={lender_drawdown_id}",
+            }
+        return {
+            "success": True,
+            "drawdown_info": drawdown_info,
+            "loan_code": partner_loan_code,
+            "source_lender_loan_id": lender_loan_id,
+            "lender_drawdown_id": lender_drawdown_id,
+            "partner_loan_code": partner_loan_code,
+            "dpu_loan_id": dpu_loan_id,
+            "loan_contract_no": loan_contract_no,
+            "outstanding_amount": float(outstanding_amount),
+            "repayment_count": repayment_count,
+            "current_term": current_term,
+            "repayment_count_sql": repayment_count_sql,
+            "loan_sql": loan_sql,
+        }
+
+    def send_cgb_repayment_result_web(
+        self,
+        payment_principal: float,
+        payment_interest: float,
+        payment_overdue_interest: float,
+        application_code: Optional[str] = None,
+        loan_code: Optional[str] = None,
+    ) -> dict:
+        """Submit the CGB repayment callback using the selected DPU drawdown loan."""
+        application_lookup = self.get_cgb_application_code(application_code)
+        if not application_lookup.get("success"):
+            return application_lookup
+        application_code = str(application_lookup.get("application_code") or "").strip()
+        if not application_code:
+            return {"success": False, "error": "未查询到 CGB applicationCode"}
+
+        loan_context = self._get_cgb_loan_repayment_context(loan_code)
+        if not loan_context.get("success"):
+            return {
+                **loan_context,
+                "applicationCode": application_code,
+                "application_code_sql": application_lookup.get("sql"),
+            }
+
+        principal = float(payment_principal)
+        interest = float(payment_interest)
+        overdue_interest = float(payment_overdue_interest)
+        deal_amount = round(principal + interest + overdue_interest, 2)
+        surplus_principal = max(
+            round(float(loan_context["outstanding_amount"]) - principal, 2),
+            0.0,
+        )
+        principal_number = self._cgb_amount_number(principal)
+        interest_number = self._cgb_amount_number(interest)
+        overdue_number = self._cgb_amount_number(overdue_interest)
+        deal_amount_number = self._cgb_amount_number(deal_amount)
+        surplus_principal_number = self._cgb_amount_number(surplus_principal)
+        current_timestamp = get_current_time("%Y-%m-%d %H:%M:%S")
+        resolved_loan_code = loan_context["loan_code"]
+        payload = {
+            "applicationCode": application_code,
+            "currentTerm": loan_context["current_term"],
+            "loanCode": resolved_loan_code,
+            "loanContractNo": loan_context["loan_contract_no"],
+            "serialNo": resolved_loan_code,
+            "paymentPrincipal": principal_number,
+            "realPaymentPrincipal": principal_number,
+            "paymentInterest": interest_number,
+            "realPaymentInterest": interest_number,
+            "paymentOverdueInterest": overdue_number,
+            "realPaymentOverdueInterest": overdue_number,
+            "dealAmount": deal_amount_number,
+            "surplusPrincipal": surplus_principal_number,
+            "dealDate": current_timestamp,
+            "realDate": current_timestamp,
+        }
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-lending-common/v1/loan/repayment?lenderId=23",
+            "CGB还款结果",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        result.update({
+            "applicationCode": application_code,
+            "loanCode": resolved_loan_code,
+            "sourceLenderLoanId": loan_context["source_lender_loan_id"],
+            "lenderDrawdownId": loan_context["lender_drawdown_id"],
+            "loanContractNo": loan_context["loan_contract_no"],
+            "currentTerm": loan_context["current_term"],
+            "dealAmount": deal_amount_number,
+            "surplusPrincipal": surplus_principal_number,
+            "application_code_sql": application_lookup.get("sql"),
+            "repayment_count_sql": loan_context["repayment_count_sql"],
+            "loan_sql": loan_context["loan_sql"],
+            "drawdown_info": loan_context["drawdown_info"],
+            "payload": payload,
+        })
+        return result
+
+    @staticmethod
+    def _webank_amount_str(amount: float) -> str:
+        """Render an amount as an integer-like string when possible (matches sample)."""
+        amount = float(amount)
+        return str(int(amount)) if amount == int(amount) else str(amount)
+
+    def get_webank_loan_code(self) -> dict:
+        """Return the latest loan_code for the current merchant from the DOWSURE DB.
+
+        merchant_id 即 dsb_seller_center.t_external_user.ext_user_id；
+        先查 user_id，再取该 user 名下 t_loan 最新一条 loan_code。
+        """
+        merchant_id = str(self.merchant_id or "").strip()
+        if not merchant_id:
+            return {"success": False, "error": "当前会话缺少 merchant_id，无法查询 loan_code"}
+
+        try:
+            user_rows = self._query_dowsure_seller_center(
+                "SELECT user_id FROM t_external_user "
+                f"WHERE ext_user_id = {self._sql_literal(merchant_id)} "
+                "ORDER BY user_id DESC LIMIT 1"
+            )
+        except Exception as exc:  # noqa: BLE001 - 网络/凭据类异常回传前端
+            return {"success": False, "error": f"查询 t_external_user 失败: {exc}"}
+
+        if not user_rows:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "error": f"未在 dsb_seller_center.t_external_user 查到 ext_user_id={merchant_id} 的记录",
+            }
+
+        user_id = user_rows[0].get("user_id")
+        if user_id is None:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "error": "t_external_user.user_id 为空",
+            }
+
+        try:
+            loan_rows = self._query_dowsure_seller_center(
+                "SELECT loan_code FROM t_loan "
+                f"WHERE user_id = {self._sql_literal(str(user_id))} "
+                "ORDER BY create_time DESC LIMIT 1"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": f"查询 t_loan 失败: {exc}"}
+
+        if not loan_rows:
+            return {
+                "success": False,
+                "merchant_id": merchant_id,
+                "user_id": user_id,
+                "error": f"未在 dsb_seller_center.t_loan 查到 user_id={user_id} 的放款记录",
+            }
+
+        loan_code = str(loan_rows[0].get("loan_code") or "")
+        return {
+            "success": True,
+            "merchant_id": merchant_id,
+            "user_id": user_id,
+            "loan_code": loan_code,
+        }
+
+    def send_webank_drawdown_result_web(
+        self,
+        loan_amount: float,
+        service_fee_amount: float,
+    ) -> dict:
+        """Send WEBANK loan-result (支用结果) callback.
+
+        用户只需输入 loanAmount 与 serviceFee.amount，businessSum/balance 自动同步为 loanAmount；
+        loanCode 始终从 DOWSURE t_loan 取当前 merchant 最新一条；
+        loanAcctNo 固定为 WB_LOAN_{loanCode}。
+        """
+        lookup = self.get_webank_loan_code()
+        if not lookup.get("success"):
+            return {"success": False, "error": lookup.get("error", "无法获取 loanCode")}
+        loan_code = str(lookup.get("loan_code") or "").strip()
+        if not loan_code:
+            return {"success": False, "error": "loanCode is required"}
+
+        loan_amount = float(loan_amount)
+        service_fee_amount = float(service_fee_amount)
+        amount_num = int(loan_amount) if loan_amount == int(loan_amount) else loan_amount
+        service_fee_num = (
+            int(service_fee_amount)
+            if service_fee_amount == int(service_fee_amount)
+            else service_fee_amount
+        )
+        loan_acct_no = f"WB_LOAN_{loan_code}"
+        payload = {
+            "loanCode": loan_code,
+            "orderStatus": {
+                "transStatus": "SUCCESS",
+                "putOutDate": "2026/07/29",
+                "loanAmount": amount_num,
+                "loanAcctNo": loan_acct_no,
+            },
+            "loanDetail": {
+                "loanAcctNo": loan_acct_no,
+                "putOutDate": "2026/07/29",
+                "corpusPayMethod": "RPT-02",
+                "businessSum": amount_num,
+                "businessRate": 5.9,
+                "periods": "9",
+                "dueStatus": "0",
+                "maturityDate": "2027/04/29",
+                "balance": amount_num,
+                "interestBalance1": 0,
+            },
+            "serviceFee": {
+                "amount": service_fee_num,
+                "currency": "CNY",
+            },
+        }
+
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-merchant/v1/test/webank/loan-result",
+            "WEBANK支用结果",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        if result.get("success"):
+            self.dowsure_loan_code = loan_code
+        result.update({
+            "loanCode": loan_code,
+            "loanAcctNo": loan_acct_no,
+            "loanAmount": amount_num,
+            "serviceFeeAmount": service_fee_num,
+            "payload": payload,
+        })
+        return result
+
+    def send_webank_repayment_result_web(
+        self,
+        payment_principal: float,
+        payment_interest: float,
+        payment_penalty_interest: float,
+        loan_code: Optional[str] = None,
+    ) -> dict:
+        """Send WEBANK repayment-result callback using the current merchant's latest loan."""
+        selected_loan_code = str(loan_code or "").strip()
+        lookup = {}
+        if not selected_loan_code:
+            lookup = self.get_webank_loan_code()
+            if not lookup.get("success"):
+                return {"success": False, "error": lookup.get("error", "无法获取 loanCode")}
+            selected_loan_code = str(lookup.get("loan_code") or "").strip()
+        if not selected_loan_code:
+            return {"success": False, "error": "loanCode is required"}
+
+        principal = float(payment_principal)
+        interest = float(payment_interest)
+        penalty_interest = float(payment_penalty_interest)
+        drawdown_info = self._get_drawdown_info_for_repayment(selected_loan_code)
+        if not drawdown_info:
+            return {
+                "success": False,
+                "error": f"未查询到还款单 dpu_drawdown，无法计算 remainPrincipalAmount | loanCode={selected_loan_code}",
+                "loanCode": selected_loan_code,
+                "loan_lookup": lookup,
+            }
+        outstanding_amount = float(drawdown_info.get("outstanding_amount") or 0)
+        remain_principal = max(round(outstanding_amount - principal, 2), 0.0)
+        request_loan_code = str(drawdown_info.get("lender_drawdown_id") or "").strip()
+        if not request_loan_code:
+            return {
+                "success": False,
+                "error": (
+                    "dpu_drawdown.lender_drawdown_id 为空，无法组装 WEBANK repayment-result loanCode"
+                    f" | selectedLoanCode={selected_loan_code}"
+                ),
+                "loanCode": selected_loan_code,
+                "drawdown_info": drawdown_info,
+                "loan_lookup": lookup,
+            }
+
+        payload = {
+            "loanCode": request_loan_code,
+            "serialNo": f"WB_REPAY_{request_loan_code}",
+            "dealDate": "2026/07/29",
+            "paymentPrincipal": int(principal) if principal == int(principal) else principal,
+            "paymentInterest": int(interest) if interest == int(interest) else interest,
+            "paymentPenaltyInterest": (
+                int(penalty_interest)
+                if penalty_interest == int(penalty_interest)
+                else penalty_interest
+            ),
+            "remainPrincipalAmount": (
+                int(remain_principal)
+                if remain_principal == int(remain_principal)
+                else remain_principal
+            ),
+        }
+        result = self._do_post_custom(
+            "https://lendingapi-sit.dowsure.com/dowsure-merchant/v1/test/webank/repayment-result",
+            "WEBANK还款结果",
+            json_data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        if result.get("success"):
+            self.dowsure_loan_code = request_loan_code
+        result.update({
+            "loanCode": request_loan_code,
+            "selectedLoanCode": selected_loan_code,
+            "serialNo": payload["serialNo"],
+            "outstandingAmount": outstanding_amount,
+            "remainPrincipalAmount": remain_principal,
+            "drawdown_info": drawdown_info,
             "payload": payload,
         })
         return result
@@ -3736,6 +5707,30 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
 
         approved_amount = round(float(amount), 2)
         approved_status = status
+        sofr_sql = (
+            "SELECT sofr_value "
+            "FROM dpu_seller_center.dpu_sofr_data AS dsd "
+            "ORDER BY record_date DESC LIMIT 1"
+        )
+        try:
+            raw_sofr_value = self.db_executor.execute_sql(sofr_sql)
+            if raw_sofr_value is None:
+                raise ValueError("未查询到 SOFR 数据")
+            base_rate_decimal = Decimal(str(raw_sofr_value)) / Decimal("100")
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            msg = f"查询或转换最新 SOFR 失败: {exc}"
+            log.error(msg)
+            return {"success": False, "error": msg, "sofr_sql": sofr_sql}
+
+        margin_rate_decimal = Decimal("0.02")
+        fixed_rate_decimal = base_rate_decimal + margin_rate_decimal
+
+        def _rate_text(value: Decimal) -> str:
+            return format(value.normalize(), "f")
+
+        base_rate = _rate_text(base_rate_decimal)
+        margin_rate = _rate_text(margin_rate_decimal)
+        fixed_rate = _rate_text(fixed_rate_decimal)
         lender_approved_offer_id = self._ensure_credit_offer_lender_approved_offer_id(
             self.application_unique_id,
             approved_amount,
@@ -3776,9 +5771,9 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
                         "rate": {
                             "chargeBases": "Fixed" if self.preferred_currency == "CNY" else "Float",
                             "baseRateType": "SOFR",
-                            "baseRate": "0.05",
-                            "marginRate": "0.02",
-                            "fixedRate": "0.07"
+                            "baseRate": base_rate,
+                            "marginRate": margin_rate,
+                            "fixedRate": fixed_rate,
                         },
                         "term": 120,
                         "termUnit": "Days",
@@ -3805,6 +5800,9 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
             "failure_reason": failure_reason,
             "application_unique_id": self.application_unique_id,
             "lender_approved_offer_id": lender_approved_offer_id,
+            "base_rate": base_rate,
+            "margin_rate": margin_rate,
+            "fixed_rate": fixed_rate,
         })
         return result
 
@@ -4113,6 +6111,22 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         lender_loan_id = drawdown_row.get("lender_loan_id") or self.lender_loan_id
         lender_drawdown_id = drawdown_row.get("lender_drawdown_id") or "DRA1"
 
+        sofr_sql = (
+            "SELECT * "
+            "FROM dpu_seller_center.dpu_sofr_data AS dsd "
+            "ORDER BY record_date DESC LIMIT 1"
+        )
+        try:
+            sofr_row = self.db_executor.execute_query(sofr_sql)
+            raw_sofr_value = (sofr_row or {}).get("sofr_value")
+            if raw_sofr_value is None:
+                raise ValueError("未查询到 SOFR 数据")
+            base_rate = format((Decimal(str(raw_sofr_value)) / Decimal("100")).normalize(), "f")
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            msg = f"查询或转换最新 SOFR 失败: {exc}"
+            log.error(msg)
+            return {"success": False, "error": msg, "sofr_sql": sofr_sql}
+
         current_date = get_current_time("%Y-%m-%d")
         request_body = {
             "data": {
@@ -4136,8 +6150,8 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
                     "lastUpdatedBy": "system",
                     "disbursement": {
                         "loanAmount": {"currency": self.preferred_currency, "amount": f"{float(amount):.2f}"},
-                        "rate": {"chargeBases": "Fixed" if self.preferred_currency == "CNY" else "Float", "baseRateType": "SOFR", "baseRate": "10.00",
-                                 "marginRate": "0.00"},
+                        "rate": {"chargeBases": "Fixed" if self.preferred_currency == "CNY" else "Float", "baseRateType": "SOFR", "baseRate": base_rate,
+                                 "marginRate": "2.5"},
                         "term": "90",
                         "termUnit": "Days",
                         "drawdownSuccessDate": current_date,
@@ -4159,6 +6173,8 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
             "dpu_loan_id": dpu_loan_id,
             "lender_loan_id": lender_loan_id,
             "lender_drawdown_id": lender_drawdown_id,
+            "base_rate": base_rate,
+            "margin_rate": "2.5",
         })
         return result
 
@@ -4292,12 +6308,20 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
 
     # ======================== 10. 多店铺 SP 绑定 ========================
 
-    def mock_multi_shop_binding(self, state: str = None) -> dict:
+    def mock_multi_shop_binding(
+        self,
+        state: str = None,
+        platform_seller_id: str = None,
+    ) -> dict:
         """SP 店铺绑定（多店铺第一步）"""
         if state is None:
             return super().mock_multi_shop_binding()
 
-        generated_selling_partner_id = f"spshouquanfs{random.randint(10000, 99999)}"
+        generated_selling_partner_id = (
+            str(platform_seller_id).strip()
+            if platform_seller_id and str(platform_seller_id).strip()
+            else f"spshouquanfs{random.randint(10000, 99999)}"
+        )
         auth_token = ""
         params = {
             "state": state,
@@ -4374,6 +6398,13 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         sp_status: str = "SUCCESS",
     ) -> dict:
         """Register a new account and run the multi-shop flow via amazon-sp/auth plus DB verification."""
+        if not offline and funder_resource == "DOWSURE":
+            return {
+                "success": False,
+                "stage": "unsupported_combo",
+                "error": "DOWSURE 线上模式不支持注册并完成绑店，请切换到线下模式",
+            }
+
         register_result = WebDPUMockService.register_new_account_web(
             env=env,
             journey=journey,
@@ -4399,6 +6430,100 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
 
             session_ctx = session_manager.create_session(env, register_result["phone_number"])
             service = session_ctx.service
+
+            if offline and funder_resource == "DOWSURE":
+                offer_result = WebDPUMockService.step_create_offer_web(
+                    env=env,
+                    journey=journey,
+                    currency="CNY",
+                    yearly_repayment_amount=950000,
+                )
+                steps.append({
+                    "step": "generate offerId",
+                    "endpoint": "/api/register/create-offer",
+                    "payload": {
+                        "currency": "CNY",
+                        "yearly_repayment_amount": 950000,
+                    },
+                    "result": offer_result,
+                })
+                if not offer_result.get("success"):
+                    return {
+                        "success": False,
+                        "stage": "generate_cny_offer",
+                        "error": offer_result.get("error", "generate-shop-performance failed"),
+                        "register_result": register_result,
+                        "session": {
+                            "session_id": session_ctx.session_id,
+                            "env": session_ctx.env,
+                            "phone_number": session_ctx.phone_number,
+                            "merchant_id": session_ctx.merchant_id,
+                        },
+                        "steps": steps,
+                    }
+
+                auth_token = str(register_result.get("token") or "").strip()
+                if not auth_token:
+                    auth_token = WebDPUMockService._lookup_user_token(
+                        service.db_executor,
+                        register_result["phone_number"],
+                    )
+                service.session_user_token = auth_token
+                redirect_result = WebDPUMockService.step_amazon_redirect_web(
+                    env=env,
+                    offer_id=offer_result["offer_id"],
+                    phone_number=register_result["phone_number"],
+                    currency="CNY",
+                    funder_resource="DOWSURE",
+                    token=auth_token,
+                )
+                # The step-by-step scenario exposes TESTOFFER cleanup as its
+                # own SQL step. Keep the legacy one-click flow equivalent by
+                # running that cleanup here after the redirect succeeds.
+                if redirect_result.get("success"):
+                    cleanup_result = WebDPUMockService.remove_test_offer_suffix_web(
+                        env=env,
+                        phone_number=register_result["phone_number"],
+                    )
+                    if cleanup_result.get("success"):
+                        redirect_result["offer_id_update"] = {
+                            key: value
+                            for key, value in cleanup_result.items()
+                            if key != "success"
+                        }
+                    else:
+                        redirect_result.update({
+                            "success": False,
+                            "stage": "remove_test_offer_suffix",
+                            "error": cleanup_result.get(
+                                "error", "移除 TESTOFFER 后缀失败"
+                            ),
+                        })
+                steps.append({
+                    "step": "GET redirect + POST redirect",
+                    "endpoint": "/api/register/amazon-redirect",
+                    "payload": {
+                        "offer_id": offer_result["offer_id"],
+                        "phone_number": register_result["phone_number"],
+                        "currency": "CNY",
+                        "funder_resource": "DOWSURE",
+                    },
+                    "result": redirect_result,
+                })
+                return {
+                    "success": redirect_result.get("success", False),
+                    "stage": "completed" if redirect_result.get("success") else "amazon_redirect",
+                    "summary": "Registered, created session, then ran DS-CNY generate offerId and amazon redirect.",
+                    "register_result": register_result,
+                    "session": {
+                        "session_id": session_ctx.session_id,
+                        "env": session_ctx.env,
+                        "phone_number": session_ctx.phone_number,
+                        "merchant_id": session_ctx.merchant_id,
+                    },
+                    "offer_id": offer_result["offer_id"],
+                    "steps": steps,
+                }
 
             state = service.db_executor.execute_sql("SELECT UUID() AS state")
             if not state:
@@ -4895,17 +7020,20 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
 
     # ======================== 12. 3PL 重定向 ========================
 
-    def _run_multishop_3pl_redirect_with_post(self) -> dict:
+    def _run_multishop_3pl_redirect_with_post(self, platform_offer_id: Optional[str] = None) -> dict:
         """Run the register-and-bind 3PL redirect flow, including the required POST callback."""
-        seller_id = self._resolve_platform_seller_id()
-        if not seller_id:
-            return {"success": False, "error": "未找到可用的 SP 绑定ID，请先执行SP店铺绑定或确认商户已有记录"}
-
-        platform_offer_id = self.get_platform_offer_id(seller_id)
+        seller_id = None
+        platform_offer_id = str(platform_offer_id or "").strip()
         if not platform_offer_id:
-            msg = f"seller_id: {seller_id} 无对应platform_offer_id"
-            log.error(msg)
-            return {"success": False, "error": msg}
+            seller_id = self._resolve_platform_seller_id()
+            if not seller_id:
+                return {"success": False, "error": "未找到可用的 SP 绑定ID，请先执行SP店铺绑定或确认商户已有记录"}
+
+            platform_offer_id = self.get_platform_offer_id(seller_id)
+            if not platform_offer_id:
+                msg = f"seller_id: {seller_id} 无对应platform_offer_id"
+                log.error(msg)
+                return {"success": False, "error": msg}
 
         full_redirect_url = f"{self.api_config.redirect_url}?offerId={platform_offer_id}"
         get_request_info = {
@@ -5646,13 +7774,21 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         env: str,
         journey: str = "500K",
         currency: str = "USD",
+        yearly_repayment_amount: Optional[int] = None,
     ) -> dict:
         """线上注册流程第 1 步：调用 generate-shop-performance 生成 mock offer_id。
 
         单独暴露成一步，方便前端在 UI 上看到真正打给上游的 POST body + response。
+
+        - 传入 yearly_repayment_amount 时直接用该金额（DS-CNY 场景固定 950000），
+          忽略 journey 档位映射。
+        - 不传时按 journey 档位映射到年还款额，保持 FP 线上场景原行为。
         """
         api_config = WebDPUMockService._build_api_config(env)
-        yearly_amount = WebDPUMockService._JOURNEY_YEARLY_REPAYMENT.get((journey or "").upper())
+        if yearly_repayment_amount is not None:
+            yearly_amount = yearly_repayment_amount
+        else:
+            yearly_amount = WebDPUMockService._JOURNEY_YEARLY_REPAYMENT.get((journey or "").upper())
         if not yearly_amount:
             return {"success": False, "error": f"不支持的 journey: {journey}"}
         payload = {"yearlyRepaymentAmount": yearly_amount, "currency": currency}
@@ -5709,10 +7845,16 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
     def step_amazon_redirect_web(
         env: str,
         offer_id: str,
+        phone_number: str,
         currency: str = "USD",
         funder_resource: str = "FUNDPARK",
+        token: Optional[str] = None,
     ) -> dict:
-        """线上注册流程第 2 步：GET redirect 让 offer 生效 + POST redirect 二次确认。"""
+        """线上注册流程第 2 步：GET redirect 让 offer 生效 + POST redirect 二次确认。
+
+        传入 token 时，GET/POST 都会带上 Authorization: Bearer <token>（DS-CNY 场景在
+        signup 后透传 ${token}）；token 为空则不加该头，保持原行为。
+        """
         if not offer_id:
             return {"success": False, "error": "offer_id 不能为空"}
         api_config = WebDPUMockService._build_api_config(env)
@@ -5724,6 +7866,9 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
             "finance-product": "LINE_OF_CREDIT",
             "funder-resource": funder_resource,
         }
+        auth_token = str(token or "").strip()
+        if auth_token:
+            common_headers["Authorization"] = f"Bearer {auth_token}"
         get_request_info = {
             "method": "GET",
             "url": redirect_url,
@@ -6337,16 +8482,93 @@ WHERE amazon_3pl_offer_id = {self._sql_literal(resolved_offer_id)}
         }
 
     @staticmethod
-    def step_3pl_redirect_web(env: str, phone_number: str) -> dict:
-        """注册流程第 8 步：3PL 重定向回调 POST。"""
+    def step_3pl_redirect_web(
+        env: str,
+        phone_number: str,
+        currency: Optional[str] = None,
+        funder_resource: Optional[str] = None,
+    ) -> dict:
+        """注册流程第 8 步：3PL 重定向回调 POST。
+
+        注意：DS-CNY 场景已在前端拆分为独立的「生成 offerId」(/register/create-offer)
+        + 「GET redirect + POST redirect」(/register/amazon-redirect) 两步，不再走下面的
+        CNY+DOWSURE 合并分支。该分支保留仅为兼容其它可能的调用方。
+        """
         with DatabaseExecutor(env=env) as db:
             service = WebDPUMockService(phone_number, db)
-            redirect_result = service._run_multishop_3pl_redirect_with_post()
+            if (currency or "").upper() == "CNY" and (funder_resource or "").upper() == "DOWSURE":
+                offer_payload = {"yearlyRepaymentAmount": 950000, "currency": "CNY"}
+                offer_headers = {"Content-Type": "application/json"}
+                offer_request_info = {
+                    "method": "POST",
+                    "url": service.api_config.create_offerid_url,
+                    "headers": offer_headers,
+                    "body": offer_payload,
+                }
+                try:
+                    offer_response = http_requests.post(
+                        service.api_config.create_offerid_url,
+                        json=offer_payload,
+                        headers=offer_headers,
+                        timeout=30,
+                    )
+                    offer_response.raise_for_status()
+                except http_requests.exceptions.RequestException as exc:
+                    return {
+                        "success": False,
+                        "stage": "generate_cny_offer",
+                        "error": f"generate-shop-performance 失败: {exc}",
+                        "offer_generation": {
+                            "request_info": offer_request_info,
+                            "status_code": exc.response.status_code if getattr(exc, "response", None) is not None else None,
+                            "response_body": (
+                                service._format_redirect_body_for_log(exc.response.text)
+                                if getattr(exc, "response", None) is not None
+                                else None
+                            ),
+                        },
+                    }
+                try:
+                    platform_offer_id = (offer_response.json() or {}).get("data", {}).get("amazon3plOfferId", "")
+                except Exception:
+                    platform_offer_id = ""
+                if not platform_offer_id:
+                    return {
+                        "success": False,
+                        "stage": "generate_cny_offer",
+                        "error": "generate-shop-performance 未返回 amazon3plOfferId",
+                        "offer_generation": {
+                            "request_info": offer_request_info,
+                            "status_code": offer_response.status_code,
+                            "response_body": service._format_redirect_body_for_log(offer_response.text),
+                        },
+                    }
+                redirect_result = service._run_multishop_3pl_redirect_with_post(
+                    platform_offer_id=platform_offer_id,
+                )
+                redirect_result["offer_generation"] = {
+                    "request_info": offer_request_info,
+                    "status_code": offer_response.status_code,
+                    "response_body": service._format_redirect_body_for_log(offer_response.text),
+                    "platform_offer_id": platform_offer_id,
+                }
+            else:
+                redirect_result = service._run_multishop_3pl_redirect_with_post()
         return {
             "success": bool(redirect_result.get("success")),
             "stage": "3pl_redirect",
             "result": redirect_result,
         }
+
+    @staticmethod
+    def remove_test_offer_suffix_web(env: str, phone_number: str) -> dict:
+        """Run the standalone post-redirect TESTOFFER cleanup step."""
+        try:
+            with DatabaseExecutor(env=env) as db:
+                result = WebDPUMockService._remove_test_offer_suffix(db, phone_number)
+            return {"success": True, **result}
+        except Exception as exc:
+            return {"success": False, "error": f"移除 TESTOFFER 后缀失败: {exc}"}
 
     # ======================== 注册（静态方法改为实例无关的独立函数） ========================
 

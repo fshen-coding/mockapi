@@ -1,0 +1,13 @@
+[Unit]
+Description=Protect single-node Kubernetes control-plane ports
+Wants=network-online.target
+After=network-online.target
+Before=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/mockapi-deploy/protect-control-plane.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

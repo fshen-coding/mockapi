@@ -47,9 +47,12 @@ import {
   disconnectSession,
   fetchEnums,
   fetchDrawdownRepaymentRows,
+  fetchEnvironmentMonitor,
   fetchHealth,
   fetchContactIssues,
+  fetchApplicationCodes,
   fetchDowsureMerchantAccounts,
+  fetchWebankSellerOffers,
   fetchLimitApplications,
   fetchLogs,
   fetchPspAuthorizationRows,
@@ -66,6 +69,10 @@ import {
   sendAiChat,
   fetchPromptTemplates,
   fetchScenarioStepOverrides,
+  fetchShopPerformanceBuiltinPresets,
+  fetchCompanyImageTemplates,
+  saveCompanyImageTemplate,
+  deleteCompanyImageTemplate,
   saveScenarioStepOverride,
   deleteScenarioStepOverride,
   fetchScenarioMetaOverrides,
@@ -81,6 +88,15 @@ import {
   deletePromptTemplate,
   togglePromptTemplate,
   executePromptTemplate,
+  fetchAiUiRuntimeStatus,
+  fetchAiUiCases,
+  generateAiUiCase,
+  saveAiUiCase,
+  deleteAiUiCase,
+  fetchAiUiRuns,
+  startAiUiRun,
+  fetchAiUiRun,
+  stopAiUiRun,
   fetchAdminUsers,
   updateAdminUser,
   deleteAdminUser,
@@ -92,6 +108,14 @@ const defaultEnvironments = ['sit', 'uat', 'dev', 'preprod', 'reg', 'local']
 const defaultAiSqlDataSources = ['sit', 'uat', 'dev', 'preprod', 'reg', 'local', 'douke', 'dowsure']
 const defaultJourneys = ['200K', '500K', '2000K']
 const defaultCurrencies = ['USD', 'CNY']
+const aiUiEnvironmentOptions = [
+  { value: 'sit', label: 'SIT', url: 'https://expressfinance-dpu-sit.dowsure.com/en/' },
+  { value: 'dev', label: 'DEV', url: 'https://expressfinance-dpu-dev.dowsure.com/en/sign-up-step1' },
+  { value: 'uat', label: 'UAT', url: 'https://expressfinance-uat.business.hsbc.com/zh-Hans/' },
+  { value: 'preprod', label: 'PREPROD', url: 'https://expressfinance-preprod.business.hsbc.com/zh-Hans/sign-up' },
+  { value: 'reg', label: 'REG', url: 'https://expressfinance-dpu-reg.dowsure.com/en/' },
+  { value: 'custom', label: '自定义', url: '' },
+]
 const upstreamBaseUrls = {
   sit: 'https://sit.api.expressfinance.business.hsbc.com',
   dev: 'https://dpu-gateway-dev.dowsure.com',
@@ -138,8 +162,12 @@ const enumOptions = ref(null)
 const activeOperationKey = ref('')
 const activeSessionId = ref('')
 const selectedApplicationUniqueId = ref('')
+const applicationCodeOptions = ref([])
+const loadingApplicationCodes = ref(false)
 const dowsureMerchantAccounts = ref([])
 const loadingDowsureMerchantAccounts = ref(false)
+const webankSellerOffers = ref([])
+const loadingWebankSellerOffers = ref(false)
 const limitApplicationRows = ref([])
 const loadingLimitApplications = ref(false)
 const selectedLimitApplicationUniqueId = ref('')
@@ -157,12 +185,41 @@ const liveSessions = ref([])
 const eventLogs = ref([])
 const activityFeed = ref([])
 const auditOperations = ref([])
+const expandedAuditOperationIds = ref(new Set())
 const auditQuery = reactive({ phone_number: '', session_id: '' })
 const auditLoading = ref(false)
 const auditError = ref('')
+const environmentMonitor = ref({ overall: 'checking', checked_at: '', items: [] })
+const environmentMonitorLoading = ref(false)
+const environmentMonitorError = ref('')
+const environmentMonitorRefreshSeconds = ref(60)
+let environmentMonitorRefreshTimer = null
 const promptTemplates = ref([])
 const promptTemplatesLoading = ref(false)
 const promptTemplatesError = ref('')
+// 提示词模板：名称/描述模糊搜索 + 分页
+const promptTemplateSearch = ref('')
+const promptTemplatePage = ref(1)
+const promptTemplatePageSize = ref(6)
+const filteredPromptTemplates = computed(() => {
+  const kw = promptTemplateSearch.value.trim().toLowerCase()
+  if (!kw) return promptTemplates.value
+  return promptTemplates.value.filter((t) => (
+    (t.title || '').toLowerCase().includes(kw)
+    || (t.description || '').toLowerCase().includes(kw)
+  ))
+})
+const promptTemplatesTotal = computed(() => filteredPromptTemplates.value.length)
+const pagedPromptTemplates = computed(() => {
+  const start = (promptTemplatePage.value - 1) * promptTemplatePageSize.value
+  return filteredPromptTemplates.value.slice(start, start + promptTemplatePageSize.value)
+})
+// 搜索变化时回到第 1 页；分页越界（如删到只剩前面几页）时自动收回。
+watch(promptTemplateSearch, () => { promptTemplatePage.value = 1 })
+watch(promptTemplatesTotal, (total) => {
+  const maxPage = Math.max(1, Math.ceil(total / promptTemplatePageSize.value))
+  if (promptTemplatePage.value > maxPage) promptTemplatePage.value = maxPage
+})
 const promptTemplateFormVisible = ref(false)
 const promptTemplateSaving = ref(false)
 const promptTemplateForm = reactive({
@@ -183,6 +240,8 @@ const promptTemplateUseForm = reactive({
   user_input: '',
   env: 'reg',
 })
+// 按占位符拆分的分列参数输入（key = 占位符名，如 phone / offer_id）。
+const promptTemplateUseParams = reactive({})
 
 // Admin: user management
 const adminUsers = ref([])
@@ -210,16 +269,59 @@ let notifySocket = null
 
 const PROMPT_PARAM_HINT_MAP = {
   offer_id: '3P offer id',
+  tpl_offer_id: '3PL offer id',
   amazon_3pl_offer_id: 'Amazon 3PL offer id',
   application_unique_id: '申请单号',
+  application_code: '申请单号（application_code）',
   douke_application_id: 'douke 申请单号',
   value: '目标数值',
   amount: '金额',
   status: '目标状态',
+  phone: '手机号',
   phone_number: '手机号',
   merchant_id: '商户号',
   user_id: '用户 ID',
   env: '环境',
+  shop_type: '店铺类型（DPU_3PL/SP/3PL）',
+  country: '国家（US/CA/DE/UK/GB/FR/IT/ES/JP）',
+  is_admit: '是否准入（1=准入，0=不准入）',
+  seller_id: 'sellerId（留空自动生成）',
+  access_mode: '店铺是否准入（ADMITTED/NOT_ADMITTED）',
+  sp_mode: 'SP 授权（AUTHORIZED/NOT_AUTHORIZED）',
+  quota_year1_sales_value: 'CUSTOM 年销售额',
+}
+
+// 使用模板弹窗里可留空的占位符（后端会自动生成/兜底），不做必填校验。
+const OPTIONAL_PROMPT_PARAMS = new Set(['seller_id', 'quota_year1_sales_value'])
+const PROMPT_PARAM_SELECT_OPTIONS = {
+  shop_type: [
+    { label: 'DPU_3PL', value: 'DPU_3PL' },
+    { label: 'SP', value: 'SP' },
+    { label: '3PL', value: '3PL' },
+  ],
+  country: [
+    { label: 'US', value: 'US' },
+    { label: 'CA', value: 'CA' },
+    { label: 'DE', value: 'DE' },
+    { label: 'UK', value: 'UK' },
+    { label: 'GB', value: 'GB' },
+    { label: 'FR', value: 'FR' },
+    { label: 'IT', value: 'IT' },
+    { label: 'ES', value: 'ES' },
+    { label: 'JP', value: 'JP' },
+  ],
+  is_admit: [
+    { label: '准入（1）', value: '1' },
+    { label: '不准入（0）', value: '0' },
+  ],
+  access_mode: [
+    { label: '准入（ADMITTED）', value: 'ADMITTED' },
+    { label: '不准入（NOT_ADMITTED）', value: 'NOT_ADMITTED' },
+  ],
+  sp_mode: [
+    { label: '已授权（AUTHORIZED）', value: 'AUTHORIZED' },
+    { label: '未授权（NOT_AUTHORIZED）', value: 'NOT_AUTHORIZED' },
+  ],
 }
 
 const useDialogTargetPlaceholders = computed(() => {
@@ -236,6 +338,27 @@ const useDialogTargetPlaceholders = computed(() => {
 
 const useDialogParamHints = computed(() => {
   return useDialogTargetPlaceholders.value.map((key) => PROMPT_PARAM_HINT_MAP[key] || key)
+})
+
+// 每个占位符一个输入项：{ key, label }，供弹窗按列渲染独立输入框。
+const useDialogParamFields = computed(() => {
+  return useDialogTargetPlaceholders.value.map((key) => ({
+    key,
+    label: PROMPT_PARAM_HINT_MAP[key] || key,
+    options: getPromptTemplateParamOptions(key),
+    help: key === 'quota_year1_sales_value'
+      ? '填写 5000 万到 2 亿，权重占比高。'
+      : '',
+    disabled: (
+      key === 'quota_year1_sales_value'
+      && promptTemplateUseParams.access_mode === 'NOT_ADMITTED'
+    ) || (
+      (
+        (key === 'country' && promptTemplateUseParams.shop_type === '3PL')
+        || (key === 'sp_mode' && ['3PL', 'SP'].includes(promptTemplateUseParams.shop_type))
+      )
+    ),
+  }))
 })
 
 const useDialogInputLabel = computed(() => {
@@ -302,6 +425,42 @@ const aiReasoningOptions = [
   { value: 'extreme', label: '极高' },
 ]
 const currentView = ref('console')
+const aiUiCases = ref([])
+const aiUiRuns = ref([])
+const aiUiRuntime = ref(null)
+const aiUiLoading = ref(false)
+const aiUiSaving = ref(false)
+const aiUiGenerating = ref(false)
+const aiUiError = ref('')
+const aiUiSelectedCaseId = ref('')
+const aiUiActiveRunId = ref('')
+const aiUiNaturalLanguage = ref('')
+const aiUiStructuredYaml = ref('')
+const aiUiVariablesText = ref('{}')
+const aiUiStructuredSpec = ref(null)
+const aiUiRunConfirmVisible = ref(false)
+const aiUiPendingCase = ref(null)
+const aiUiPageMode = ref('cases')
+const aiUiPageModes = [
+  { key: 'cases', label: '案例' },
+  { key: 'reports', label: '报告' },
+]
+let aiUiPollTimer = null
+const aiUiForm = reactive({
+  id: null,
+  environment: 'sit',
+  name: 'OFFLINE 注册入口检查-SIT-样板',
+  url: 'https://expressfinance-dpu-sit.dowsure.com/en/',
+  context: '这是 OFFLINE_SIGNUP_URL_DICT 的 SIT 页面入口冒烟用例。只验证环境 URL、FundPark USD 产品进入注册页以及手机号验证控件，不发送短信、不创建客户。',
+  prompt: `Scenario: OFFLINE signup entry smoke test
+  Given the SIT HSBC Express Finance homepage is open
+  When I click the "Get started" button for the FundPark USD Line of Credit product
+  Then the page should show "Enter your contact details to begin"
+  And the page should show the "Mobile number" field
+  And the "Get code" button should be disabled before a mobile number is entered`,
+  headed: false,
+  viewport: { width: 1440, height: 900 },
+})
 const logSearchLoading = ref(false)
 const logSearchResults = ref([])
 const authStorageKey = 'mockapi-auth-user'
@@ -336,6 +495,25 @@ const logSearchForm = reactive({
   limit: DEFAULT_LOG_PREVIEW_LIMIT,
 })
 
+function formatJsonBlock(payload) {
+  return JSON.stringify(payload ?? {}, null, 2)
+}
+
+function isAuditOperationExpanded(id) {
+  return expandedAuditOperationIds.value.has(String(id))
+}
+
+function toggleAuditOperationDetail(id) {
+  const key = String(id)
+  const next = new Set(expandedAuditOperationIds.value)
+  if (next.has(key)) {
+    next.delete(key)
+  } else {
+    next.add(key)
+  }
+  expandedAuditOperationIds.value = next
+}
+
 const contactForm = reactive({
   issue: '',
 })
@@ -350,8 +528,8 @@ const contactIssues = ref([])
 const interfaceStepEnabled = reactive({})
 const activeInterfaceScenarioKey = ref('fpUsd500k')
 const activeScenarioTab = ref('base')
-const expandedScenarioTrees = reactive({ fpUsd500k: true, fpUsd2k: false, dsCny: false })
-const expandedScenarioDirectories = reactive({ singleShop: true, multiShop: false })
+const expandedScenarioTrees = reactive({ fpUsd500k: false, fpUsd2k: false, dsCny: false })
+const expandedScenarioDirectories = reactive({ singleShop: false, multiShop: false })
 const scenarioLibrarySearch = ref('')
 const debugInterfaceSearch = ref('')
 const interfacePageMode = ref('scenario')
@@ -378,6 +556,224 @@ const scenarioStopRequested = ref(false)
 const scenarioStepOverrides = reactive({})
 const scenarioStepOverrideDraft = reactive({})
 const scenarioStepOverrideSaving = reactive({})
+// Presets and company templates are persisted as one whole-array payload per
+// step, rebuilt from the in-memory list on every save. Until a load has
+// actually succeeded that list only holds the builtin defaults, so writing it
+// back would erase the user's custom records. Saves stay blocked while false.
+const scenarioStepOverridesLoaded = ref(false)
+const SHOP_PERFORMANCE_PRESET_SCENARIO = 'mockApi'
+const SHOP_PERFORMANCE_PRESET_STEP = 'shop-performance-presets'
+const DOWSURE_COMPANY_TEMPLATE_SCENARIO = 'mockApi'
+const DOWSURE_COMPANY_TEMPLATE_STEP = 'dowsure-cny-company-templates'
+const DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE = {
+  name: '广州测试科技有限公司',
+  template: {
+    enName: '',
+    cnName: '广州测试科技有限公司',
+    regNo: '91440101MA5D6YRJ0X',
+    address: '广州市天河区测试路1号',
+    contactNumber: { countryCode: '+86', number: '' },
+    operationAddressFlag: true,
+    operationAddress: '',
+    businessDocName: '营业执照.png',
+  },
+  directorTemplate: {
+    position: 'DIRECTOR_AND_LEGAL_REPRESENTATIVE',
+    nameCn: '奉晓慧',
+    nameEn: '',
+    mobileNumber: { countryCode: '+86', number: '18374816332' },
+    dowsurePersonInfoExtend: {
+      idNumber: '431121199611248750',
+      idCardStartDate: '02/06/2026',
+      idCardEndDate: '',
+      longTermFlag: 'true',
+      addressDetail: '广州市天河区测试路1号',
+    },
+    dateOfBirth: '03/06/2026',
+    frontDocName: '身份证正面.png',
+    backDocName: '身份证反面.png',
+    emailAddress: '18374816332@qq.com',
+    idDocumentType: 'PRC_RESIDENT_ID_CARD',
+  },
+  contactTemplate: {
+    isDraft: false,
+    isExistingPerson: false,
+    selectedPersonId: '',
+    fullChineseName: '奉晓慧',
+    email: '18374816332@qq.com',
+    mobileNumber: '18374816332',
+    phoneCountryCode: '+86',
+  },
+}
+const BACKUP_DOWSURE_CNY_COMPANY_TEMPLATE = {
+  name: '测广州市昆袄祝山脸从股份有限公司',
+  template: {
+    enName: '',
+    cnName: '测广州市昆袄祝山脸从股份有限公司',
+    regNo: '914401000747111984',
+    address: '甘肃省兰州市盘快饺题路247号301',
+    contactNumber: { countryCode: '+86', number: '' },
+    operationAddressFlag: true,
+    operationAddress: '',
+    businessDocName: '营业执照.png',
+  },
+  directorTemplate: {
+    position: 'DIRECTOR_AND_LEGAL_REPRESENTATIVE',
+    nameCn: '测近智',
+    nameEn: '',
+    mobileNumber: { countryCode: '+86', number: '19443548216' },
+    dowsurePersonInfoExtend: {
+      idNumber: '620100197108054266',
+      idCardStartDate: '10/08/2025',
+      idCardEndDate: '',
+      longTermFlag: 'true',
+      addressDetail: '甘肃省兰州市盘快饺题路247号301',
+    },
+    dateOfBirth: '05/08/1971',
+    frontDocName: '身份证正面.png',
+    backDocName: '身份证反面.png',
+    emailAddress: '19443548216@qq.com',
+    idDocumentType: 'PRC_RESIDENT_ID_CARD',
+  },
+  contactTemplate: {
+    isDraft: false,
+    isExistingPerson: false,
+    selectedPersonId: '',
+    fullChineseName: '测近智',
+    email: '19443548216@qq.com',
+    mobileNumber: '19443548216',
+    phoneCountryCode: '+86',
+  },
+}
+const BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES = [
+  DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE,
+  BACKUP_DOWSURE_CNY_COMPANY_TEMPLATE,
+]
+const BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATE_NAMES = new Set(
+  BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES.map((item) => item.name),
+)
+function cloneDowsureCompanyTemplate(item) {
+  return JSON.parse(JSON.stringify(item))
+}
+const BUILTIN_SHOP_PERFORMANCE_NAMES = [
+  'webank准入ccb准入',
+  'webank不准入ccb准入',
+  'webank准入ccb不准入',
+  'webank不准入ccb不准入',
+  '店铺5',
+  '店铺6',
+  '店铺7',
+  '店铺8',
+  '店铺9',
+  '店铺10',
+  '店铺11',
+  '店铺12',
+  '店铺13',
+  '店铺14',
+  '店铺15',
+  '店铺16',
+]
+const BUILTIN_SHOP_PERFORMANCE_NAME_SET = new Set(BUILTIN_SHOP_PERFORMANCE_NAMES)
+function createBuiltinShopPerformancePresets() {
+  return BUILTIN_SHOP_PERFORMANCE_NAMES.map((name) => ({
+    name,
+    custom_sql: '',
+    builtin_sql: '',
+    is_builtin: true,
+    is_customized: false,
+  }))
+}
+function mergeShopPerformancePresets(savedPresets = []) {
+  const presetsByName = new Map(
+    createBuiltinShopPerformancePresets().map((item) => [item.name, item]),
+  )
+  savedPresets
+    .filter((preset) => preset?.name && preset?.custom_sql)
+    .forEach((preset) => {
+      const name = String(preset.name).trim()
+      presetsByName.set(name, {
+        name,
+        custom_sql: String(preset.custom_sql),
+        builtin_sql: '',
+        is_builtin: BUILTIN_SHOP_PERFORMANCE_NAME_SET.has(name),
+        is_customized: true,
+      })
+    })
+  return Array.from(presetsByName.values())
+}
+function serializeShopPerformancePresets(presets) {
+  return presets
+    .filter((preset) => (
+      preset?.name
+      && String(preset.custom_sql || '').trim()
+      && (!preset.is_builtin || preset.is_customized)
+    ))
+    .map((preset) => ({
+      name: String(preset.name).trim(),
+      custom_sql: String(preset.custom_sql).trim(),
+    }))
+}
+const shopPerformancePresets = ref(createBuiltinShopPerformancePresets())
+const shopPerformanceBuiltinLoading = ref(false)
+const shopPerformancePresetForm = reactive({
+  name: '',
+  custom_sql: '',
+})
+const shopPerformancePresetSaving = ref(false)
+const shopPerformancePresetError = ref('')
+const editingShopPerformancePresetName = ref('')
+const shopPerformanceManagerVisible = ref(false)
+const shopPerformanceEditorVisible = ref(false)
+const BUILTIN_COMPANY_IMAGE_TEMPLATES = [
+  {
+    id: 'builtin:business_license',
+    name: '测广州市昆袄祝山脸从股份有限公司营业执照',
+    image_type: 'business_license',
+    filename: 'business_license.png',
+    is_builtin: true,
+  },
+  {
+    id: 'builtin:director_id_front',
+    name: '默认法人身份证正面',
+    image_type: 'director_id_front',
+    filename: 'director_id_front.png',
+    is_builtin: true,
+  },
+  {
+    id: 'builtin:director_id_back',
+    name: '默认法人身份证反面',
+    image_type: 'director_id_back',
+    filename: 'director_id_back.png',
+    is_builtin: true,
+  },
+]
+const companyImageTemplates = ref(BUILTIN_COMPANY_IMAGE_TEMPLATES.map((item) => ({ ...item })))
+const companyImageManagerVisible = ref(false)
+const companyImageSaving = ref(false)
+const companyImageError = ref('')
+const companyImageFile = ref(null)
+const companyImageLocalPreview = ref('')
+const companyImageFileInputKey = ref(0)
+const companyImageForm = reactive({
+  id: '',
+  name: '',
+  image_type: 'business_license',
+  filename: '',
+  is_builtin: false,
+})
+const dowsureCnyCompanyTemplates = ref(
+  BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES.map(cloneDowsureCompanyTemplate),
+)
+const dowsureCompanyTemplateForm = reactive({
+  name: DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.name,
+  templateText: JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.template, null, 2),
+  directorTemplateText: JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.directorTemplate, null, 2),
+  contactTemplateText: JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.contactTemplate, null, 2),
+})
+const dowsureCompanyTemplateSaving = ref(false)
+const dowsureCompanyTemplateError = ref('')
+const editingDowsureCompanyTemplateName = ref('')
+const dowsureCompanyTemplateManagerVisible = ref(false)
 function scenarioStepOverrideKey(scenarioKey, stepKey) {
   return `${scenarioKey || ''}::${stepKey || ''}`
 }
@@ -407,6 +803,14 @@ const scenarioStepMetaEditForm = reactive({
   isHidden: false,
 })
 
+// Admin-only step editing stays local until the toolbar 保存 button is used.
+// Added steps are copied from an existing step so they retain the same
+// executable request definition and can be inserted after any current step.
+const scenarioStepStructureDraft = reactive({})
+const scenarioStepStructureDeleted = reactive({})
+const scenarioAddStepVisible = ref(false)
+const scenarioAddStepForm = reactive({ scenarioKey: '', afterStepKey: '', sourceStepKey: '' })
+
 // Per-user drag-and-drop step ordering for scenarios. Persisted server-side.
 //   scenarioStepOrders    -> committed order pulled from backend on login
 //   scenarioStepOrderDraft-> in-flight order while user drags around; only
@@ -415,6 +819,9 @@ const scenarioStepMetaEditForm = reactive({
 const scenarioStepOrders = reactive({})
 const scenarioStepOrderDraft = reactive({})
 const scenarioDragState = ref({ scenarioKey: '', stepKey: '' })
+const mockOperationEditMode = ref(false)
+const mockOperationDragState = ref('')
+let mockOperationLongPressTimer = null
 const scenarioExecutionHistory = ref([])
 const scenarioStepResults = reactive({})
 const scenarioStepSourceCache = reactive({})
@@ -475,20 +882,22 @@ const registerForm = reactive({
 // flow today. Block them on the frontend so users don't trigger an inevitable
 // backend failure. Each entry pins which mode (online/offline) is affected.
 //   - Online  + USD + HSBC      → HSBC USD 只走线下
-//   - Online  + USD + DOWSURE   → 线上 USD 资方限制
 //   - Online  + CNY + HSBC      → 线上 CNY 资方限制
 //   - Online  + CNY + FUNDPARK  → 线上 CNY 资方限制
-//   - Offline + USD + DOWSURE   → DOWSURE USD 只走线上
 //   - Offline + CNY + HSBC      → 线下 CNY 资方限制
 //   - Offline + CNY + FUNDPARK  → 线下 CNY 资方限制
+//   - Online  + USD + DOWSURE   → 注册及注册并完成绑店均禁用
+//   - Offline + USD + DOWSURE   → 注册及注册并完成绑店均禁用
+// DOWSURE + CNY registration itself is allowed in both modes; only the combined
+// online register-and-bind flow is gated, see dowsureOnlineBindingBlocked below.
 const BLOCKED_REGISTER_COMBOS = [
   { offline: false, currency: 'USD', funder_resource: 'HSBC' },
-  { offline: false, currency: 'USD', funder_resource: 'DOWSURE' },
   { offline: false, currency: 'CNY', funder_resource: 'HSBC' },
   { offline: false, currency: 'CNY', funder_resource: 'FUNDPARK' },
-  { offline: true, currency: 'USD', funder_resource: 'DOWSURE' },
   { offline: true, currency: 'CNY', funder_resource: 'HSBC' },
   { offline: true, currency: 'CNY', funder_resource: 'FUNDPARK' },
+  { offline: false, currency: 'USD', funder_resource: 'DOWSURE' },
+  { offline: true, currency: 'USD', funder_resource: 'DOWSURE' },
 ]
 const onlineUsdHsbcBlocked = computed(() =>
   BLOCKED_REGISTER_COMBOS.some(
@@ -503,12 +912,45 @@ const onlineUsdHsbcBlockedReason = computed(() => {
   const combo = `${registerForm.currency} + ${registerForm.funder_resource}`
   return `${modeText}不支持 ${combo} 组合，请切换模式或更换币种/资方。`
 })
+const dowsureOnlineBindingBlocked = computed(() =>
+  !registerForm.offline
+  && registerForm.currency !== 'USD'
+  && registerForm.funder_resource === 'DOWSURE'
+)
+const registerAndBindingBlocked = computed(() =>
+  onlineUsdHsbcBlocked.value || dowsureOnlineBindingBlocked.value
+)
+const registerAndBindingBlockedReason = computed(() =>
+  onlineUsdHsbcBlocked.value
+    ? onlineUsdHsbcBlockedReason.value
+    : 'DOWSURE 线上模式不支持注册并完成绑店，请切换到线下模式。'
+)
 
 const operationForms = reactive({
   linkSp3pl: {},
   underwritten: { amount: 500000, status: 'APPROVED' },
-  underwrittenDowsure: { status: 'APPROVED', merchant_accounts: [] },
-  dowsureCreditResult: { application_code: '', amount: 500000, credit_status: 'APPROVE' },
+  dowsureCreditResult: {
+    applicationCode: '',
+    amount: 100000,
+    processingFee: 0,
+    creditResultList: [],
+  },
+  webankCreditResult: { application_code: '', businessSum: 500000, seller_offers: [] },
+  cgbCreditResult: { amount: 200000, processingFee: 0, creditStatus: 'APPROVE' },
+  cgbLoanResult: { application_code: '', amount: 100000, processingFee: 0 },
+  cgbRepaymentResult: {
+    application_code: '',
+    payment_principal: 50000,
+    payment_interest: 500,
+    payment_overdue_interest: 0,
+  },
+  webankDrawdownResult: { application_code: '', loan_amount: 500000, service_fee_amount: 100 },
+  webankRepaymentResult: {
+    application_code: '',
+    payment_principal: 10000,
+    payment_interest: 0,
+    payment_penalty_interest: 0,
+  },
   dowsureEsignDrawdownResult: {
     application_code: '',
     credit_contract_no: '',
@@ -520,7 +962,7 @@ const operationForms = reactive({
     payment_principal: 1000,
     payment_overdue_interest: 0,
   },
-  dowsureRetryCallback: {},
+  dowsureRetryCallback: { application_code: '' },
   approvedOffer: { amount: 500000, status: 'APPROVED', failure_reason_index: 1, rejection_reason: 'fraud' },
   pspStart: { status: 'PROCESSING' },
   pspCompleted: { status: 'SUCCESS' },
@@ -528,7 +970,7 @@ const operationForms = reactive({
   drawdown: { amount: 100000, status: 'APPROVED', failure_reason_index: 1 },
   repaymentStart: { principal_amount: 1000 },
   repayment: { principal_amount: 1000, status: 'Success', failure_reason_index: 1 },
-  multiShopBinding: { state: '' },
+  multiShopBinding: { state: '', platform_seller_id: '' },
   spStatusUpdate: { platform_seller_id: '', status: 'SUCCESS', failure_reason_index: 1 },
   multiShop3plRedirect: {},
   systemEvent: {
@@ -558,10 +1000,72 @@ const isAuthenticated = computed(() => Boolean(authUser.value))
 const isAdmin = computed(() => authUser.value?.role === 'admin')
 const authDisplayName = computed(() => authUser.value?.username || '未登录')
 const authRoleLabel = computed(() => (isAdmin.value ? '管理员账号' : '普通账号'))
+const auditStats = computed(() => {
+  const rows = auditOperations.value || []
+  const successCount = rows.filter((item) => item.success === true).length
+  const failedCount = rows.filter((item) => item.success === false).length
+  const userCount = new Set(rows.map((item) => item.username).filter(Boolean)).size
+  return [
+    { label: '记录数', value: rows.length, hint: '当前筛选结果' },
+    { label: '成功', value: successCount, hint: 'success = true' },
+    { label: '失败', value: failedCount, hint: 'success = false' },
+    { label: isAdmin.value ? '用户数' : '最近时间', value: isAdmin.value ? userCount : (rows[0]?.created_at || '-'), hint: isAdmin.value ? '涉及账号' : '最新操作' },
+  ]
+})
+const environmentMonitorItems = computed(() => environmentMonitor.value?.items || [])
+const environmentMonitorOverallLabel = computed(() => {
+  const status = environmentMonitor.value?.overall
+  if (status === 'operational') return 'OPERATIONAL'
+  if (status === 'degraded') return 'DEGRADED'
+  if (status === 'down') return 'DOWN'
+  return 'CHECKING'
+})
+const environmentMonitorOverallType = computed(() => {
+  const status = environmentMonitor.value?.overall
+  if (status === 'operational') return 'success'
+  if (status === 'down') return 'danger'
+  if (status === 'degraded') return 'warning'
+  return 'info'
+})
+function statusLabel(status) {
+  if (status === 'operational' || status === 'ok') return '正常'
+  if (status === 'down') return '异常'
+  if (status === 'checking') return '检测中'
+  return '波动'
+}
+function statusTagType(status) {
+  if (status === 'operational' || status === 'ok') return 'success'
+  if (status === 'down') return 'danger'
+  if (status === 'checking') return 'info'
+  return 'warning'
+}
+function availabilityState(value) {
+  if (value === null || value === undefined || value === '') return 'checking'
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) return 'checking'
+  if (numericValue < 60) return 'down'
+  if (numericValue < 80) return 'degraded'
+  return 'ok'
+}
+function availabilityLabel(value) {
+  return statusLabel(availabilityState(value))
+}
+function availabilityTagType(value) {
+  return statusTagType(availabilityState(value))
+}
+function environmentCardState(item) {
+  const states = [availabilityState(item?.availability), availabilityState(item?.channel_availability)]
+  if (states.includes('down')) return 'down'
+  if (states.includes('degraded')) return 'degraded'
+  if (states.every((state) => state === 'ok')) return 'operational'
+  return 'checking'
+}
 const activeToolModule = computed(() => {
   if (currentView.value === 'interfaceTest') return 'interfaceTest'
+  if (currentView.value === 'aiUi') return 'aiUi'
+  if (currentView.value === 'mockApi') return 'mockApi'
   if (currentView.value === 'activity') return 'activity'
-  if (currentView.value === 'logs') return 'logs'
+  if (currentView.value === 'environmentMonitor') return 'environmentMonitor'
   if (currentView.value === 'ai') return 'ai'
   if (currentView.value === 'promptTemplates') return 'promptTemplates'
   if (currentView.value === 'about') return 'about'
@@ -605,6 +1109,20 @@ const scenarioBaseDefs = [
     description: '完整 FP USD 500K 线下注册接口自动化场景（含 sp-updateOffer + 3PL 兜底）',
     bootstrap: { env: 'reg', currency: 'USD', funder_resource: 'FUNDPARK', offline: true },
     buildSteps: () => buildFpUsdScenarioSteps('500K', { prefix: 'FP-USD-500K-Offline', offline: true }),
+  },
+  {
+    key: 'fpUsd500kOfflineDrawdown200k',
+    category: 'singleShop',
+    code: '100139',
+    name: 'FP-USD-500K-Offline-Drawdown-200K',
+    priority: 'P0',
+    description: '完整 FP USD 500K 线下流程，执行至 eSign 成功后按 200K 放款',
+    bootstrap: { env: 'reg', currency: 'USD', funder_resource: 'FUNDPARK', offline: true },
+    buildSteps: () => buildFpUsdScenarioSteps('500K', {
+      prefix: 'FP-USD-500K-Offline-Drawdown-200K',
+      offline: true,
+      drawdownAmount: 200000,
+    }),
   },
   {
     key: 'fpUsd500kOnline',
@@ -657,7 +1175,7 @@ const scenarioBaseDefs = [
     code: '100134',
     name: 'DS-CNY',
     priority: 'P0',
-    description: 'DS CNY 注册绑店后创建申请单并提交企业/法人信息',
+    description: 'DS CNY 注册后直接执行 3PL 重定向，再创建申请单并提交企业/法人信息',
     bootstrap: { env: 'reg', currency: 'CNY', funder_resource: 'DOWSURE', offline: true },
     buildSteps: () => buildDsCnyScenarioSteps(),
   },
@@ -762,6 +1280,13 @@ const scenarioBaseDefs = [
         description: '第二家店铺 3PL 重定向回调，复用注册分步接口 /api/register/3pl-redirect。',
       },
       {
+        key: 'Multi-FP-USD-500K-Increase-second-shop-3pl-redirect-cleanup',
+        type: 'api', method: 'POST', kind: 'SQL步骤',
+        title: '第二家店铺 移除 TESTOFFER 后缀并更新店铺记录',
+        endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+        payload: { env: '${env}', phone_number: '${phone_number}' },
+      },
+      {
         ...makePspStartStep('Multi-FP-USD-500K-Increase-second-shop-psp-start'),
         title: '第二家店铺psp-start',
         description: '第二家店铺 PSP started，调用 /api/mock/psp-start；后端按最新 ACTIVE SP 店铺解析 merchantAccountId。',
@@ -860,6 +1385,16 @@ const scenarioBaseDefs = [
     bootstrap: { env: 'reg', currency: 'USD', funder_resource: 'HSBC', offline: true },
     buildSteps: () => buildDmfMultiShopScenarioSteps(),
   },
+  {
+    key: 'multiDsCny',
+    category: 'multiShop',
+    code: '100142',
+    name: 'DS-CNY多店铺',
+    priority: 'P0',
+    description: '照搬单店铺 DS-CNY 全流程，并在提交联系人信息后、开始信用评估前追加第二家店铺（生成 offerId / redirect / 更新3PL店铺数据 / 校验 kiosk seller_id）',
+    bootstrap: { env: 'reg', currency: 'CNY', funder_resource: 'DOWSURE', offline: true },
+    buildSteps: () => buildDsCnyMultiShopScenarioSteps(),
+  },
 ]
 
 function scenarioStepMetaOverrideKey(scenarioKey, stepKey) {
@@ -882,6 +1417,12 @@ function applyScenarioStepMetaOverrides(scenarioKey, steps) {
     .filter(Boolean)
 }
 
+function scenarioStepStructure(scenarioKey, baseSteps) {
+  const deleted = new Set(scenarioStepStructureDeleted[scenarioKey] || [])
+  const added = scenarioStepStructureDraft[scenarioKey] || []
+  return [...baseSteps, ...added].filter((step) => step?.key && !deleted.has(step.key))
+}
+
 const interfaceScenarios = computed(() => scenarioBaseDefs.map((def) => {
   const override = scenarioMetaOverrides[def.key] || {}
   return {
@@ -894,7 +1435,10 @@ const interfaceScenarios = computed(() => scenarioBaseDefs.map((def) => {
       ? override.description
       : def.description,
     bootstrap: def.bootstrap,
-    steps: applyScenarioStepMetaOverrides(def.key, def.buildSteps()),
+    steps: scenarioStepStructure(
+      def.key,
+      applyScenarioStepMetaOverrides(def.key, def.buildSteps()),
+    ),
   }
 }))
 
@@ -1142,8 +1686,8 @@ const selectedApplicationCurrency = computed(() => (
 
 const hsbcUsdDisabledOperationKeys = new Set([
   'underwritten',
-  'underwrittenDowsure',
   'dowsureCreditResult',
+  'webankCreditResult',
   'dowsureEsignDrawdownResult',
   'dowsureRepaymentResult',
   'dowsureRetryCallback',
@@ -1158,6 +1702,17 @@ const hsbcUsdDisabledOperationKeys = new Set([
 ])
 
 const hsbcUsdDisabledReason = '当前申请单为 HSBC USD，通用/DOWSURE 状态流操作不可执行'
+
+const dowsureCnyOnlyOperationKeys = new Set([
+  'webankCreditResult',
+  'webankDrawdownResult',
+  'webankRepaymentResult',
+  'cgbCreditResult',
+  'cgbLoanResult',
+  'cgbRepaymentResult',
+])
+
+const dowsureCnyOnlyReason = '该模块仅 DOWSURE CNY 申请单可用'
 
 const dowsureCnyDisabledOperationKeys = new Set([
   'underwritten',
@@ -1177,8 +1732,8 @@ const dowsureCnyDisabledOperationKeys = new Set([
 const dowsureCnyDisabledReason = '当前申请单为 DOWSURE CNY，通用 FP/HSBC 状态流操作不可执行'
 
 const fundparkUsdDisabledOperationKeys = new Set([
-  'underwrittenDowsure',
   'dowsureCreditResult',
+  'webankCreditResult',
   'dowsureEsignDrawdownResult',
   'dowsureRepaymentResult',
   'dowsureRetryCallback',
@@ -1231,6 +1786,13 @@ const selectedApplicationIsFundparkUsd = computed(() => {
 
 function getOperationDisabledState(operation) {
   const key = operation?.key
+  if (
+    dowsureCnyOnlyOperationKeys.has(key)
+    && activeSessionId.value
+    && !selectedApplicationIsDowsureCny.value
+  ) {
+    return { disabled: true, reason: dowsureCnyOnlyReason, chip: 'DOWSURE CNY 专用' }
+  }
   if (selectedApplicationIsHsbcUsd.value && hsbcUsdDisabledOperationKeys.has(key)) {
     return { disabled: true, reason: hsbcUsdDisabledReason, chip: 'HSBC USD 禁用' }
   }
@@ -1264,11 +1826,32 @@ const shouldShowLimitApplications = computed(() => (
 ))
 
 const shouldShowDrawdownRepaymentRows = computed(() => (
-  ['repaymentStart', 'repayment', 'dowsureRepaymentResult'].includes(activeOperation.value?.key)
+  ['repaymentStart', 'repayment', 'dowsureRepaymentResult', 'webankRepaymentResult', 'cgbRepaymentResult'].includes(activeOperation.value?.key)
 ))
 
 const shouldShowDowsureMerchantAccounts = computed(() => (
-  activeOperation.value?.key === 'underwrittenDowsure'
+  activeOperation.value?.key === 'dowsureCreditResult'
+))
+
+const shouldShowWebankSellerOffers = computed(() => (
+  activeOperation.value?.key === 'webankCreditResult'
+))
+
+const applicationCodeOperationKeys = [
+  'dowsureCreditResult',
+  'dowsureEsignDrawdownResult',
+  'dowsureRepaymentResult',
+  'dowsureRetryCallback',
+  'webankCreditResult',
+  'webankDrawdownResult',
+  'webankRepaymentResult',
+  'cgbCreditResult',
+  'cgbLoanResult',
+  'cgbRepaymentResult',
+]
+
+const shouldLoadApplicationCodes = computed(() => (
+  applicationCodeOperationKeys.includes(activeOperation.value?.key)
 ))
 
 const consoleStatusCards = computed(() => [
@@ -1318,7 +1901,10 @@ const registerStatusMessage = computed(() => {
 })
 
 const operations = computed(() => [
-  { key: 'multiShopBinding', title: '多店铺 SP 绑定', icon: Link, endpoint: '/api/mock/multi-shop-binding', description: '输入 state，获取 SP 授权 URL。', fields: [{ prop: 'state', label: 'State', type: 'text', placeholder: '请输入 state' }] },
+  { key: 'multiShopBinding', title: '多店铺 SP 绑定', icon: Link, endpoint: '/api/mock/multi-shop-binding', description: '输入 state，获取 SP 授权 URL；可选填 Platform Seller ID。', fields: [
+    { prop: 'state', label: 'State', type: 'text', placeholder: '请输入 state' },
+    { prop: 'platform_seller_id', label: 'Platform Seller ID', type: 'text', placeholder: '可为空，默认自动生成' },
+  ] },
   { key: 'spStatusUpdate', title: 'SP 状态更新', icon: Cpu, endpoint: '/api/mock/sp-status-update', description: '更新 SP 状态。', fields: [
     { prop: 'platform_seller_id', label: 'Platform Seller ID', type: 'text', placeholder: '可为空，默认使用当前 session' },
     { prop: 'status', label: '状态', type: 'select', options: ['SUCCESS', 'FAIL'] },
@@ -1330,26 +1916,57 @@ const operations = computed(() => [
     { prop: 'amount', label: '核保额度', type: 'number', min: 1, step: 1000 },
     { prop: 'status', label: '状态', type: 'select', options: enumOptions.value?.underwritten_statuses ?? [] },
   ] },
-  { key: 'underwrittenDowsure', title: '核保 DOWSURE', icon: Document, endpoint: '/api/mock/underwritten-dowsure', description: '发送 DOWSURE underwrittenLimit.completed。', fields: [
-    { prop: 'status', label: '状态', type: 'select', options: enumOptions.value?.underwritten_statuses ?? [] },
+  { key: 'dowsureCreditResult', title: '授信结果 CCB', icon: Check, endpoint: '/api/mock/dowsure-credit-result', description: '发送 CCB credit-result，包含原核保店铺额度列表；applicationCode 从数据库带出，默认最新一条。', fields: [
+    { prop: 'applicationCode', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'amount', label: '授信金额', type: 'number', min: 0, step: 1000 },
+    { prop: 'processingFee', label: 'Processing Fee', type: 'number', min: 0, step: 100 },
   ] },
-  { key: 'dowsureCreditResult', title: '授信结果 DOWSURE', icon: Check, endpoint: '/api/mock/dowsure-credit-result', description: '发送 DOWSURE credit-result。', fields: [
-    { prop: 'application_code', label: 'Application Code', type: 'text', placeholder: '请输入 applicationCode' },
-    { prop: 'credit_status', label: 'Credit Status', type: 'select', options: ['APPROVE', 'REJECT'] },
-    { prop: 'amount', label: '授信金额', type: 'number', min: 0.01, step: 1000 },
-  ] },
-  { key: 'dowsureEsignDrawdownResult', title: 'eSign&drawdown DOWSURE', icon: Promotion, endpoint: '/api/mock/dowsure-esign-drawdown-result', description: '发送 DOWSURE loan 结果。', fields: [
-    { prop: 'application_code', label: 'Application Code', type: 'text', placeholder: '可为空，默认使用授信结果' },
+  { key: 'dowsureEsignDrawdownResult', title: '支用结果 CCB', icon: Promotion, endpoint: '/api/mock/dowsure-esign-drawdown-result', description: '发送 CCB loan 结果。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
     { prop: 'credit_contract_no', label: 'Credit Contract No', type: 'text', placeholder: '可为空，默认使用授信结果' },
     { prop: 'amount', label: '放款金额', type: 'number', min: 0.01, step: 1000 },
     { prop: 'processing_fee', label: 'Processing Fee', type: 'number', min: 0, step: 100 },
   ] },
-  { key: 'dowsureRepaymentResult', title: '还款结果 DOWSURE', icon: Refresh, endpoint: '/api/mock/dowsure-repayment-result', description: '发送 DOWSURE repayment 结果。', fields: [
-    { prop: 'application_code', label: 'Application Code', type: 'text', placeholder: '可为空，默认使用授信结果' },
+  { key: 'dowsureRepaymentResult', title: '还款结果 CCB', icon: Refresh, endpoint: '/api/mock/dowsure-repayment-result', description: '发送 CCB repayment 结果。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
     { prop: 'payment_principal', label: 'Payment Principal', type: 'number', min: 0, step: 100 },
     { prop: 'payment_overdue_interest', label: 'Overdue Interest', type: 'number', min: 0, step: 100 },
   ] },
-  { key: 'dowsureRetryCallback', title: '重试请求 DOWSURE', icon: Refresh, endpoint: '/api/mock/dowsure-retry-callback', description: '调用 DOWSURE callback retry，limit=100。', fields: [] },
+  { key: 'dowsureRetryCallback', title: '重试请求 CCB', icon: Refresh, endpoint: '/api/mock/dowsure-retry-callback', description: '调用 CCB callback retry，limit=100；Application Code 仅用于当前申请单反显。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+  ] },
+  { key: 'webankCreditResult', title: '授信结果 WEBANK', icon: Check, endpoint: '/api/mock/webank-credit-result', description: '输入 businessSum，并按店铺输入 applySellerBusinessSum；applicationCode 从数据库带出，默认最新一条。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'businessSum', label: 'businessSum', type: 'number', min: 0, step: 1000 },
+  ] },
+  { key: 'cgbCreditResult', title: '授信结果 CGB', icon: Check, endpoint: '/api/mock/cgb-credit-result', description: '按当前 Session 手机号查询 applicationCode（默认最新一条，可切换），自动拼接 creditCode 和 creditContractNo；creditStatus 由前端输入。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'creditStatus', label: 'creditStatus', type: 'select', options: ['APPROVE', 'REJECT'] },
+    { prop: 'amount', label: '授信金额 amount', type: 'number', min: 0, step: 1000 },
+    { prop: 'processingFee', label: 'Processing Fee', type: 'number', min: 0, step: 100 },
+  ] },
+  { key: 'cgbLoanResult', title: '支用回传 CGB', icon: Promotion, endpoint: '/api/mock/cgb-loan-result', description: '按当前 Session 手机号查询 applicationCode，并自动生成 CGB loanCode 与 loanContractNo。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'amount', label: '支用金额 amount', type: 'number', min: 0, step: 1000 },
+    { prop: 'processingFee', label: 'Processing Fee', type: 'number', min: 0, step: 100 },
+  ] },
+  { key: 'cgbRepaymentResult', title: '还款结果 CGB', icon: Refresh, endpoint: '/api/mock/cgb-repayment-result', description: '按当前手机号、DPU 放款记录和 DOWSURE t_loan 组装 CGB 还款回传；还款本金、利息和逾期利息由前端输入。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'payment_principal', label: 'paymentPrincipal', type: 'number', min: 0, step: 0.01 },
+    { prop: 'payment_interest', label: 'paymentInterest', type: 'number', min: 0, step: 0.01 },
+    { prop: 'payment_overdue_interest', label: 'paymentOverdueInterest', type: 'number', min: 0, step: 0.01 },
+  ] },
+  { key: 'webankDrawdownResult', title: '支用结果 WEBANK', icon: Promotion, endpoint: '/api/mock/webank-drawdown-result', description: '输入 loanAmount 与 serviceFee.amount，系统从数据库反查 loanCode 后发送 WEBANK loan-result。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'loan_amount', label: '支用金额', type: 'number', min: 0, step: 1000 },
+    { prop: 'service_fee_amount', label: 'serviceFee.amount', type: 'number', min: 0, step: 100 },
+  ] },
+  { key: 'webankRepaymentResult', title: '还款结果 WEBANK', icon: Refresh, endpoint: '/api/mock/webank-repayment-result', description: '选择还款单并输入还款金额，remainPrincipalAmount 自动按 outstanding_amount - paymentPrincipal 计算。', fields: [
+    { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
+    { prop: 'payment_principal', label: 'paymentPrincipal', type: 'number', min: 0, step: 1000 },
+    { prop: 'payment_interest', label: 'paymentInterest', type: 'number', min: 0, step: 1000 },
+    { prop: 'payment_penalty_interest', label: 'paymentPenaltyInterest', type: 'number', min: 0, step: 1000 },
+  ] },
   { key: 'approvedOffer', title: '审批', icon: Check, endpoint: '/api/mock/approved-offer', description: '发送审批额度、状态和原因。', fields: [
     { prop: 'amount', label: '审批金额', type: 'number', min: 1, step: 1000 },
     { prop: 'status', label: '状态', type: 'select', options: enumOptions.value?.approved_offer_statuses ?? [] },
@@ -1385,6 +2002,43 @@ const operations = computed(() => [
   { key: 'pspHsbcStart', title: 'PSP 开始 HSBC', icon: Promotion, endpoint: '/api/mock/psp-hsbc-start', description: '发送 HSBC PSP started 通知。', fields: [] },
   { key: 'pspHsbcCompleted', title: 'PSP 完成 HSBC', icon: Check, endpoint: '/api/mock/psp-hsbc-completed', description: '发送 HSBC PSP completed 通知。', fields: [{ prop: 'result', label: '结果', type: 'select', options: ['SUCCESS', 'FAIL'] }] },
 ])
+
+function isOperationVisible(operation) {
+  return true
+}
+
+function orderMockOperations(items) {
+  const configuredOrder = mockOperationEditMode.value
+    ? scenarioStepOrderDraft.mockOperations || scenarioStepOrders.mockOperations
+    : scenarioStepOrders.mockOperations
+  if (!Array.isArray(configuredOrder) || !configuredOrder.length) return items
+  const byKey = new Map(items.map((item) => [item.key, item]))
+  const seen = new Set()
+  const ordered = []
+  for (const key of configuredOrder) {
+    const item = byKey.get(key)
+    if (item && !seen.has(key)) {
+      ordered.push(item)
+      seen.add(key)
+    }
+  }
+  for (const item of items) {
+    if (!seen.has(item.key)) ordered.push(item)
+  }
+  return ordered
+}
+
+const visibleOperations = computed(() => orderMockOperations(operations.value.filter(isOperationVisible)))
+
+watch(
+  visibleOperations,
+  (items) => {
+    if (currentView.value === 'interfaceTest') return
+    if (activeOperationKey.value && !items.some((operation) => operation.key === activeOperationKey.value)) {
+      activeOperationKey.value = ''
+    }
+  },
+)
 
 function buildDmfScenarioSteps() {
   // DMF: HSBC + USD 线下注册场景。前 8 步走拆分版 /api/register/*，每步独立接口、
@@ -1719,6 +2373,13 @@ function buildDmfMultiShopScenarioSteps() {
       description: 'DMF 第二家店铺 3PL 重定向回调，复用注册分步接口 /api/register/3pl-redirect。',
     },
     {
+      key: 'Multi-DMF-second-shop-3pl-redirect-cleanup',
+      type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '第二家店铺 移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
+    },
+    {
       key: 'Multi-DMF-start-reassessment',
       type: 'api',
       method: 'POST',
@@ -1834,6 +2495,13 @@ function buildDmfMultiShopScenarioSteps() {
         phone_number: '${phone_number}',
       },
       description: 'DMF 第三家店铺 3PL 重定向回调，复用注册分步接口 /api/register/3pl-redirect。',
+    },
+    {
+      key: 'Multi-DMF-third-shop-3pl-redirect-cleanup',
+      type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '第三家店铺 移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
     },
     {
       key: 'Multi-DMF-increase-start-reassessment',
@@ -1955,7 +2623,7 @@ function buildRegisterStepGroup({
   // Online mode registers with the offer_id already attached (Amazon 3P), so
   // once Amazon SP auth callback returns the flow is finished — there is no
   // need to run sp-updateOffer / wait for dpu_manual_offer / call 3PL redirect.
-  // The offline flow (DMF / DS-CNY) still needs those 3 extra steps to bind
+  // The offline flow (DMF) still needs those 3 extra steps to bind
   // the 3P shop after registration.
   const signupTitle = offline
     ? 'POST 用户注册'
@@ -1991,9 +2659,15 @@ function buildRegisterStepGroup({
       title: 'GET redirect + POST redirect 让 offerId 生效',
       endpoint: '/api/register/amazon-redirect', operationKey: null,
       payload: {
-        env: '${env}', offer_id: '${offer_id}',
+        env: '${env}', offer_id: '${offer_id}', phone_number: '${phone_number}',
         currency, funder_resource: funderResource,
       },
+    },
+    {
+      key: `${prefix}-amazon-redirect-cleanup`, type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
     },
   ]
   const baseSteps = [
@@ -2046,7 +2720,7 @@ function buildRegisterStepGroup({
   ]
 
   // 线上注册已经带着 offer_id 完成绑店，SP auth 回调返回后即结束。
-  // 线下模式 (DMF / DS-CNY) 需要额外三步：sp-updateOffer 上报授权结果、
+  // 线下模式 (DMF) 需要额外三步：sp-updateOffer 上报授权结果、
   // 等待 dpu_manual_offer 生成 platform_offer_id、以及 3PL 重定向回调。
   if (!offline) {
     return baseSteps
@@ -2097,6 +2771,12 @@ function buildRegisterStepGroup({
     {
       key: `${prefix}-3pl-auth-result`, type: 'api', method: 'POST', kind: '场景步骤',
       title: '3PL 重定向回调 (amazon/redirect + POST)', endpoint: '/api/register/3pl-redirect', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
+    },
+    {
+      key: `${prefix}-3pl-redirect-cleanup`, type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
       payload: { env: '${env}', phone_number: '${phone_number}' },
     },
   ]
@@ -2256,6 +2936,9 @@ function buildFpUsdScenarioSteps(limitLabel, options = {}) {
       refresh: !!options.withActivateAdditionalLimit,
       defaultAmount: options.withActivateAdditionalLimit ? 800000 : 500000,
     }),
+    ...(options.drawdownAmount
+      ? [makeDrawdownStep(`${prefix}-drawdown`, 'disbursement-completed', options.drawdownAmount)]
+      : []),
   ]
 }
 
@@ -2393,12 +3076,12 @@ function makeIncreaseEsignStep(key, defaultAmount) {
   }
 }
 
-function makeDrawdownStep(key, title) {
+function makeDrawdownStep(key, title, defaultAmount = 500000) {
   return {
     key, type: 'api', method: 'POST', kind: '自定义请求',
     title: title || 'drawdown', endpoint: '/api/mock/drawdown', operationKey: 'drawdown',
     fields: [
-      { key: 'amount', label: '放款金额', type: 'number', default: 500000 },
+      { key: 'amount', label: '放款金额', type: 'number', default: defaultAmount },
       {
         key: 'status', label: '放款结果', type: 'select', default: 'APPROVED',
         options: [
@@ -2414,15 +3097,72 @@ function makeDrawdownStep(key, title) {
   }
 }
 
+// 准入类型选择器：DS-CNY 各店铺「更新3PL店铺经营数据」步骤共用，避免多处维护同一份选项。
+function buildAccessTypeField() {
+  const optionsByName = new Map(
+    shopPerformancePresets.value
+      .filter((preset) => preset?.name)
+      .map((preset) => [preset.name, { label: preset.name, value: preset.name }]),
+  )
+  return {
+    key: 'access_type', label: '准入类型', type: 'select', default: 'webank准入ccb准入',
+    options: Array.from(optionsByName.values()),
+  }
+}
+
 function buildDsCnyScenarioSteps() {
+  const registerSteps = buildRegisterStepGroup({
+    prefix: 'DS-CNY',
+    journey: '500K',
+    currency: 'CNY',
+    funderResource: 'DOWSURE',
+    offline: true,
+  })
+  const skippedBindingSteps = new Set([
+    'DS-CNY-state',
+    'DS-CNY-sp-auth',
+    'DS-CNY-update-offer',
+    'DS-CNY-3pl-auth',
+    // 原合并的 3PL 重定向回调步骤已拆成下面的 create-offer + amazon-redirect 两步。
+    'DS-CNY-3pl-auth-result',
+  ])
+
   return [
-    ...buildRegisterStepGroup({
-      prefix: 'DS-CNY',
-      journey: '500K',
-      currency: 'CNY',
-      funderResource: 'DOWSURE',
-      offline: true,
-    }),
+    ...registerSteps.filter((step) => !skippedBindingSteps.has(step.key)),
+    // 拆分原「3PL 重定向回调」：先固定生成 CNY 950000 的 offerId。
+    {
+      key: 'DS-CNY-create-offer',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: '生成 offerId',
+      endpoint: '/api/register/create-offer',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        currency: 'CNY',
+        yearly_repayment_amount: 950000,
+      },
+    },
+    // 再 GET redirect + POST redirect 让 offerId 生效。
+    {
+      key: 'DS-CNY-amazon-redirect',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: 'GET redirect + POST redirect 让 offerId 生效',
+      endpoint: '/api/register/amazon-redirect',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        offer_id: '${offer_id}',
+        phone_number: '${phone_number}',
+        currency: 'CNY',
+        funder_resource: 'DOWSURE',
+        // signup 后 harvest 的用户 token，用于给 amazon/redirect 带 Authorization: Bearer。
+        token: '${token}',
+      },
+    },
     {
       key: 'DS-CNY-shop-performance-sql',
       type: 'api',
@@ -2433,6 +3173,34 @@ function buildDsCnyScenarioSteps() {
       operationKey: null,
       payload: {
         offer_id: '${platform_offer_id}',
+        access_type: 'webank准入ccb准入',
+      },
+      // 准入类型：按所选店铺跑对应经营数据 SQL（选项复用 buildAccessTypeField）。
+      fields: [buildAccessTypeField()],
+    },
+    {
+      key: 'DS-CNY-kiosk-seller-id-check',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '校验 kiosk 生成 seller_id',
+      endpoint: '/api/mock/kiosk-seller-id-check',
+      operationKey: null,
+      payload: {
+        offer_id: '${platform_offer_id}',
+      },
+    },
+    {
+      key: 'DS-CNY-remove-test-offer-suffix',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        phone_number: '${phone_number}',
       },
     },
     {
@@ -2463,7 +3231,26 @@ function buildDsCnyScenarioSteps() {
         journey: '500K',
         currency: 'CNY',
         funder_resource: 'DOWSURE',
+        cnName: '广州测试科技有限公司',
       },
+      // 企业中文名可在「参数」里切换；后端仅 CNY+DOWSURE 分支使用 cnName。
+      fields: [
+        {
+          key: 'cnName', label: '企业中文名', type: 'select', default: '广州测试科技有限公司',
+          options: [
+            ...dowsureCnyCompanyTemplates.value
+              .filter((item) => item?.name && item?.template?.cnName)
+              .map((item) => ({ label: item.name, value: item.template.cnName })),
+          ],
+        },
+        {
+          key: 'businessLicenseImageId',
+          label: '企业营业执照',
+          type: 'select',
+          default: 'builtin:business_license',
+          options: companyImageOptions('business_license'),
+        },
+      ],
     },
     {
       key: 'DS-CNY-director-info',
@@ -2473,12 +3260,42 @@ function buildDsCnyScenarioSteps() {
       title: '邓白氏提交法人信息',
       endpoint: '/api/mock/fp-director-info',
       operationKey: null,
+      // 不再固定 nameCn/addressDetail：法人信息自动跟随上一步 business-info 选择的公司。
+      // 选默认公司→法人「奉晓慧」；选备用公司「测广州市昆袄祝山脸从股份有限公司」→法人「测近智」。
       payload: {
         journey: '500K',
         currency: 'CNY',
         funder_resource: 'DOWSURE',
-        nameCn: '奉晓慧',
-        addressDetail: '广州市天河区测试路1号',
+      },
+      fields: [
+        {
+          key: 'directorIdFrontImageId',
+          label: '法人身份证正面',
+          type: 'select',
+          default: 'builtin:director_id_front',
+          options: companyImageOptions('director_id_front'),
+        },
+        {
+          key: 'directorIdBackImageId',
+          label: '法人身份证反面',
+          type: 'select',
+          default: 'builtin:director_id_back',
+          options: companyImageOptions('director_id_back'),
+        },
+      ],
+    },
+    {
+      key: 'DS-CNY-contact-person',
+      type: 'api',
+      method: 'POST',
+      kind: '自定义请求',
+      title: '提交联系人信息',
+      endpoint: '/api/mock/fp-add-contact-information',
+      operationKey: null,
+      payload: {
+        journey: '500K',
+        currency: 'CNY',
+        funder_resource: 'DOWSURE',
       },
     },
     {
@@ -2497,6 +3314,156 @@ function buildDsCnyScenarioSteps() {
     },
   ]
 }
+
+function buildDsCnyMultiShopScenarioSteps() {
+  // 照搬单店铺 DS-CNY 全流程，然后在「提交联系人信息」之后、「开始信用评估」之前
+  // 追加第二家店铺步骤（照搬 DS-CNY 第 4/5/6/7 步：生成 offerId → redirect →
+  // 更新3PL店铺数据 → 校验 kiosk 生成 seller_id）。每次 create-offer 会生成一个新的
+  // amazon3plOfferId 并写入 ${offer_id}/${platform_offer_id}，供后续 redirect/店铺数据/
+  // kiosk 步骤复用，因此第二家店铺沿用相同的 payload 即可。
+  const baseSteps = buildDsCnyScenarioSteps()
+  const secondShopSteps = [
+    {
+      key: 'DS-CNY-second-shop-create-offer',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: '第二家店铺 生成 offerId',
+      endpoint: '/api/register/create-offer',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        currency: 'CNY',
+        yearly_repayment_amount: 950000,
+      },
+    },
+    {
+      key: 'DS-CNY-second-shop-amazon-redirect',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: '第二家店铺 GET redirect + POST redirect 让 offerId 生效',
+      endpoint: '/api/register/amazon-redirect',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        offer_id: '${offer_id}',
+        phone_number: '${phone_number}',
+        currency: 'CNY',
+        funder_resource: 'DOWSURE',
+        token: '${token}',
+      },
+    },
+    {
+      key: 'DS-CNY-second-shop-amazon-redirect-cleanup',
+      type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '第二家店铺 移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
+    },
+    {
+      key: 'DS-CNY-second-shop-shop-performance-sql',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '第二家店铺 更新3PL店铺经营数据',
+      endpoint: '/api/mock/shop-performance-cny-boost',
+      operationKey: null,
+      payload: {
+        offer_id: '${platform_offer_id}',
+        access_type: 'webank准入ccb准入',
+      },
+      fields: [buildAccessTypeField()],
+    },
+    {
+      key: 'DS-CNY-second-shop-kiosk-seller-id-check',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '第二家店铺 校验 kiosk 生成 seller_id',
+      endpoint: '/api/mock/kiosk-seller-id-check',
+      operationKey: null,
+      payload: {
+        offer_id: '${platform_offer_id}',
+      },
+    },
+  ]
+  // 第三家店铺：再照搬 DS-CNY 第 4/5/6/7 步生成一家新店铺。
+  const thirdShopSteps = [
+    {
+      key: 'DS-CNY-third-shop-create-offer',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: '第三家店铺 生成 offerId',
+      endpoint: '/api/register/create-offer',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        currency: 'CNY',
+        yearly_repayment_amount: 950000,
+      },
+    },
+    {
+      key: 'DS-CNY-third-shop-amazon-redirect',
+      type: 'api',
+      method: 'POST',
+      kind: '场景步骤',
+      title: '第三家店铺 GET redirect + POST redirect 让 offerId 生效',
+      endpoint: '/api/register/amazon-redirect',
+      operationKey: null,
+      payload: {
+        env: '${env}',
+        offer_id: '${offer_id}',
+        phone_number: '${phone_number}',
+        currency: 'CNY',
+        funder_resource: 'DOWSURE',
+        token: '${token}',
+      },
+    },
+    {
+      key: 'DS-CNY-third-shop-amazon-redirect-cleanup',
+      type: 'api', method: 'POST', kind: 'SQL步骤',
+      title: '第三家店铺 移除 TESTOFFER 后缀并更新店铺记录',
+      endpoint: '/api/register/remove-test-offer-suffix', operationKey: null,
+      payload: { env: '${env}', phone_number: '${phone_number}' },
+    },
+    {
+      key: 'DS-CNY-third-shop-shop-performance-sql',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '第三家店铺 更新3PL店铺经营数据',
+      endpoint: '/api/mock/shop-performance-cny-boost',
+      operationKey: null,
+      payload: {
+        offer_id: '${platform_offer_id}',
+        access_type: 'webank准入ccb准入',
+      },
+      fields: [buildAccessTypeField()],
+    },
+    {
+      key: 'DS-CNY-third-shop-kiosk-seller-id-check',
+      type: 'api',
+      method: 'POST',
+      kind: 'SQL步骤',
+      title: '第三家店铺 校验 kiosk 生成 seller_id',
+      endpoint: '/api/mock/kiosk-seller-id-check',
+      operationKey: null,
+      payload: {
+        offer_id: '${platform_offer_id}',
+      },
+    },
+  ]
+  secondShopSteps.push(...thirdShopSteps)
+  const insertBeforeKey = 'DS-CNY-start-reassessment'
+  const idx = baseSteps.findIndex((step) => step.key === insertBeforeKey)
+  if (idx === -1) {
+    return [...baseSteps, ...secondShopSteps]
+  }
+  return [...baseSteps.slice(0, idx), ...secondShopSteps, ...baseSteps.slice(idx)]
+}
+
 
 const aiQuickPrompts = [
   '帮我看一下当前 session 的状态，哪些关键信息还缺失？',
@@ -2551,13 +3518,24 @@ watch(
       loadDowsureMerchantAccounts()
     } else {
       dowsureMerchantAccounts.value = []
-      operationForms.underwrittenDowsure.merchant_accounts = []
+      operationForms.dowsureCreditResult.creditResultList = []
+    }
+    if (shouldShowWebankSellerOffers.value) {
+      loadWebankSellerOffers()
+    } else {
+      webankSellerOffers.value = []
+      operationForms.webankCreditResult.seller_offers = []
     }
     if (shouldShowPspAuthorizationRows.value) {
       loadPspAuthorizationRows()
     } else {
       selectedPspMerchantAccountId.value = ''
       pspSelectionTouched.value = false
+    }
+    if (shouldLoadApplicationCodes.value) {
+      loadApplicationCodes()
+    } else {
+      applicationCodeOptions.value = []
     }
   },
 )
@@ -2576,8 +3554,9 @@ watch(
 )
 
 watch(activeInterfaceScenarioKey, () => {
-  if (!activeInterfaceScenario.value.steps.some((step) => step.key === activeOperationKey.value)) {
-    activeOperationKey.value = activeInterfaceScenario.value.steps[0]?.key || ''
+  const steps = interfaceAutomationSteps.value
+  if (!steps.some((step) => step.key === activeOperationKey.value)) {
+    activeOperationKey.value = steps[0]?.key || ''
   }
   if (activeInterfaceScenario.value.bootstrap?.env) {
     connectionForm.env = activeInterfaceScenario.value.bootstrap.env
@@ -2630,10 +3609,12 @@ onMounted(async () => {
   restoreScenarioExecutionHistory()
   restoreAuthUser()
   loadContactIssues()
+  startEnvironmentMonitorAutoRefresh()
   await Promise.all([refreshHealth(), loadEnums(), loadSessions(), refreshScenarioMetaOverrides(), refreshScenarioStepMetaOverrides()])
   if (authUser.value?.username) {
     refreshScenarioStepOverrides()
     refreshScenarioStepOrders()
+    refreshCompanyImageTemplates()
   }
 })
 
@@ -2645,6 +3626,7 @@ watch(
       refreshScenarioMetaOverrides()
       refreshScenarioStepMetaOverrides()
       refreshScenarioStepOrders()
+      refreshCompanyImageTemplates()
     } else {
       // Clear cached overrides on logout so the next user doesn't see them.
       Object.keys(scenarioStepOrders).forEach((key) => { delete scenarioStepOrders[key] })
@@ -2653,13 +3635,28 @@ watch(
       Object.keys(scenarioStepOverrides).forEach((key) => {
         delete scenarioStepOverrides[key]
       })
+      scenarioStepOverridesLoaded.value = false
+      shopPerformancePresets.value = createBuiltinShopPerformancePresets()
+      resetShopPerformancePresetForm()
+      dowsureCnyCompanyTemplates.value = BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES.map(cloneDowsureCompanyTemplate)
+      resetDowsureCompanyTemplateForm()
+      companyImageTemplates.value = BUILTIN_COMPANY_IMAGE_TEMPLATES.map((item) => ({ ...item }))
+      resetCompanyImageForm()
+      aiUiCases.value = []
+      aiUiRuns.value = []
+      aiUiRuntime.value = null
+      aiUiActiveRunId.value = ''
+      clearAiUiPoll()
     }
   },
 )
 
 onBeforeUnmount(() => {
+  clearAiUiPoll()
+  stopMockOperationLongPress()
   closeSocket()
   stopSessionPolling()
+  stopEnvironmentMonitorAutoRefresh()
   window.removeEventListener('resize', syncRailViewport)
 })
 
@@ -2816,7 +3813,7 @@ async function loadDrawdownRepaymentRows() {
     const result = await fetchDrawdownRepaymentRows(activeSessionId.value)
     drawdownRepaymentRows.value = result.rows ?? []
     const currentSelectionStillValid = drawdownRepaymentRows.value.some(
-      (row) => row.lender_loan_id === selectedDowsureRepaymentLoanCode.value,
+      (row) => repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode.value,
     )
     if (drawdownRepaymentSelectionTouched.value) {
       if (!currentSelectionStillValid) {
@@ -2826,7 +3823,7 @@ async function loadDrawdownRepaymentRows() {
     } else {
       selectedDowsureRepaymentLoanCode.value = result.default_selected_lender_loan_id || ''
     }
-    if (!drawdownRepaymentRows.value.some((row) => row.lender_loan_id === selectedDowsureRepaymentLoanCode.value)) {
+    if (!drawdownRepaymentRows.value.some((row) => repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode.value)) {
       selectedDowsureRepaymentLoanCode.value = ''
     }
   } catch (error) {
@@ -2840,32 +3837,106 @@ async function loadDrawdownRepaymentRows() {
 }
 
 function selectDrawdownRepaymentRow(row) {
-  selectedDowsureRepaymentLoanCode.value = row?.lender_loan_id || ''
+  selectedDowsureRepaymentLoanCode.value = repaymentRowSelectionKey(row)
   drawdownRepaymentSelectionTouched.value = true
+}
+
+function repaymentRowSelectionKey(row) {
+  return String(row?.lender_loan_id || row?.lender_drawdown_id || '').trim()
+}
+
+function applyApplicationCodeDefaults() {
+  const codes = applicationCodeOptions.value
+  const fallback = codes.length ? codes[0] : ''
+  const targets = [
+    ['dowsureCreditResult', 'applicationCode'],
+    ['dowsureEsignDrawdownResult', 'application_code'],
+    ['dowsureRepaymentResult', 'application_code'],
+    ['dowsureRetryCallback', 'application_code'],
+    ['webankCreditResult', 'application_code'],
+    ['webankDrawdownResult', 'application_code'],
+    ['webankRepaymentResult', 'application_code'],
+    ['cgbCreditResult', 'application_code'],
+    ['cgbLoanResult', 'application_code'],
+    ['cgbRepaymentResult', 'application_code'],
+  ]
+  for (const [formKey, prop] of targets) {
+    const form = operationForms[formKey]
+    if (!form) continue
+    const current = String(form[prop] ?? '').trim()
+    if (!current || !codes.includes(current)) {
+      form[prop] = fallback
+    }
+  }
+}
+
+async function loadApplicationCodes() {
+  if (!activeSessionId.value) {
+    applicationCodeOptions.value = []
+    applyApplicationCodeDefaults()
+    return
+  }
+  loadingApplicationCodes.value = true
+  try {
+    const result = await fetchApplicationCodes(activeSessionId.value)
+    applicationCodeOptions.value = result.application_codes ?? []
+    applyApplicationCodeDefaults()
+  } catch (error) {
+    applicationCodeOptions.value = []
+    applyApplicationCodeDefaults()
+    pushActivity('error', '加载 applicationCode 失败', normalizeError(error))
+  } finally {
+    loadingApplicationCodes.value = false
+  }
 }
 
 async function loadDowsureMerchantAccounts() {
   if (!activeSessionId.value) {
     dowsureMerchantAccounts.value = []
-    operationForms.underwrittenDowsure.merchant_accounts = []
+    operationForms.dowsureCreditResult.creditResultList = []
     return
   }
   loadingDowsureMerchantAccounts.value = true
   try {
     const result = await fetchDowsureMerchantAccounts(activeSessionId.value)
     dowsureMerchantAccounts.value = result.accounts ?? []
-    operationForms.underwrittenDowsure.merchant_accounts = dowsureMerchantAccounts.value.map((item) => ({
-      merchantAccountId: item.merchantAccountId,
-      merchantAccountLimit: item.merchantAccountLimit ?? null,
-      merchant_account_id: item.merchant_account_id ?? '',
-      created_at: item.created_at ?? '',
+    operationForms.dowsureCreditResult.creditResultList = dowsureMerchantAccounts.value.map((item) => ({
+      offerId: item.offerId || '',
+      sellerId: item.sellerId || '',
+      amount: item.amount ?? operationForms.dowsureCreditResult.amount ?? 0,
     }))
   } catch (error) {
     dowsureMerchantAccounts.value = []
-    operationForms.underwrittenDowsure.merchant_accounts = []
+    operationForms.dowsureCreditResult.creditResultList = []
     pushActivity('error', '加载 DOWSURE 店铺失败', normalizeError(error))
   } finally {
     loadingDowsureMerchantAccounts.value = false
+  }
+}
+
+async function loadWebankSellerOffers() {
+  if (!activeSessionId.value) {
+    webankSellerOffers.value = []
+    operationForms.webankCreditResult.seller_offers = []
+    return
+  }
+  loadingWebankSellerOffers.value = true
+  try {
+    const result = await fetchWebankSellerOffers(activeSessionId.value)
+    webankSellerOffers.value = result.offers ?? []
+    operationForms.webankCreditResult.seller_offers = webankSellerOffers.value.map((item) => ({
+      offer_id: item.offer_id ?? '',
+      seller_id: item.seller_id ?? '',
+      marketplace_country: item.marketplace_country ?? '',
+      admissionStatus: 'ADMITTED',
+      applySellerBusinessSum: 0,
+    }))
+  } catch (error) {
+    webankSellerOffers.value = []
+    operationForms.webankCreditResult.seller_offers = []
+    pushActivity('error', '加载 WEBANK 店铺失败', normalizeError(error))
+  } finally {
+    loadingWebankSellerOffers.value = false
   }
 }
 
@@ -2933,8 +4004,8 @@ async function handleRegister() {
 }
 
 async function handleRegisterAndRunMultiShop() {
-  if (onlineUsdHsbcBlocked.value) {
-    showRegisterToast('warning', onlineUsdHsbcBlockedReason.value)
+  if (registerAndBindingBlocked.value) {
+    showRegisterToast('warning', registerAndBindingBlockedReason.value)
     return
   }
   registeringAndBinding.value = true
@@ -3140,6 +4211,12 @@ async function handleScenarioStepRun(step) {
           scenarioVariables[key] = value
         }
       }
+      // create-offer 返回的 offer_id 就是上游 amazon3plOfferId，等价于后续步骤要用的
+      // platform_offer_id。extractPlatformOfferId 只认包含 TESTOFFER 的值，这里显式回填，
+      // 保证 DS-CNY 的 shop-performance-sql / create-application 能拿到 ${platform_offer_id}。
+      if (step.endpoint === '/api/register/create-offer' && typeof data?.offer_id === 'string' && data.offer_id) {
+        scenarioVariables.platform_offer_id = data.offer_id
+      }
       // After the signup step the user actually exists in the DB; open a
       // session immediately so later /api/mock/* steps (create-application,
       // business-info, ...) see activeSessionId. Then push the freshly-issued
@@ -3320,7 +4397,15 @@ function getScenarioByKey(scenarioKey) {
 }
 
 function buildScenarioApiPayload(step, scenario = activeInterfaceScenario.value) {
-  const resolved = resolveScenarioPayload(step.payload || {})
+  const applyShopPerformancePreset = (payload) => {
+    const selectedPreset = shopPerformancePresets.value.find(
+      (preset) => preset?.name === String(payload?.access_type || '').trim(),
+    )
+    return selectedPreset
+      ? { ...payload, custom_sql: selectedPreset.custom_sql }
+      : payload
+  }
+  const resolved = applyShopPerformancePreset(resolveScenarioPayload(step.payload || {}))
   // Apply any user-saved overrides for this step on top of the resolved payload.
   // Hidden fields (e.g. failure_reason_index when sp_status=SUCCESS) are dropped
   // so we don't accidentally send stale values from a previous config.
@@ -3343,7 +4428,7 @@ function buildScenarioApiPayload(step, scenario = activeInterfaceScenario.value)
         session_id: activeSessionId.value,
         username: authUser.value?.username,
         operation_name: getScenarioOperationName(step, scenario),
-        ...merged,
+        ...applyShopPerformancePreset(merged),
       }
     }
   }
@@ -3385,6 +4470,7 @@ function getScenarioStepTimeout(step) {
   // 轮询申请单状态的后端最长会等 5 分钟（dpu_application + dpu_lender_shop_data_transmission
   // 三个条件齐了才返回），前端必须给到至少 5 分钟才能拿到结果，留 20s 缓冲。
   if (step.endpoint === '/api/mock/dmf-poll-application-ready') return 320000
+  if (step.endpoint === '/api/mock/kiosk-seller-id-check') return 320000
   return undefined
 }
 
@@ -3925,15 +5011,15 @@ function selectScenarioFromTree(scenarioKey) {
 }
 
 function selectStepFromTree(scenarioKey, stepKey) {
+  activeOperationKey.value = stepKey
+  interfaceFocusMode.value = 'step'
+  interfacePageMode.value = 'scenario'
+  stepFocusTab.value = 'params'
+  debugRequestError.value = ''
+  expandedScenarioSteps[stepKey] = true
   activeInterfaceScenarioKey.value = scenarioKey
   expandedScenarioDirectories[scenarioCategoryForKey(scenarioKey)] = true
   expandedScenarioTrees[scenarioKey] = true
-  interfacePageMode.value = 'scenario'
-  interfaceFocusMode.value = 'step'
-  stepFocusTab.value = 'actualBody'
-  debugRequestError.value = ''
-  activeOperationKey.value = stepKey
-  expandedScenarioSteps[stepKey] = true
 }
 
 async function selectDebugInterface(stepKey) {
@@ -4513,6 +5599,18 @@ async function handleScenarioSave() {
       scenarioStepOrders[scenarioKey] = draftOrder
       delete scenarioStepOrderDraft[scenarioKey]
     }
+    await saveScenarioStepOrder({
+      username: authUser.value.username,
+      scenario_key: `${scenarioKey}::structure`,
+      step_order: [
+        JSON.stringify({
+          added: scenarioStepStructureDraft[scenarioKey] || [],
+          deleted: scenarioStepStructureDeleted[scenarioKey] || [],
+        }),
+      ],
+    })
+    delete scenarioStepStructureDraft[scenarioKey]
+    delete scenarioStepStructureDeleted[scenarioKey]
     scenarioSaveState.value = `已保存 ${new Date().toLocaleTimeString()}`
     pushActivity('scenario', `${scenario.name} 已保存`, {
       scenario: scenario.name,
@@ -4825,7 +5923,7 @@ function buildPayload(operation) {
   if (operation.key === 'underwritten' && selectedLimitApplicationUniqueId.value) {
     payload.limit_application_unique_id = selectedLimitApplicationUniqueId.value
   }
-  if (['repaymentStart', 'repayment', 'dowsureRepaymentResult'].includes(operation.key) && selectedDowsureRepaymentLoanCode.value) {
+  if (['repaymentStart', 'repayment', 'dowsureRepaymentResult', 'webankRepaymentResult', 'cgbRepaymentResult'].includes(operation.key) && selectedDowsureRepaymentLoanCode.value) {
     payload.loan_code = selectedDowsureRepaymentLoanCode.value
   }
   const form = operationForms[operation.key] ?? {}
@@ -4840,13 +5938,27 @@ function buildPayload(operation) {
       payload[field.prop] = value
     }
   }
-  if (operation.key === 'underwrittenDowsure') {
-    payload.merchant_accounts = (form.merchant_accounts ?? [])
+  if (operation.key === 'dowsureCreditResult') {
+    if (!payload.applicationCode) {
+      payload.applicationCode = selectedApplication.value?.application_unique_id || sessionSummary.value?.application_unique_id || ''
+    }
+    payload.creditResultList = (form.creditResultList ?? [])
       .map((item) => ({
-        merchantAccountId: String(item.merchantAccountId ?? '').trim(),
-        merchantAccountLimit: item.merchantAccountLimit ?? null,
+        offerId: String(item.offerId ?? '').trim(),
+        sellerId: String(item.sellerId ?? '').trim(),
+        amount: item.amount ?? 0,
       }))
-      .filter((item) => item.merchantAccountId)
+      .filter((item) => item.offerId && item.sellerId)
+  }
+  if (operation.key === 'webankCreditResult') {
+    payload.seller_offers = (form.seller_offers ?? [])
+      .filter((item) => item.admissionStatus !== 'NOT_ADMITTED')
+      .map((item) => ({
+        applySellerId: String(item.seller_id ?? '').trim(),
+        applySellerBusinessSum: item.applySellerBusinessSum ?? 0,
+        sellerSiteCountryName: String(item.marketplace_country ?? '').trim(),
+      }))
+      .filter((item) => item.applySellerId)
   }
   return payload
 }
@@ -4912,19 +6024,262 @@ function summarizeOperationResult(payload) {
   return String(payload || '')
 }
 
-function openLogSystem() {
-  if (!requireAdminView('logs')) return
-  closeToolRail()
-  currentView.value = 'logs'
-  runLogSearch()
-}
-
 function openInterfaceTestView() {
   closeToolRail()
   currentView.value = 'interfaceTest'
+  interfacePageMode.value = 'scenario'
+  interfaceFocusMode.value = 'scenario'
+  Object.keys(expandedScenarioDirectories).forEach((key) => {
+    expandedScenarioDirectories[key] = false
+  })
+  Object.keys(expandedScenarioTrees).forEach((key) => {
+    expandedScenarioTrees[key] = false
+  })
   if (!activeOperationKey.value && activeInterfaceScenario.value.steps.length > 0) {
     activeOperationKey.value = activeInterfaceScenario.value.steps[0].key
   }
+}
+
+function clearAiUiPoll() {
+  if (!aiUiPollTimer) return
+  window.clearTimeout(aiUiPollTimer)
+  aiUiPollTimer = null
+}
+
+function aiUiEnvironmentLabel(environment) {
+  return aiUiEnvironmentOptions.find((item) => item.value === environment)?.label || '自定义'
+}
+
+function inferAiUiEnvironment(url) {
+  const normalizedUrl = String(url || '').trim().replace(/\/+$/, '')
+  return aiUiEnvironmentOptions.find((item) => item.url && item.url.replace(/\/+$/, '') === normalizedUrl)?.value || 'custom'
+}
+
+function handleAiUiEnvironmentChange(environment) {
+  const option = aiUiEnvironmentOptions.find((item) => item.value === environment)
+  if (option?.url) aiUiForm.url = option.url
+  else aiUiForm.url = ''
+}
+
+function resetAiUiForm() {
+  aiUiForm.id = null
+  aiUiForm.environment = 'sit'
+  aiUiForm.name = 'OFFLINE 注册入口检查-SIT-样板'
+  aiUiForm.url = 'https://expressfinance-dpu-sit.dowsure.com/en/'
+  aiUiForm.context = '这是 OFFLINE_SIGNUP_URL_DICT 的 SIT 页面入口冒烟用例。只验证环境 URL、FundPark USD 产品进入注册页以及手机号验证控件，不发送短信、不创建客户。'
+  aiUiForm.prompt = `Scenario: OFFLINE signup entry smoke test
+  Given the SIT HSBC Express Finance homepage is open
+  When I click the "Get started" button for the FundPark USD Line of Credit product
+  Then the page should show "Enter your contact details to begin"
+  And the page should show the "Mobile number" field
+  And the "Get code" button should be disabled before a mobile number is entered`
+  aiUiForm.headed = false
+  aiUiForm.viewport = { width: 1440, height: 900 }
+  aiUiNaturalLanguage.value = ''
+  aiUiStructuredYaml.value = ''
+  aiUiVariablesText.value = '{}'
+  aiUiStructuredSpec.value = null
+}
+
+function editAiUiCase(item) {
+  aiUiForm.id = item.id
+  aiUiForm.environment = item.environment || inferAiUiEnvironment(item.url)
+  aiUiForm.name = item.name || ''
+  aiUiForm.url = item.url || aiUiEnvironmentOptions.find((option) => option.value === aiUiForm.environment)?.url || ''
+  aiUiForm.context = item.context || ''
+  aiUiForm.prompt = item.prompt || ''
+  aiUiForm.headed = Boolean(item.headed)
+  aiUiForm.viewport = { width: item.viewport?.width || 1440, height: item.viewport?.height || 900 }
+  aiUiNaturalLanguage.value = ''
+  aiUiStructuredSpec.value = item.structured_spec || null
+  aiUiStructuredYaml.value = item.structured_spec?.yaml || ''
+  aiUiVariablesText.value = JSON.stringify(item.variables || item.structured_spec?.variables || {}, null, 2)
+  aiUiSelectedCaseId.value = item.id
+}
+
+async function refreshAiUiPage() {
+  if (!authUser.value?.username) return
+  aiUiLoading.value = true
+  aiUiError.value = ''
+  try {
+    const [cases, runs, runtime] = await Promise.all([
+      fetchAiUiCases(authUser.value.username),
+      fetchAiUiRuns(authUser.value.username),
+      fetchAiUiRuntimeStatus(authUser.value.username),
+    ])
+    aiUiCases.value = Array.isArray(cases) ? cases : []
+    aiUiRuns.value = Array.isArray(runs) ? [...runs].reverse() : []
+    aiUiRuntime.value = runtime || null
+    if (!aiUiSelectedCaseId.value && aiUiCases.value.length) editAiUiCase(aiUiCases.value[0])
+    if (aiUiActiveRunId.value) await pollAiUiRun(aiUiActiveRunId.value)
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || 'AI UI 数据加载失败'
+  } finally {
+    aiUiLoading.value = false
+  }
+}
+
+function openAiUiView() {
+  closeToolRail()
+  currentView.value = 'aiUi'
+  void refreshAiUiPage()
+}
+
+function switchAiUiPageMode(mode) {
+  aiUiPageMode.value = mode === 'reports' ? 'reports' : 'cases'
+  if (aiUiPageMode.value === 'reports') void refreshAiUiPage()
+}
+
+function openAiUiReport(path) {
+  if (!path) return
+  window.open(path, '_blank', 'noopener,noreferrer')
+}
+
+async function generateAiUiStructuredCase() {
+  if (!authUser.value?.username) return ElMessage.warning('请先登录')
+  if (aiUiNaturalLanguage.value.trim().length < 8) {
+    return ElMessage.warning('请先用一句完整自然语言描述测试场景')
+  }
+  aiUiGenerating.value = true
+  aiUiError.value = ''
+  try {
+    const result = await generateAiUiCase({
+      username: authUser.value.username,
+      instruction: aiUiNaturalLanguage.value.trim(),
+      environment: aiUiForm.environment,
+      context: aiUiForm.context,
+    })
+    aiUiStructuredSpec.value = result
+    aiUiStructuredYaml.value = result.yaml || ''
+    aiUiVariablesText.value = JSON.stringify(result.variables || {}, null, 2)
+    aiUiForm.name = result.name || aiUiForm.name
+    aiUiForm.prompt = result.gherkin || aiUiForm.prompt
+    if (result.environment && aiUiEnvironmentOptions.some((option) => option.value === result.environment)) {
+      aiUiForm.environment = result.environment
+      handleAiUiEnvironmentChange(result.environment)
+    }
+    ElMessage.success('已生成结构化用例并转换为 Gherkin')
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || '自然语言转换失败'
+  } finally {
+    aiUiGenerating.value = false
+  }
+}
+
+function parseAiUiVariables() {
+  const text = aiUiVariablesText.value.trim()
+  if (!text) return {}
+  const parsed = JSON.parse(text)
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error('变量必须是 JSON 对象')
+  }
+  return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, String(value)]))
+}
+
+async function saveAiUiCaseRecord() {
+  if (!authUser.value?.username) return ElMessage.warning('请先登录')
+  aiUiSaving.value = true
+  aiUiError.value = ''
+  try {
+    const variables = parseAiUiVariables()
+    const row = await saveAiUiCase({
+      username: authUser.value.username,
+      name: aiUiForm.name,
+      environment: aiUiForm.environment,
+      url: aiUiForm.url,
+      context: aiUiForm.context,
+      prompt: aiUiForm.prompt,
+      variables,
+      structured_spec: aiUiStructuredSpec.value,
+      headed: aiUiForm.headed,
+      viewport: aiUiForm.viewport,
+    }, aiUiForm.id)
+    const index = aiUiCases.value.findIndex((item) => item.id === row.id)
+    if (index >= 0) aiUiCases.value[index] = row
+    else aiUiCases.value.unshift(row)
+    editAiUiCase(row)
+    ElMessage.success('AI UI 用例已保存')
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || '保存失败'
+  } finally {
+    aiUiSaving.value = false
+  }
+}
+
+async function removeAiUiCase(item) {
+  try {
+    await ElMessageBox.confirm(`确定删除「${item.name}」吗？`, '删除确认', {
+      type: 'warning',
+      confirmButtonText: '确定删除',
+      cancelButtonText: '取消',
+    })
+    await deleteAiUiCase(item.id, authUser.value.username)
+    aiUiCases.value = aiUiCases.value.filter((row) => row.id !== item.id)
+    if (aiUiForm.id === item.id) resetAiUiForm()
+    ElMessage.success('AI UI 用例已删除')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    aiUiError.value = error?.payload?.message || error?.message || '删除失败'
+  }
+}
+
+async function runAiUiCase(item = null) {
+  const target = item || aiUiCases.value.find((row) => row.id === aiUiSelectedCaseId.value)
+  if (!target) return ElMessage.warning('请先保存一个 AI UI 用例')
+  aiUiPendingCase.value = target
+  aiUiRunConfirmVisible.value = true
+}
+
+async function confirmAiUiRun() {
+  const target = aiUiPendingCase.value
+  if (!target) return
+  aiUiRunConfirmVisible.value = false
+  aiUiSelectedCaseId.value = target.id
+  aiUiError.value = ''
+  try {
+    const run = await startAiUiRun({ username: authUser.value.username, case_id: target.id })
+    aiUiActiveRunId.value = run.id
+    aiUiRuns.value = [run, ...aiUiRuns.value.filter((row) => row.id !== run.id)]
+    await pollAiUiRun(run.id)
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || '启动失败'
+  }
+}
+
+async function pollAiUiRun(runId) {
+  clearAiUiPoll()
+  if (!runId || !authUser.value?.username) return
+  try {
+    const run = await fetchAiUiRun(runId, authUser.value.username)
+    const index = aiUiRuns.value.findIndex((row) => row.id === run.id)
+    if (index >= 0) aiUiRuns.value[index] = run
+    else aiUiRuns.value.unshift(run)
+    if (['running'].includes(run.status)) {
+      aiUiPollTimer = window.setTimeout(() => pollAiUiRun(runId), 1500)
+    } else {
+      aiUiActiveRunId.value = ''
+    }
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || '执行状态查询失败'
+  }
+}
+
+async function stopAiUiCaseRun(run) {
+  clearAiUiPoll()
+  try {
+    const updated = await stopAiUiRun(run.id, authUser.value.username)
+    const index = aiUiRuns.value.findIndex((row) => row.id === updated.id)
+    if (index >= 0) aiUiRuns.value[index] = updated
+    aiUiActiveRunId.value = ''
+  } catch (error) {
+    aiUiError.value = error?.payload?.message || error?.message || '停止失败'
+  }
+}
+
+function openMockApiView() {
+  if (!requireAdminView('interfaceTest')) return
+  closeToolRail()
+  currentView.value = 'mockApi'
 }
 
 function openActivityView() {
@@ -4933,10 +6288,64 @@ function openActivityView() {
   refreshAuditOperations()
 }
 
+function openEnvironmentMonitorView() {
+  closeToolRail()
+  currentView.value = 'environmentMonitor'
+  refreshEnvironmentMonitor()
+  resetEnvironmentMonitorCountdown()
+}
+
+async function refreshEnvironmentMonitor(force = false) {
+  environmentMonitorLoading.value = true
+  environmentMonitorError.value = ''
+  try {
+    const result = await fetchEnvironmentMonitor({ force })
+    environmentMonitor.value = result || { overall: 'checking', checked_at: '', items: [] }
+    if (!force && result?.overall === 'checking') {
+      window.setTimeout(() => {
+        if (currentView.value === 'environmentMonitor') refreshEnvironmentMonitor(false)
+      }, 2500)
+    }
+  } catch (error) {
+    environmentMonitorError.value = normalizeError(error)
+  } finally {
+    environmentMonitorLoading.value = false
+    resetEnvironmentMonitorCountdown()
+  }
+}
+
+function resetEnvironmentMonitorCountdown() {
+  environmentMonitorRefreshSeconds.value = 60
+}
+
+function startEnvironmentMonitorAutoRefresh() {
+  stopEnvironmentMonitorAutoRefresh()
+  environmentMonitorRefreshTimer = window.setInterval(() => {
+    if (currentView.value !== 'environmentMonitor') {
+      resetEnvironmentMonitorCountdown()
+      return
+    }
+    environmentMonitorRefreshSeconds.value -= 1
+    if (environmentMonitorLoading.value && environmentMonitorRefreshSeconds.value <= 0) {
+      environmentMonitorRefreshSeconds.value = 1
+      return
+    }
+    if (environmentMonitorRefreshSeconds.value <= 0 && !environmentMonitorLoading.value) {
+      refreshEnvironmentMonitor(true)
+    }
+  }, 1000)
+}
+
+function stopEnvironmentMonitorAutoRefresh() {
+  if (!environmentMonitorRefreshTimer) return
+  window.clearInterval(environmentMonitorRefreshTimer)
+  environmentMonitorRefreshTimer = null
+}
+
 async function refreshAuditOperations() {
   if (!authUser.value?.username) {
     auditOperations.value = []
-    auditError.value = '请先登录后再查看操作轨迹'
+    auditError.value = '请先登录后再查看使用日志'
     return
   }
   auditLoading.value = true
@@ -4952,6 +6361,7 @@ async function refreshAuditOperations() {
     if (session) params.session_id = session
     const rows = await fetchUserOperations(params)
     auditOperations.value = Array.isArray(rows) ? rows : []
+    expandedAuditOperationIds.value = new Set()
   } catch (error) {
     auditError.value = error?.payload?.message || error?.message || '查询失败'
     auditOperations.value = []
@@ -5095,8 +6505,10 @@ function toggleToolRail() {
   toolRailOpen.value = !toolRailOpen.value
 }
 
-function closeToolRail() {
-  toolRailOpen.value = false
+function closeToolRail(force = false) {
+  if (force || isMobileViewport.value) {
+    toolRailOpen.value = false
+  }
 }
 
 function resetLogSearch() {
@@ -5112,6 +6524,7 @@ async function runLogSearch() {
     const [startTime, endTime] = logSearchForm.timeRange || []
     const previewMode = isLogPreviewMode.value
     logSearchResults.value = await fetchLogs({
+      username: authUser.value?.username,
       keyword: logSearchForm.keyword?.trim() || undefined,
       start_time: startTime || undefined,
       end_time: endTime || undefined,
@@ -5203,6 +6616,17 @@ async function refreshScenarioStepOrders() {
       for (const row of rows) {
         if (!row?.scenario_key) continue
         const order = Array.isArray(row.step_order) ? row.step_order.filter(Boolean).map(String) : []
+        if (row.scenario_key.endsWith('::structure')) {
+          const scenarioKey = row.scenario_key.slice(0, -'::structure'.length)
+          try {
+            const structure = JSON.parse(order[0] || '{}')
+            if (Array.isArray(structure.added) && structure.added.length) scenarioStepStructureDraft[scenarioKey] = structure.added
+            if (Array.isArray(structure.deleted) && structure.deleted.length) scenarioStepStructureDeleted[scenarioKey] = structure.deleted
+          } catch (error) {
+            // Ignore malformed legacy structure rows.
+          }
+          continue
+        }
         if (order.length) scenarioStepOrders[row.scenario_key] = order
       }
     }
@@ -5246,7 +6670,13 @@ function onScenarioStepDrop(event, scenarioKey, targetStepKey) {
   const targetIndex = nextOrder.indexOf(targetStepKey)
   if (srcIndex === -1 || targetIndex === -1) return
   nextOrder.splice(srcIndex, 1)
-  const insertIndex = nextOrder.indexOf(targetStepKey)
+  let insertIndex = nextOrder.indexOf(targetStepKey)
+  // 根据鼠标落点决定插入到目标步骤上方还是下方，拖动上下位置更直观。
+  const targetElement = event?.currentTarget
+  if (targetElement?.getBoundingClientRect) {
+    const rect = targetElement.getBoundingClientRect()
+    if (event.clientY > rect.top + rect.height / 2) insertIndex += 1
+  }
   nextOrder.splice(insertIndex, 0, src.stepKey)
   scenarioStepOrderDraft[scenarioKey] = nextOrder
   scenarioSaveState.value = '未保存'
@@ -5254,6 +6684,72 @@ function onScenarioStepDrop(event, scenarioKey, targetStepKey) {
 
 function onScenarioStepDragEnd() {
   scenarioDragState.value = { scenarioKey: '', stepKey: '' }
+}
+
+function startMockOperationLongPress() {
+  if (!isAdmin.value) return
+  stopMockOperationLongPress()
+  mockOperationLongPressTimer = window.setTimeout(() => {
+    mockOperationEditMode.value = true
+    if (!Array.isArray(scenarioStepOrderDraft.mockOperations)) {
+      scenarioStepOrderDraft.mockOperations = visibleOperations.value.map((item) => item.key)
+    }
+    ElMessage.info('已进入排版模式，拖动模块调整顺序')
+  }, 550)
+}
+
+function stopMockOperationLongPress() {
+  clearTimeout(mockOperationLongPressTimer)
+  mockOperationLongPressTimer = null
+}
+
+function onMockOperationDragStart(event, operationKey) {
+  if (!isAdmin.value || !mockOperationEditMode.value) return
+  mockOperationDragState.value = operationKey
+  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.setData('text/plain', operationKey)
+}
+
+function onMockOperationDrop(event, targetKey) {
+  if (!isAdmin.value || !mockOperationEditMode.value) return
+  event.preventDefault()
+  const sourceKey = mockOperationDragState.value || event.dataTransfer.getData('text/plain')
+  mockOperationDragState.value = ''
+  if (!sourceKey || sourceKey === targetKey) return
+  const currentOrder = (scenarioStepOrderDraft.mockOperations || visibleOperations.value.map((item) => item.key)).slice()
+  const sourceIndex = currentOrder.indexOf(sourceKey)
+  const targetIndex = currentOrder.indexOf(targetKey)
+  if (sourceIndex === -1 || targetIndex === -1) return
+  currentOrder.splice(sourceIndex, 1)
+  currentOrder.splice(currentOrder.indexOf(targetKey), 0, sourceKey)
+  scenarioStepOrderDraft.mockOperations = currentOrder
+}
+
+function onMockOperationDragEnd() {
+  mockOperationDragState.value = ''
+}
+
+function cancelMockOperationLayout() {
+  delete scenarioStepOrderDraft.mockOperations
+  mockOperationEditMode.value = false
+}
+
+async function saveMockOperationLayout() {
+  if (!authUser.value?.username || !isAdmin.value) return
+  const order = (scenarioStepOrderDraft.mockOperations || visibleOperations.value.map((item) => item.key)).slice()
+  try {
+    await saveScenarioStepOrder({
+      username: authUser.value.username,
+      scenario_key: 'mockOperations',
+      step_order: order,
+    })
+    scenarioStepOrders.mockOperations = order
+    delete scenarioStepOrderDraft.mockOperations
+    mockOperationEditMode.value = false
+    ElMessage.success('Mock 操作排版已保存，所有账号将使用新顺序')
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '排版保存失败')
+  }
 }
 
 function openScenarioMetaEditor() {
@@ -5315,6 +6811,45 @@ function openScenarioStepMetaEditor(scenario, step) {
   scenarioStepMetaEditVisible.value = true
 }
 
+function openScenarioAddStep(scenario, afterStep) {
+  if (!isAdmin.value) {
+    ElMessage.warning('仅管理员可添加步骤')
+    return
+  }
+  const steps = scenario?.steps || []
+  scenarioAddStepForm.scenarioKey = scenario?.key || ''
+  scenarioAddStepForm.afterStepKey = afterStep?.key || ''
+  scenarioAddStepForm.sourceStepKey = steps.find((item) => item.key !== afterStep?.key)?.key || ''
+  scenarioAddStepVisible.value = true
+}
+
+function addScenarioStepAfter() {
+  const scenario = interfaceScenarios.value.find((item) => item.key === scenarioAddStepForm.scenarioKey)
+  const source = scenario?.steps?.find((item) => item.key === scenarioAddStepForm.sourceStepKey)
+  if (!scenario || !source) return
+  const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+  const step = JSON.parse(JSON.stringify({
+    ...source,
+    key: `${scenario.key}-custom-${suffix}`,
+    title: `${source.title}（副本）`,
+  }))
+  const current = (scenarioStepStructureDraft[scenario.key] || []).slice()
+  const deleted = new Set(scenarioStepStructureDeleted[scenario.key] || [])
+  deleted.delete(step.key)
+  scenarioStepStructureDeleted[scenario.key] = Array.from(deleted)
+  const all = scenario.steps.filter((item) => !deleted.has(item.key)).map((item) => item.key)
+  const addedByKey = new Map(current.map((item) => [item.key, item]))
+  addedByKey.set(step.key, step)
+  scenarioStepStructureDraft[scenario.key] = Array.from(addedByKey.values())
+  const order = (scenarioStepOrderDraft[scenario.key] || scenarioStepOrders[scenario.key] || all).filter((key) => key !== step.key)
+  const index = Math.max(0, order.indexOf(scenarioAddStepForm.afterStepKey))
+  order.splice(index + 1, 0, step.key)
+  scenarioStepOrderDraft[scenario.key] = order
+  scenarioSaveState.value = '未保存'
+  scenarioAddStepVisible.value = false
+  ElMessage.success('步骤已加入草稿，点击右上角保存后生效')
+}
+
 async function saveScenarioStepMetaEditor() {
   if (!authUser.value?.username || !scenarioStepMetaEditForm.scenarioKey || !scenarioStepMetaEditForm.stepKey) return
   scenarioStepMetaEditSaving.value = true
@@ -5348,35 +6883,24 @@ async function saveScenarioStepMetaEditor() {
 async function hideScenarioStepMeta(scenario, step) {
   if (!isAdmin.value || !authUser.value?.username || !scenario?.key || !step?.key) return
   try {
-    await ElMessageBox.confirm(`确定隐藏步骤「${step.title}」吗？所有用户的场景树都会隐藏该步骤。`, '隐藏步骤', { type: 'warning' })
+    await ElMessageBox.confirm(`确定删除步骤「${step.title}」吗？点击右上角保存后才会对场景生效。`, '删除步骤', { type: 'warning' })
   } catch {
     return
   }
-  try {
-    const override = scenarioStepMetaOverrides[scenarioStepMetaOverrideKey(scenario.key, step.key)] || {}
-    const row = await saveScenarioStepMetaOverride({
-      username: authUser.value.username,
-      scenario_key: scenario.key,
-      step_key: step.key,
-      title: override.title || step.title || null,
-      description: override.description || step.description || '',
-      is_hidden: true,
-    })
-    scenarioStepMetaOverrides[scenarioStepMetaOverrideKey(row.scenario_key, row.step_key)] = {
-      title: row.title || '',
-      description: row.description || '',
-      is_hidden: Boolean(row.is_hidden),
-      updated_by: row.updated_by || '',
-      updated_at: row.updated_at || '',
-    }
+  const deleted = new Set(scenarioStepStructureDeleted[scenario.key] || [])
+  deleted.add(step.key)
+  scenarioStepStructureDeleted[scenario.key] = Array.from(deleted)
+  // 如果目标步骤来自新增草稿，同时从新增列表移除，避免下一次计算时被重新带回。
+  if (Array.isArray(scenarioStepStructureDraft[scenario.key])) {
+    scenarioStepStructureDraft[scenario.key] = scenarioStepStructureDraft[scenario.key]
+      .filter((item) => item?.key !== step.key)
+  }
+  scenarioSaveState.value = '未保存'
     if (activeOperationKey.value === step.key) {
       activeOperationKey.value = interfaceAutomationSteps.value[0]?.key || ''
       interfaceFocusMode.value = activeOperationKey.value ? 'step' : 'scenario'
     }
-    ElMessage.success('步骤已隐藏')
-  } catch (error) {
-    ElMessage.error(error?.payload?.message || error?.message || '隐藏失败')
-  }
+    ElMessage.success('步骤已加入删除草稿，点击右上角保存后生效')
 }
 
 async function resetScenarioStepMetaEditor() {
@@ -5401,16 +6925,44 @@ async function resetScenarioStepMetaEditor() {
 
 async function refreshScenarioStepOverrides() {
   if (!authUser.value?.username) return
+  scenarioStepOverridesLoaded.value = false
   try {
     const rows = await fetchScenarioStepOverrides(authUser.value.username)
     Object.keys(scenarioStepOverrides).forEach((key) => {
       delete scenarioStepOverrides[key]
     })
+    shopPerformancePresets.value = createBuiltinShopPerformancePresets()
+    dowsureCnyCompanyTemplates.value = BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES.map(cloneDowsureCompanyTemplate)
     if (Array.isArray(rows)) {
       for (const row of rows) {
         if (!row?.scenario_key || !row?.step_key) continue
         const payload = { ...(row.payload || {}) }
         scenarioStepOverrides[scenarioStepOverrideKey(row.scenario_key, row.step_key)] = payload
+        if (
+          row.scenario_key === SHOP_PERFORMANCE_PRESET_SCENARIO
+          && row.step_key === SHOP_PERFORMANCE_PRESET_STEP
+        ) {
+          shopPerformancePresets.value = mergeShopPerformancePresets(
+            Array.isArray(payload.presets) ? payload.presets : [],
+          )
+        }
+        if (
+          row.scenario_key === DOWSURE_COMPANY_TEMPLATE_SCENARIO
+          && row.step_key === DOWSURE_COMPANY_TEMPLATE_STEP
+        ) {
+          const customTemplates = Array.isArray(payload.templates)
+            ? payload.templates
+              .map(normalizeDowsureCompanyTemplate)
+              .filter(Boolean)
+            : []
+          const templatesByName = new Map(
+            BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATES
+              .map(cloneDowsureCompanyTemplate)
+              .map((item) => [item.name, item]),
+          )
+          customTemplates.forEach((item) => templatesByName.set(item.name, item))
+          dowsureCnyCompanyTemplates.value = Array.from(templatesByName.values())
+        }
         // If the saved payload embeds an `_enabled` flag, mirror it onto the
         // in-memory step-enabled map so the tree renders the disabled state
         // that this user previously saved. Missing / true keeps the default
@@ -5424,10 +6976,23 @@ async function refreshScenarioStepOverrides() {
         }
       }
     }
+    scenarioStepOverridesLoaded.value = true
   } catch (error) {
-    // Silent failure: overrides simply fall back to defaults.
-    pushActivity('error', '加载场景参数偏好失败', normalizeError(error))
+    // Keep scenarioStepOverridesLoaded false so whole-array saves stay blocked
+    // instead of writing the builtin-only list back over the stored records.
+    pushActivity('error', '加载场景参数偏好失败，请刷新页面后再保存配置', normalizeError(error))
+    ElMessage.error('加载已保存的 Mock 配置失败，请刷新页面后再编辑，避免覆盖已有配置')
   }
+}
+
+// Guard for the whole-array payloads (shop performance presets, company
+// templates). They are rebuilt from the in-memory list on every save, so
+// writing before a successful load would drop the stored custom records.
+function ensureScenarioStepOverridesLoaded() {
+  if (scenarioStepOverridesLoaded.value) return true
+  ElMessage.error('已保存的 Mock 配置尚未加载成功，请刷新页面后再编辑，避免覆盖已有配置')
+  refreshScenarioStepOverrides()
+  return false
 }
 
 function getScenarioStepOverride(scenarioKey, stepKey) {
@@ -5454,6 +7019,567 @@ function isStepFieldVisible(field, draft) {
     return Boolean(field.visibleWhen(draft || {}))
   } catch (error) {
     return true
+  }
+}
+
+function resetShopPerformancePresetForm() {
+  shopPerformancePresetForm.name = ''
+  shopPerformancePresetForm.custom_sql = ''
+  shopPerformancePresetError.value = ''
+  editingShopPerformancePresetName.value = ''
+}
+
+async function refreshShopPerformanceBuiltinPresets() {
+  if (!authUser.value?.username || shopPerformanceBuiltinLoading.value) return
+  shopPerformanceBuiltinLoading.value = true
+  try {
+    const payload = await fetchShopPerformanceBuiltinPresets(authUser.value.username)
+    const builtinRows = Array.isArray(payload?.presets) ? payload.presets : []
+    const builtinSqlByName = new Map(
+      builtinRows
+        .filter((item) => item?.name && item?.custom_sql)
+        .map((item) => [String(item.name), String(item.custom_sql)]),
+    )
+    shopPerformancePresets.value = shopPerformancePresets.value.map((preset) => {
+      if (!preset.is_builtin) return preset
+      const builtinSql = builtinSqlByName.get(preset.name) || preset.builtin_sql || ''
+      return {
+        ...preset,
+        builtin_sql: builtinSql,
+        custom_sql: preset.is_customized ? preset.custom_sql : builtinSql,
+      }
+    })
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '加载内置店铺配置失败')
+  } finally {
+    shopPerformanceBuiltinLoading.value = false
+  }
+}
+
+async function openShopPerformanceManager() {
+  shopPerformanceManagerVisible.value = true
+  await refreshShopPerformanceBuiltinPresets()
+}
+
+function startNewShopPerformancePreset() {
+  resetShopPerformancePresetForm()
+  shopPerformanceEditorVisible.value = true
+}
+
+function companyImageTypeLabel(imageType) {
+  return {
+    business_license: '企业营业执照',
+    director_id_front: '法人身份证正面',
+    director_id_back: '法人身份证反面',
+  }[imageType] || imageType
+}
+
+function companyImageOptions(imageType) {
+  return companyImageTemplates.value
+    .filter((item) => item.image_type === imageType)
+    .map((item) => ({ label: item.name, value: String(item.id) }))
+}
+
+const companyImagePreviewUrl = computed(() => {
+  if (companyImageLocalPreview.value) return companyImageLocalPreview.value
+  const username = encodeURIComponent(authUser.value?.username || '')
+  if (companyImageForm.is_builtin) {
+    return `/api/company-image-templates/builtin/${companyImageForm.image_type}/content?username=${username}`
+  }
+  if (companyImageForm.id) {
+    return `/api/company-image-templates/${companyImageForm.id}/content?username=${username}`
+  }
+  return ''
+})
+
+async function refreshCompanyImageTemplates() {
+  if (!authUser.value?.username) return
+  try {
+    const rows = await fetchCompanyImageTemplates(authUser.value.username)
+    const templatesByKey = new Map(
+      BUILTIN_COMPANY_IMAGE_TEMPLATES.map((item) => [
+        `${item.image_type}:${item.name}`,
+        { ...item },
+      ]),
+    )
+    if (Array.isArray(rows)) {
+      rows.forEach((item) => {
+        templatesByKey.set(`${item.image_type}:${item.name}`, { ...item, is_builtin: false })
+      })
+    }
+    companyImageTemplates.value = Array.from(templatesByKey.values())
+  } catch (error) {
+    pushActivity('error', '加载公司图片模板失败', normalizeError(error))
+  }
+}
+
+function resetCompanyImageForm() {
+  companyImageForm.id = ''
+  companyImageForm.name = ''
+  companyImageForm.image_type = 'business_license'
+  companyImageForm.filename = ''
+  companyImageForm.is_builtin = false
+  companyImageFile.value = null
+  companyImageLocalPreview.value = ''
+  companyImageError.value = ''
+  companyImageFileInputKey.value += 1
+}
+
+function editCompanyImageTemplate(item) {
+  companyImageForm.id = item?.is_builtin ? '' : String(item?.id || '')
+  companyImageForm.name = item?.name || ''
+  companyImageForm.image_type = item?.image_type || 'business_license'
+  companyImageForm.filename = item?.filename || ''
+  companyImageForm.is_builtin = Boolean(item?.is_builtin)
+  companyImageFile.value = null
+  companyImageLocalPreview.value = ''
+  companyImageError.value = ''
+  companyImageFileInputKey.value += 1
+}
+
+function handleCompanyImageFileChange(event) {
+  companyImageFile.value = event?.target?.files?.[0] || null
+  companyImageLocalPreview.value = ''
+  if (companyImageFile.value) {
+    const reader = new FileReader()
+    reader.onload = () => {
+      companyImageLocalPreview.value = String(reader.result || '')
+    }
+    reader.readAsDataURL(companyImageFile.value)
+  }
+}
+
+async function saveCompanyImageRecord() {
+  if (!authUser.value?.username) return
+  const name = companyImageForm.name.trim()
+  if (!name) {
+    companyImageError.value = '请输入图片名称'
+    return
+  }
+  if (!companyImageForm.id && !companyImageFile.value) {
+    companyImageError.value = companyImageForm.is_builtin
+      ? '替换内置图片时请选择新的图片文件'
+      : '请选择要上传的图片'
+    return
+  }
+  companyImageSaving.value = true
+  companyImageError.value = ''
+  const replacingBuiltin = companyImageForm.is_builtin
+  try {
+    await saveCompanyImageTemplate(
+      {
+        username: authUser.value.username,
+        name,
+        image_type: companyImageForm.image_type,
+        file: companyImageFile.value,
+      },
+      companyImageForm.id || null,
+    )
+    ElMessage.success(
+      companyImageForm.id
+        ? '图片配置已更新'
+        : (replacingBuiltin ? '内置图片已替换' : '图片配置已创建'),
+    )
+    resetCompanyImageForm()
+    await refreshCompanyImageTemplates()
+  } catch (error) {
+    companyImageError.value = error?.payload?.detail || error?.payload?.message || error?.message || '保存失败'
+    ElMessage.error(companyImageError.value)
+  } finally {
+    companyImageSaving.value = false
+  }
+}
+
+async function removeCompanyImageTemplate(item) {
+  if (!item?.id || item.is_builtin || !authUser.value?.username) return
+  try {
+    await ElMessageBox.confirm(`确定删除图片配置「${item.name}」吗？`, '删除图片配置', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await deleteCompanyImageTemplate(item.id, authUser.value.username)
+    if (companyImageForm.id === String(item.id)) resetCompanyImageForm()
+    await refreshCompanyImageTemplates()
+    ElMessage.success('图片配置已删除')
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '删除失败')
+  }
+}
+
+async function openCompanyImageManager() {
+  companyImageManagerVisible.value = true
+  await refreshCompanyImageTemplates()
+}
+
+function normalizeDowsureCompanyTemplate(item) {
+  const name = String(item?.name || '').trim()
+  const source = item?.template
+  const directorSource = item?.directorTemplate
+  const contactSource = item?.contactTemplate
+  if (
+    !name
+    || !source
+    || typeof source !== 'object'
+    || Array.isArray(source)
+    || !directorSource
+    || typeof directorSource !== 'object'
+    || Array.isArray(directorSource)
+    || !contactSource
+    || typeof contactSource !== 'object'
+    || Array.isArray(contactSource)
+  ) return null
+  const cnName = String(source.cnName || '').trim()
+  const regNo = String(source.regNo || '').trim()
+  const address = String(source.address || '').trim()
+  const directorName = String(directorSource.nameCn || '').trim()
+  const directorMobile = String(directorSource.mobileNumber?.number || '').trim()
+  const directorExtend = directorSource.dowsurePersonInfoExtend
+  const idNumber = String(directorExtend?.idNumber || '').trim()
+  const directorAddress = String(directorExtend?.addressDetail || '').trim()
+  const dateOfBirth = String(directorSource.dateOfBirth || '').trim()
+  const contactName = String(contactSource.fullChineseName || '').trim()
+  const contactMobile = String(contactSource.mobileNumber || '').trim()
+  const contactEmail = String(contactSource.email || '').trim()
+  if (
+    !cnName
+    || !regNo
+    || !address
+    || !directorName
+    || !directorMobile
+    || !idNumber
+    || !directorAddress
+    || !dateOfBirth
+    || !contactName
+    || !contactMobile
+    || !contactEmail
+  ) return null
+  const contactNumber = source.contactNumber && typeof source.contactNumber === 'object'
+    ? source.contactNumber
+    : {}
+  return {
+    name,
+    template: {
+      enName: String(source.enName || ''),
+      cnName,
+      regNo,
+      address,
+      contactNumber: {
+        countryCode: String(contactNumber.countryCode || '+86'),
+        number: '',
+      },
+      operationAddressFlag: source.operationAddressFlag !== false,
+      operationAddress: String(source.operationAddress || ''),
+      businessDocName: String(source.businessDocName || '营业执照.png'),
+    },
+    directorTemplate: {
+      position: String(directorSource.position || 'DIRECTOR_AND_LEGAL_REPRESENTATIVE'),
+      nameCn: directorName,
+      nameEn: String(directorSource.nameEn || ''),
+      mobileNumber: {
+        countryCode: String(directorSource.mobileNumber?.countryCode || '+86'),
+        number: directorMobile,
+      },
+      dowsurePersonInfoExtend: {
+        idNumber,
+        idCardStartDate: String(directorExtend?.idCardStartDate || ''),
+        idCardEndDate: String(directorExtend?.idCardEndDate || ''),
+        longTermFlag: String(directorExtend?.longTermFlag ?? 'true'),
+        addressDetail: directorAddress,
+      },
+      dateOfBirth,
+      frontDocName: String(directorSource.frontDocName || '身份证正面.png'),
+      backDocName: String(directorSource.backDocName || '身份证反面.png'),
+      emailAddress: String(directorSource.emailAddress || `${directorMobile}@qq.com`),
+      idDocumentType: String(directorSource.idDocumentType || 'PRC_RESIDENT_ID_CARD'),
+    },
+    contactTemplate: {
+      isDraft: Boolean(contactSource.isDraft),
+      isExistingPerson: Boolean(contactSource.isExistingPerson),
+      selectedPersonId: String(contactSource.selectedPersonId || ''),
+      fullChineseName: contactName,
+      email: contactEmail,
+      mobileNumber: contactMobile,
+      phoneCountryCode: String(contactSource.phoneCountryCode || '+86'),
+    },
+  }
+}
+
+function resetDowsureCompanyTemplateForm() {
+  dowsureCompanyTemplateForm.name = DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.name
+  dowsureCompanyTemplateForm.templateText = JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.template, null, 2)
+  dowsureCompanyTemplateForm.directorTemplateText = JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.directorTemplate, null, 2)
+  dowsureCompanyTemplateForm.contactTemplateText = JSON.stringify(DEFAULT_DOWSURE_CNY_COMPANY_TEMPLATE.contactTemplate, null, 2)
+  dowsureCompanyTemplateError.value = ''
+  editingDowsureCompanyTemplateName.value = ''
+}
+
+function startNewDowsureCompanyTemplate() {
+  resetDowsureCompanyTemplateForm()
+  dowsureCompanyTemplateForm.name = ''
+}
+
+function openDowsureCompanyTemplateManager() {
+  dowsureCompanyTemplateManagerVisible.value = true
+  if (dowsureCnyCompanyTemplates.value.length) {
+    editDowsureCompanyTemplate(dowsureCnyCompanyTemplates.value[0])
+  } else {
+    startNewDowsureCompanyTemplate()
+  }
+}
+
+function editDowsureCompanyTemplate(item) {
+  dowsureCompanyTemplateForm.name = item?.name || ''
+  dowsureCompanyTemplateForm.templateText = JSON.stringify(item?.template || {}, null, 2)
+  dowsureCompanyTemplateForm.directorTemplateText = JSON.stringify(item?.directorTemplate || {}, null, 2)
+  dowsureCompanyTemplateForm.contactTemplateText = JSON.stringify(item?.contactTemplate || {}, null, 2)
+  dowsureCompanyTemplateError.value = ''
+  editingDowsureCompanyTemplateName.value = item?.name || ''
+}
+
+function parseDowsureCompanyTemplate() {
+  let parsed
+  let directorParsed
+  let contactParsed
+  try {
+    parsed = JSON.parse(dowsureCompanyTemplateForm.templateText || '{}')
+    directorParsed = JSON.parse(dowsureCompanyTemplateForm.directorTemplateText || '{}')
+    contactParsed = JSON.parse(dowsureCompanyTemplateForm.contactTemplateText || '{}')
+  } catch (error) {
+    return { error: `三接口模板中存在无效 JSON：${error.message}` }
+  }
+  const normalized = normalizeDowsureCompanyTemplate({
+    name: dowsureCompanyTemplateForm.name,
+    template: parsed,
+    directorTemplate: directorParsed,
+    contactTemplate: contactParsed,
+  })
+  if (!normalized) {
+    return { error: '必须同时完整配置企业、法人和联系人模板，请检查必填姓名、证件号、手机号、邮箱和地址。' }
+  }
+  return { template: normalized }
+}
+
+async function saveDowsureCompanyTemplate() {
+  if (!authUser.value?.username) {
+    ElMessage.warning('请先登录后再保存公司模板')
+    return
+  }
+  if (!ensureScenarioStepOverridesLoaded()) return
+  const name = dowsureCompanyTemplateForm.name.trim()
+  if (!name) {
+    ElMessage.warning('请输入参数名称')
+    return
+  }
+  const parsed = parseDowsureCompanyTemplate()
+  if (parsed.error) {
+    dowsureCompanyTemplateError.value = parsed.error
+    ElMessage.error(parsed.error)
+    return
+  }
+  dowsureCompanyTemplateError.value = ''
+  const existingName = editingDowsureCompanyTemplateName.value
+  const nextTemplates = dowsureCnyCompanyTemplates.value
+    .filter((item) => item.name !== existingName && item.name !== name)
+    .concat(parsed.template)
+  const key = scenarioStepOverrideKey(DOWSURE_COMPANY_TEMPLATE_SCENARIO, DOWSURE_COMPANY_TEMPLATE_STEP)
+  dowsureCompanyTemplateSaving.value = true
+  try {
+    await saveScenarioStepOverride({
+      username: authUser.value.username,
+      scenario_key: DOWSURE_COMPANY_TEMPLATE_SCENARIO,
+      step_key: DOWSURE_COMPANY_TEMPLATE_STEP,
+      payload: { templates: nextTemplates },
+    })
+    dowsureCnyCompanyTemplates.value = nextTemplates
+    scenarioStepOverrides[key] = { templates: nextTemplates }
+    ElMessage.success(`「${name}」已保存，可在企业中文名下拉框中选择`)
+    startNewDowsureCompanyTemplate()
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '保存失败')
+  } finally {
+    dowsureCompanyTemplateSaving.value = false
+  }
+}
+
+async function deleteDowsureCompanyTemplate(item) {
+  if (!authUser.value?.username || !item?.name) return
+  if (BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATE_NAMES.has(item.name)) {
+    ElMessage.warning('内置公司模板不能删除')
+    return
+  }
+  if (!ensureScenarioStepOverridesLoaded()) return
+  try {
+    await ElMessageBox.confirm(`确定删除「${item.name}」吗？`, '删除公司模板', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  const nextTemplates = dowsureCnyCompanyTemplates.value.filter((entry) => entry.name !== item.name)
+  const key = scenarioStepOverrideKey(DOWSURE_COMPANY_TEMPLATE_SCENARIO, DOWSURE_COMPANY_TEMPLATE_STEP)
+  try {
+    await saveScenarioStepOverride({
+      username: authUser.value.username,
+      scenario_key: DOWSURE_COMPANY_TEMPLATE_SCENARIO,
+      step_key: DOWSURE_COMPANY_TEMPLATE_STEP,
+      payload: { templates: nextTemplates },
+    })
+    dowsureCnyCompanyTemplates.value = nextTemplates
+    scenarioStepOverrides[key] = { templates: nextTemplates }
+    if (editingDowsureCompanyTemplateName.value === item.name) startNewDowsureCompanyTemplate()
+    ElMessage.success(`「${item.name}」已删除`)
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '删除失败')
+  }
+}
+
+function editShopPerformancePreset(preset) {
+  shopPerformancePresetForm.name = preset?.name || ''
+  shopPerformancePresetForm.custom_sql = preset?.custom_sql || ''
+  shopPerformancePresetError.value = ''
+  editingShopPerformancePresetName.value = preset?.name || ''
+  shopPerformanceEditorVisible.value = true
+}
+
+function validateShopPerformanceCustomSql(customSql) {
+  let sql = String(customSql || '').trim()
+  if (!sql) return '请输入自定义经营数据 SQL。'
+  if (sql.endsWith(';')) sql = sql.slice(0, -1).trim()
+  if (sql.includes(';')) return '自定义 SQL 只允许单条 UPDATE，不能包含多个语句。'
+  const compactSql = sql.replace(/\s+/g, ' ').trim()
+  if (!/^UPDATE\s+(?:dpu_seller_center\.)?dpu_3pl_shop_performance\s+SET\s+/i.test(compactSql)) {
+    return '自定义 SQL 必须以 UPDATE dpu_seller_center.dpu_3pl_shop_performance SET 开始。'
+  }
+  if (!/\sWHERE\s+/i.test(compactSql)) {
+    return '自定义 SQL 必须包含 WHERE 条件。'
+  }
+  if (!/\bamazon_3pl_offer_id\s*=\s*(?:'[^']*'|"[^"]*"|[^\s,)]+)/i.test(compactSql)) {
+    return "WHERE 条件必须使用 amazon_3pl_offer_id = '...' 限定目标店铺。"
+  }
+  const forbidden = compactSql.match(/\b(DELETE|INSERT|REPLACE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|CALL)\b/i)
+  if (forbidden) {
+    return `自定义 SQL 不允许包含 ${forbidden[1].toUpperCase()}。`
+  }
+  return ''
+}
+
+async function saveShopPerformancePreset() {
+  if (!authUser.value?.username) {
+    ElMessage.warning('请先登录后再保存 Mock 接口参数')
+    return
+  }
+  if (!ensureScenarioStepOverridesLoaded()) return
+  const existingName = editingShopPerformancePresetName.value
+  const name = BUILTIN_SHOP_PERFORMANCE_NAME_SET.has(existingName)
+    ? existingName
+    : shopPerformancePresetForm.name.trim()
+  const customSql = shopPerformancePresetForm.custom_sql.trim()
+  if (!name) {
+    ElMessage.warning('请输入参数名称，例如“店铺20”')
+    return
+  }
+  if (!customSql) {
+    ElMessage.warning('请输入自定义经营数据 SQL')
+    return
+  }
+  const validationError = validateShopPerformanceCustomSql(customSql)
+  if (validationError) {
+    shopPerformancePresetError.value = validationError
+    ElMessage.error(validationError)
+    return
+  }
+  shopPerformancePresetError.value = ''
+  const nextEffectivePresets = shopPerformancePresets.value
+    .filter((preset) => preset.name !== existingName && preset.name !== name)
+    .concat({
+      name,
+      custom_sql: customSql,
+      builtin_sql: shopPerformancePresets.value.find((preset) => preset.name === name)?.builtin_sql || '',
+      is_builtin: BUILTIN_SHOP_PERFORMANCE_NAME_SET.has(name),
+      is_customized: true,
+    })
+  const persistedPresets = serializeShopPerformancePresets(nextEffectivePresets)
+  const nextPresets = mergeShopPerformancePresets(persistedPresets)
+  const key = scenarioStepOverrideKey(SHOP_PERFORMANCE_PRESET_SCENARIO, SHOP_PERFORMANCE_PRESET_STEP)
+  shopPerformancePresetSaving.value = true
+  try {
+    await saveScenarioStepOverride({
+      username: authUser.value.username,
+      scenario_key: SHOP_PERFORMANCE_PRESET_SCENARIO,
+      step_key: SHOP_PERFORMANCE_PRESET_STEP,
+      payload: { presets: persistedPresets },
+    })
+    shopPerformancePresets.value = nextPresets
+    scenarioStepOverrides[key] = { presets: persistedPresets }
+    await refreshShopPerformanceBuiltinPresets()
+    ElMessage.success(`「${name}」参数已保存，可在接口测试的店铺下拉框中选择`)
+    shopPerformanceEditorVisible.value = false
+    resetShopPerformancePresetForm()
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '保存失败')
+  } finally {
+    shopPerformancePresetSaving.value = false
+  }
+}
+
+async function deleteShopPerformancePreset(preset) {
+  if (!authUser.value?.username || !preset?.name) return
+  if (!ensureScenarioStepOverridesLoaded()) return
+  const isBuiltin = BUILTIN_SHOP_PERFORMANCE_NAME_SET.has(preset.name)
+  if (isBuiltin && !preset.custom_sql) {
+    ElMessage.info('当前已经是内置配置')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      isBuiltin
+        ? `确定将「${preset.name}」恢复为后端内置配置吗？`
+        : `确定删除「${preset.name}」吗？删除后接口测试下拉框将不再显示该选项。`,
+      isBuiltin ? '恢复内置配置' : '删除 Mock 参数',
+      {
+      type: 'warning',
+      confirmButtonText: isBuiltin ? '恢复' : '删除',
+      cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+  const persistedPresets = serializeShopPerformancePresets(
+    shopPerformancePresets.value.filter((item) => item.name !== preset.name),
+  )
+  const nextPresets = mergeShopPerformancePresets(persistedPresets)
+  const key = scenarioStepOverrideKey(SHOP_PERFORMANCE_PRESET_SCENARIO, SHOP_PERFORMANCE_PRESET_STEP)
+  try {
+    await saveScenarioStepOverride({
+      username: authUser.value.username,
+      scenario_key: SHOP_PERFORMANCE_PRESET_SCENARIO,
+      step_key: SHOP_PERFORMANCE_PRESET_STEP,
+      payload: { presets: persistedPresets },
+    })
+    shopPerformancePresets.value = nextPresets
+    scenarioStepOverrides[key] = { presets: persistedPresets }
+    await refreshShopPerformanceBuiltinPresets()
+    if (editingShopPerformancePresetName.value === preset.name) resetShopPerformancePresetForm()
+    ElMessage.success(isBuiltin ? `「${preset.name}」已恢复内置配置` : `「${preset.name}」已删除`)
+  } catch (error) {
+    ElMessage.error(error?.payload?.message || error?.message || '删除失败')
+  }
+}
+
+function isStepFieldDisabled(field, draft) {
+  if (typeof field?.disabledWhen !== 'function') return Boolean(field?.disabled)
+  try {
+    return Boolean(field.disabledWhen(draft || {}))
+  } catch (error) {
+    return Boolean(field?.disabled)
   }
 }
 
@@ -5631,6 +7757,11 @@ function openPromptTemplateUse(template) {
   }
   promptTemplateUseTarget.value = template
   promptTemplateUseForm.user_input = ''
+  // 重置分列参数：清空旧值，按当前模板占位符建空输入。
+  Object.keys(promptTemplateUseParams).forEach((k) => delete promptTemplateUseParams[k])
+  for (const key of useDialogTargetPlaceholders.value) {
+    promptTemplateUseParams[key] = ''
+  }
   // If the template pins an environment (e.g. douke approval), force it and
   // disable the picker in the dialog; otherwise fall back to the user's
   // current session env.
@@ -5639,6 +7770,49 @@ function openPromptTemplateUse(template) {
   promptTemplateUseResult.value = null
   promptTemplateUseError.value = ''
   promptTemplateUseVisible.value = true
+}
+
+function handlePromptTemplateParamChange(key) {
+  if (key === 'access_mode' && promptTemplateUseParams.access_mode === 'NOT_ADMITTED') {
+    promptTemplateUseParams.quota_year1_sales_value = ''
+  }
+  normalizePromptTemplateShopParams()
+}
+
+function getPromptTemplateParamOptions(key) {
+  if (
+    key === 'country'
+    && promptTemplateUseTarget.value?.title === '广发-豆沙添加店铺'
+  ) {
+    return [
+      { label: 'US', value: 'US' },
+      { label: 'DE', value: 'DE' },
+    ]
+  }
+  if (key === 'country' && promptTemplateUseParams.shop_type === '3PL') {
+    return [{ label: 'DE', value: 'DE' }]
+  }
+  if (key === 'sp_mode' && promptTemplateUseParams.shop_type === '3PL') {
+    return [{ label: '未授权（NOT_AUTHORIZED）', value: 'NOT_AUTHORIZED' }]
+  }
+  if (key === 'sp_mode' && promptTemplateUseParams.shop_type === 'SP') {
+    return [{ label: '已授权（AUTHORIZED）', value: 'AUTHORIZED' }]
+  }
+  return PROMPT_PARAM_SELECT_OPTIONS[key] || null
+}
+
+function normalizePromptTemplateShopParams() {
+  if (promptTemplateUseParams.shop_type === '3PL') {
+    promptTemplateUseParams.country = 'DE'
+    promptTemplateUseParams.sp_mode = 'NOT_AUTHORIZED'
+  }
+  if (promptTemplateUseParams.shop_type === 'SP') {
+    promptTemplateUseParams.sp_mode = 'AUTHORIZED'
+  }
+}
+
+function isPromptTemplateParamOptional(key) {
+  return OPTIONAL_PROMPT_PARAMS.has(key)
 }
 
 function copyPromptToAi(template) {
@@ -5658,9 +7832,27 @@ function copyPromptToAi(template) {
 async function executePromptTemplateAction() {
   const template = promptTemplateUseTarget.value
   if (!template || !authUser.value?.username) return
-  if (!promptTemplateUseForm.user_input.trim()) {
-    ElMessage.warning('请输入描述')
-    return
+  // 有占位符时用分列输入拼装 user_input（key = value，逐行），无占位符走自由文本。
+  const paramFields = useDialogParamFields.value
+  let userInput = ''
+  if (paramFields.length) {
+    normalizePromptTemplateShopParams()
+    const missing = paramFields.filter(
+      (f) => !isPromptTemplateParamOptional(f.key) && !String(promptTemplateUseParams[f.key] ?? '').trim(),
+    )
+    if (missing.length) {
+      ElMessage.warning(`请填写：${missing.map((f) => f.label).join('、')}`)
+      return
+    }
+    userInput = paramFields
+      .map((f) => `${f.key} = ${String(promptTemplateUseParams[f.key] ?? '').trim()}`)
+      .join('\n')
+  } else {
+    if (!promptTemplateUseForm.user_input.trim()) {
+      ElMessage.warning('请输入描述')
+      return
+    }
+    userInput = promptTemplateUseForm.user_input
   }
   promptTemplateUseLoading.value = true
   promptTemplateUseError.value = ''
@@ -5668,13 +7860,28 @@ async function executePromptTemplateAction() {
   try {
     const payload = {
       username: authUser.value.username,
-      user_input: promptTemplateUseForm.user_input,
+      user_input: userInput,
       env: promptTemplateUseForm.env || undefined,
+    }
+    // 有分列参数时把结构化 params 一并传给后端，后端直接机械替换 ${key}、跳过 AI，
+    // 避免超长脚本（存储过程）被 AI 截断或改写。
+    if (paramFields.length) {
+      const params = {}
+      for (const f of paramFields) {
+        params[f.key] = String(promptTemplateUseParams[f.key] ?? '').trim()
+      }
+      payload.params = params
     }
     const result = await executePromptTemplate(template.id, payload)
     promptTemplateUseResult.value = result
   } catch (error) {
-    promptTemplateUseError.value = error?.payload?.message || error?.message || '执行失败'
+    const responseData = error?.payload?.data || error?.payload
+    if (responseData?.execution || responseData?.summary || responseData?.rendered) {
+      promptTemplateUseResult.value = responseData
+      promptTemplateUseError.value = error?.payload?.message || responseData?.execution?.message || error?.message || '执行失败'
+    } else {
+      promptTemplateUseError.value = error?.payload?.message || error?.message || '执行失败'
+    }
   } finally {
     promptTemplateUseLoading.value = false
   }
@@ -6295,11 +8502,11 @@ function buildAiContext() {
       <el-icon><Fold v-if="toolRailOpen" /><Expand v-else /></el-icon>
       <span>{{ toolRailOpen ? '收起工具' : '展开工具' }}</span>
     </button>
-    <div v-if="toolRailOpen && isMobileViewport" class="tool-rail-scrim" @click="closeToolRail"></div>
+    <div v-if="toolRailOpen && isMobileViewport" class="tool-rail-scrim" @click="closeToolRail(true)"></div>
     <aside class="tool-side-rail" :class="{ open: toolRailOpen }" aria-label="工具入口">
       <div class="tool-side-rail-head">
         <span>工具入口</span>
-        <button type="button" aria-label="收起工具入口" @click="closeToolRail">
+        <button type="button" aria-label="收起工具入口" @click="closeToolRail(true)">
           <el-icon><Fold /></el-icon>
         </button>
       </div>
@@ -6327,18 +8534,32 @@ function buildAiContext() {
             <small>workflow 调试入口</small>
           </span>
         </button>
+        <button class="side-tool-action tone-ai-ui" :class="{ active: activeToolModule === 'aiUi' }" type="button" @click="openAiUiView">
+          <span class="side-tool-icon"><el-icon><Cpu /></el-icon></span>
+          <span class="side-tool-label">
+            <strong>AI UI 自动化</strong>
+            <small>视觉驱动 UI 用例</small>
+          </span>
+        </button>
+        <button v-if="isAdmin" class="side-tool-action tone-api" :class="{ active: activeToolModule === 'mockApi' }" type="button" @click="openMockApiView">
+          <span class="side-tool-icon"><el-icon><Monitor /></el-icon></span>
+          <span class="side-tool-label">
+            <strong>Mock 接口</strong>
+            <small>经营数据参数配置</small>
+          </span>
+        </button>
         <button class="side-tool-action tone-activity" :class="{ active: activeToolModule === 'activity' }" type="button" @click="openActivityView">
           <span class="side-tool-icon"><el-icon><Clock /></el-icon></span>
           <span class="side-tool-label">
-            <strong>操作轨迹</strong>
-            <small>历史操作可按手机号查询</small>
+            <strong>使用日志</strong>
+            <small>{{ isAdmin ? '所有用户操作记录' : '我的历史操作记录' }}</small>
           </span>
         </button>
-        <button v-if="isAdmin" class="side-tool-action tone-logs" :class="{ active: activeToolModule === 'logs' }" type="button" @click="openLogSystem">
-          <span class="side-tool-icon"><el-icon><Search /></el-icon></span>
+        <button class="side-tool-action tone-monitor" :class="{ active: activeToolModule === 'environmentMonitor' }" type="button" @click="openEnvironmentMonitorView">
+          <span class="side-tool-icon"><el-icon><Cpu /></el-icon></span>
           <span class="side-tool-label">
-            <strong>日志系统</strong>
-            <small>实时与历史日志</small>
+            <strong>环境监测</strong>
+            <small>网关检测/请求测试健康度</small>
           </span>
         </button>
         <button class="side-tool-action tone-ai" :class="{ active: activeToolModule === 'ai' }" type="button" @click="openAiPage">
@@ -6453,9 +8674,13 @@ function buildAiContext() {
             <el-icon><Tickets /></el-icon>
             <span>接口测试</span>
           </button>
-          <button v-if="isAdmin" class="hero-action" :class="{ active: activeToolModule === 'logs' }" type="button" @click="openLogSystem">
-            <el-icon><Search /></el-icon>
-            <span>日志系统</span>
+          <button class="hero-action" :class="{ active: activeToolModule === 'activity' }" type="button" @click="openActivityView">
+            <el-icon><Clock /></el-icon>
+            <span>使用日志</span>
+          </button>
+          <button class="hero-action" :class="{ active: activeToolModule === 'environmentMonitor' }" type="button" @click="openEnvironmentMonitorView">
+            <el-icon><Cpu /></el-icon>
+            <span>环境监测</span>
           </button>
           <button class="hero-action" :class="{ active: activeToolModule === 'ai' }" type="button" @click="openAiPage">
             <el-icon><ChatLineRound /></el-icon>
@@ -6587,8 +8812,8 @@ function buildAiContext() {
               plain
               :icon="Link"
               :loading="registeringAndBinding"
-              :disabled="onlineUsdHsbcBlocked"
-              :title="onlineUsdHsbcBlocked ? onlineUsdHsbcBlockedReason : ''"
+              :disabled="registerAndBindingBlocked"
+              :title="registerAndBindingBlocked ? registerAndBindingBlockedReason : ''"
               @click="handleRegisterAndRunMultiShop"
             >注册并完成绑店</el-button>
           </div>
@@ -7034,6 +9259,7 @@ function buildAiContext() {
                         v-if="field.type === 'select'"
                         v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
                         class="scenario-step-config-input"
+                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
                       >
                         <el-option
                           v-for="option in field.options || []"
@@ -7047,15 +9273,27 @@ function buildAiContext() {
                         v-model.number="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
                         type="number"
                         class="scenario-step-config-input"
+                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
+                      />
+                      <el-input
+                        v-else-if="field.type === 'textarea'"
+                        v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
+                        type="textarea"
+                        :autosize="field.autosize || { minRows: 4, maxRows: 10 }"
+                        :placeholder="field.placeholder || ''"
+                        class="scenario-step-config-input"
+                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
                       />
                       <el-input
                         v-else
                         v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
                         class="scenario-step-config-input"
+                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
                       />
+                      <small v-if="field.hint" class="scenario-step-config-note">{{ field.hint }}</small>
                     </div>
                   </div>
-                  <div v-if="isAdmin" class="scenario-step-config-actions">
+                  <div v-if="isAuthenticated" class="scenario-step-config-actions">
                     <el-button
                       type="primary"
                       :loading="scenarioStepOverrideSaving[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]"
@@ -7076,7 +9314,7 @@ function buildAiContext() {
                     <span class="scenario-step-config-hint">
                       {{ scenarioStepOverrides[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]
                         ? '当前使用已保存参数（只读）'
-                        : '当前使用默认参数（只读，仅管理员可修改）' }}
+                        : '当前使用默认参数（登录后可修改并保存）' }}
                     </span>
                   </div>
                 </template>
@@ -7092,6 +9330,11 @@ function buildAiContext() {
                 </div>
                 <div v-else class="response-empty">该步骤没有可配置参数。</div>
                 <div v-if="interfacePageMode !== 'debug' && isAdmin && selectedInterfaceStep" class="scenario-step-admin-actions">
+                  <el-button
+                    plain
+                    :icon="Plus"
+                    @click="openScenarioAddStep(activeInterfaceScenario, selectedInterfaceStep)"
+                  >添加步骤</el-button>
                   <el-button
                     plain
                     :icon="Edit"
@@ -7418,6 +9661,537 @@ function buildAiContext() {
           <el-button type="primary" :loading="scenarioStepMetaEditSaving" @click="saveScenarioStepMetaEditor">保存</el-button>
         </template>
       </el-dialog>
+
+      <el-dialog v-model="scenarioAddStepVisible" title="在下一步添加步骤" width="520px" append-to-body>
+        <el-form label-position="top">
+          <el-form-item label="复制哪个步骤">
+            <el-select v-model="scenarioAddStepForm.sourceStepKey" style="width: 100%">
+              <el-option
+                v-for="step in (interfaceScenarios.find((item) => item.key === scenarioAddStepForm.scenarioKey)?.steps || [])"
+                :key="`add-source-${step.key}`"
+                :label="step.title"
+                :value="step.key"
+              />
+            </el-select>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="scenarioAddStepVisible = false">取消</el-button>
+          <el-button type="primary" @click="addScenarioStepAfter">添加到草稿</el-button>
+        </template>
+      </el-dialog>
+    </section>
+
+    <section v-else-if="currentView === 'aiUi'" class="tool-page-view ai-ui-view">
+      <header class="tool-page-head ai-ui-page-head">
+        <div class="head-copy">
+          <span class="eyebrow"><span class="eyebrow-dot"></span>Midscene.js</span>
+          <h2>AI UI 自动化</h2>
+          <p>用自然语言描述页面动作和视觉断言，独立执行浏览器 UI 测试。</p>
+        </div>
+        <div class="ai-ui-head-actions">
+          <div class="ai-ui-page-switch" role="tablist" aria-label="AI UI 页面切换">
+            <button
+              v-for="mode in aiUiPageModes"
+              :key="mode.key"
+              type="button"
+              role="tab"
+              :aria-selected="aiUiPageMode === mode.key"
+              :class="{ active: aiUiPageMode === mode.key }"
+              @click="switchAiUiPageMode(mode.key)"
+            >{{ mode.label }}</button>
+          </div>
+          <el-tag :type="aiUiRuntime?.dependencies && aiUiRuntime?.configured ? 'success' : 'warning'" effect="plain">
+            {{ aiUiRuntime?.dependencies && aiUiRuntime?.configured ? '运行环境就绪' : '需要配置运行环境' }}
+          </el-tag>
+          <el-button plain :icon="Refresh" :loading="aiUiLoading" @click="refreshAiUiPage">刷新</el-button>
+          <el-button plain @click="backToConsole">返回控制台</el-button>
+        </div>
+      </header>
+
+      <div v-if="aiUiError" class="ai-ui-error">{{ aiUiError }}</div>
+      <template v-if="aiUiPageMode === 'cases'">
+      <div class="ai-ui-layout">
+        <aside class="ai-ui-case-list surface-card">
+          <div class="ai-ui-section-head">
+            <div><strong>用例</strong><span>{{ aiUiCases.length }} 条</span></div>
+            <el-button type="primary" plain :icon="Plus" @click="resetAiUiForm">新建</el-button>
+          </div>
+          <div v-if="!aiUiCases.length" class="ai-ui-empty">还没有 AI UI 用例，先创建一个页面冒烟用例。</div>
+          <button
+            v-for="item in aiUiCases"
+            :key="item.id"
+            type="button"
+            class="ai-ui-case-item"
+            :class="{ active: item.id === aiUiSelectedCaseId }"
+            @click="editAiUiCase(item)"
+          >
+            <strong>{{ item.name }}</strong>
+            <small>{{ item.url }}</small>
+            <div class="ai-ui-case-meta">
+              <el-tag size="small" effect="plain">{{ aiUiEnvironmentLabel(item.environment || inferAiUiEnvironment(item.url)) }}</el-tag>
+              <span>{{ item.updated_at || item.created_at }}</span>
+            </div>
+          </button>
+        </aside>
+
+        <main class="ai-ui-editor surface-card">
+          <div class="ai-ui-section-head">
+            <div>
+              <strong>{{ aiUiForm.id ? '编辑 UI 用例' : '新建 UI 用例' }}</strong>
+              <span>步骤使用 Midscene Gherkin：Given / When / Then / And</span>
+            </div>
+            <div class="ai-ui-editor-actions">
+              <el-button
+                type="success"
+                plain
+                :disabled="!aiUiForm.id || Boolean(aiUiActiveRunId)"
+                @click="runAiUiCase()"
+              >执行</el-button>
+            </div>
+          </div>
+          <section class="ai-ui-generator">
+            <div class="ai-ui-generator-head">
+              <div>
+                <strong>自然语言生成结构化用例</strong>
+                <span>先描述场景，生成后可继续编辑，再保存执行。</span>
+              </div>
+              <el-button type="primary" plain :loading="aiUiGenerating" @click="generateAiUiStructuredCase">生成 YAML</el-button>
+            </div>
+            <el-input
+              v-model="aiUiNaturalLanguage"
+              type="textarea"
+              :rows="3"
+              placeholder="例如：UAT 手机号注册进入安全设置页，填写密码，选择第一个安全问题并输入 test，不要提交。"
+            />
+          </section>
+          <el-form label-position="top" class="ai-ui-form">
+            <el-form-item label="用例名称">
+              <el-input v-model.trim="aiUiForm.name" maxlength="200" />
+            </el-form-item>
+            <el-form-item label="运行环境">
+              <el-select
+                v-model="aiUiForm.environment"
+                aria-label="AI UI 运行环境"
+                @change="handleAiUiEnvironmentChange"
+              >
+                <el-option
+                  v-for="option in aiUiEnvironmentOptions"
+                  :key="`ai-ui-env-${option.value}`"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+              <span class="ai-ui-field-hint">选择环境后自动填充 OFFLINE_SIGNUP_URL_DICT 对应地址。</span>
+            </el-form-item>
+            <el-form-item label="目标 URL">
+              <el-input
+                v-model.trim="aiUiForm.url"
+                :disabled="aiUiForm.environment !== 'custom'"
+                placeholder="https://uat.example.com 或 http://127.0.0.1:8000"
+              />
+            </el-form-item>
+            <el-form-item label="测试上下文">
+              <el-input v-model="aiUiForm.context" type="textarea" :rows="3" placeholder="补充业务背景、页面规则和不应点击的区域。" />
+            </el-form-item>
+            <el-form-item label="自然语言步骤">
+              <el-input v-model="aiUiForm.prompt" type="textarea" :rows="14" class="ai-ui-prompt-input" />
+            </el-form-item>
+            <div class="ai-ui-structured-grid">
+              <el-form-item label="结构化 YAML（生成预览）">
+                <el-input v-model="aiUiStructuredYaml" type="textarea" :rows="10" class="ai-ui-prompt-input" />
+              </el-form-item>
+              <el-form-item label="变量 JSON">
+                <el-input v-model="aiUiVariablesText" type="textarea" :rows="10" class="ai-ui-prompt-input" />
+              </el-form-item>
+            </div>
+            <div class="ai-ui-options">
+              <el-form-item label="浏览器">
+                <el-switch v-model="aiUiForm.headed" active-text="显示浏览器" inactive-text="无头执行" />
+              </el-form-item>
+              <el-form-item label="视口宽度">
+                <el-input-number v-model="aiUiForm.viewport.width" :min="800" :max="2560" />
+              </el-form-item>
+              <el-form-item label="视口高度">
+                <el-input-number v-model="aiUiForm.viewport.height" :min="600" :max="1600" />
+              </el-form-item>
+            </div>
+          </el-form>
+          <div class="ai-ui-footer-actions">
+            <div class="ai-ui-footer-action-buttons">
+              <el-button type="primary" plain :loading="aiUiSaving" @click="saveAiUiCaseRecord">保存用例</el-button>
+              <el-button v-if="aiUiForm.id" type="danger" plain @click="removeAiUiCase(aiUiForm)">删除用例</el-button>
+            </div>
+            <span>执行结果会保留在右侧历史中，Midscene 会生成 HTML 报告。</span>
+          </div>
+        </main>
+      </div>
+      </template>
+
+      <section v-else class="ai-ui-report-page surface-card">
+        <div class="ai-ui-report-head">
+          <div>
+            <strong>执行历史</strong>
+            <span>查看 AI UI 案例的最近执行状态与 Midscene 报告。</span>
+          </div>
+          <el-button plain :icon="Refresh" :loading="aiUiLoading" @click="refreshAiUiPage">刷新历史</el-button>
+        </div>
+        <div v-if="!aiUiRuns.length" class="ai-ui-empty">暂无执行历史，先到“案例”页保存并执行一个用例。</div>
+        <div v-else class="ai-ui-report-list">
+          <article v-for="run in aiUiRuns" :key="run.id" class="ai-ui-report-row">
+            <div class="ai-ui-report-main">
+              <div class="ai-ui-report-title">
+                <strong>{{ run.case_name }}</strong>
+                <el-tag
+                  size="small"
+                  effect="plain"
+                  :type="run.status === 'passed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'warning' : 'info'"
+                >
+                  {{ run.status === 'passed' ? '通过' : run.status === 'failed' ? '失败' : run.status === 'running' ? '执行中' : '已停止' }}
+                </el-tag>
+              </div>
+              <div class="ai-ui-report-meta">
+                <span>开始 {{ run.started_at || '-' }}</span>
+                <span>结束 {{ run.finished_at || '-' }}</span>
+                <span>环境 {{ aiUiEnvironmentLabel(run.environment) }}</span>
+              </div>
+              <pre v-if="run.error" class="ai-ui-run-error">{{ run.error }}</pre>
+              <div v-if="run.result?.analysis" class="ai-ui-run-analysis">
+                <strong>AI 结果解析</strong>
+                <span>{{ run.result.analysis.summary }}</span>
+                <span v-if="run.result.analysis.blocker">卡点：{{ run.result.analysis.blocker }}</span>
+                <span v-if="run.result.analysis.suggestion">建议：{{ run.result.analysis.suggestion }}</span>
+              </div>
+            </div>
+            <div class="ai-ui-report-actions">
+              <el-button v-if="run.status === 'running'" size="small" type="warning" plain @click="stopAiUiCaseRun(run)">停止</el-button>
+              <el-button
+                v-if="run.result?.report_url"
+                size="small"
+                type="primary"
+                plain
+                @click="openAiUiReport(`${run.result.report_url}?username=${encodeURIComponent(authUser.username)}`)"
+              >打开报告</el-button>
+              <el-button
+                v-if="run.result?.report_url"
+                size="small"
+                plain
+                @click="openAiUiReport(`/api/ai-ui/runs/${encodeURIComponent(run.id)}/sop?username=${encodeURIComponent(authUser.username)}`)"
+              >导出 SOP</el-button>
+              <el-button size="small" plain @click="switchAiUiPageMode('cases')">查看案例</el-button>
+            </div>
+          </article>
+        </div>
+        <div class="ai-ui-runtime">
+          <strong>运行环境</strong>
+          <span>Node.js：{{ aiUiRuntime?.node ? '已找到' : '未找到' }}</span>
+          <span>Midscene / Playwright：{{ aiUiRuntime?.dependencies ? '已安装' : '未安装' }}</span>
+          <span>视觉模型：{{ aiUiRuntime?.configured ? '已配置' : '未配置' }}</span>
+          <code v-if="aiUiRuntime && !aiUiRuntime.dependencies">{{ aiUiRuntime.install_command }}</code>
+        </div>
+      </section>
+      <el-dialog v-model="aiUiRunConfirmVisible" title="执行前确认" width="520px" append-to-body>
+        <div class="ai-ui-confirm">
+          <p>即将执行用例：<strong>{{ aiUiPendingCase?.name || '-' }}</strong></p>
+          <p>环境：<strong>{{ aiUiEnvironmentLabel(aiUiPendingCase?.environment) }}</strong></p>
+          <p>目标地址：<code>{{ aiUiPendingCase?.url || '-' }}</code></p>
+          <p>执行会启动独立 Chromium，并按当前 Gherkin 步骤操作页面。</p>
+        </div>
+        <template #footer>
+          <el-button @click="aiUiRunConfirmVisible = false">取消</el-button>
+          <el-button type="primary" @click="confirmAiUiRun">确认执行</el-button>
+        </template>
+      </el-dialog>
+    </section>
+
+    <section v-else-if="currentView === 'mockApi' && isAdmin" class="tool-page-view mock-api-view">
+      <header class="tool-page-head">
+        <div class="head-copy">
+          <span class="eyebrow">
+            <span class="eyebrow-dot"></span>
+            Mock API
+          </span>
+          <h2>Mock 接口</h2>
+          <p>集中维护 DS-CNY 的经营数据参数和企业信息模板，保存后会同步到接口测试的对应下拉框。</p>
+        </div>
+        <el-button plain :icon="Refresh" @click="openInterfaceTestView">返回接口测试</el-button>
+      </header>
+
+      <el-card shadow="never" class="surface-card mock-api-card">
+        <div class="mock-api-endpoint">
+          <div>
+            <span class="mock-api-method">POST</span>
+            <code>/api/mock/shop-performance-cny-boost</code>
+          </div>
+          <span class="mock-api-count">{{ shopPerformancePresets.length }} 条店铺记录</span>
+        </div>
+        <div class="mock-api-summary-record">
+          <div>
+            <strong>经营数据参数配置</strong>
+            <span>已反显 {{ shopPerformancePresets.length }} 条店铺记录，可进入详情编辑内置配置或新增记录。</span>
+          </div>
+          <el-button type="primary" plain :icon="Edit" @click="openShopPerformanceManager">编辑配置</el-button>
+        </div>
+      </el-card>
+
+      <el-card shadow="never" class="surface-card mock-api-card">
+        <div class="mock-api-endpoint">
+          <div class="mock-api-linked-endpoints">
+            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-business-profile</code></span>
+            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-director-info</code></span>
+            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-add-contact-information</code></span>
+          </div>
+          <span class="mock-api-count">{{ dowsureCnyCompanyTemplates.length }} 个公司模板</span>
+        </div>
+        <div class="mock-api-summary-record">
+          <div>
+            <strong>三接口公司模板配置</strong>
+            <span>
+              已配置 {{ dowsureCnyCompanyTemplates.length }} 条记录：{{ dowsureCnyCompanyTemplates.map((item) => item.name).join('、') }}
+            </span>
+          </div>
+          <el-button type="primary" plain :icon="Edit" @click="openDowsureCompanyTemplateManager">编辑配置</el-button>
+        </div>
+      </el-card>
+
+      <el-card shadow="never" class="surface-card mock-api-card">
+        <div class="mock-api-endpoint">
+          <div class="mock-api-linked-endpoints">
+            <span><span class="mock-api-method">IMAGE</span><code>/api/mock/fp-business-profile</code></span>
+            <span><span class="mock-api-method">IMAGE</span><code>/api/mock/fp-director-info</code></span>
+          </div>
+          <span class="mock-api-count">{{ companyImageTemplates.length }} 个图片配置</span>
+        </div>
+        <div class="mock-api-summary-record">
+          <div>
+            <strong>三接口公司图片配置</strong>
+            <span>上传企业营业执照、法人身份证正面和反面，保存后同步到接口测试的图片下拉框。</span>
+          </div>
+          <el-button type="primary" plain :icon="Edit" @click="openCompanyImageManager">编辑配置</el-button>
+        </div>
+      </el-card>
+
+      <el-dialog
+        v-model="shopPerformanceManagerVisible"
+        title="经营数据参数详情"
+        width="min(920px, 92vw)"
+        top="5vh"
+        append-to-body
+        class="mock-api-manager-dialog"
+      >
+        <div class="mock-api-dialog-toolbar">
+          <span>已反显16条内置店铺记录；编辑后保存同名 SQL 覆盖，不修改则继续使用后端原配置。</span>
+          <el-button type="primary" plain :icon="Plus" @click="startNewShopPerformancePreset">新增记录</el-button>
+        </div>
+        <div class="mock-api-preset-list">
+          <div v-if="shopPerformancePresets.length" class="mock-api-preset-grid">
+            <article v-for="preset in shopPerformancePresets" :key="`dialog-preset-${preset.name}`" class="mock-api-preset-item">
+              <div>
+                <strong>{{ preset.name }}</strong>
+                <code>{{ preset.custom_sql || '使用后端内置经营数据配置' }}</code>
+              </div>
+              <div class="mock-api-preset-actions">
+                <el-button link type="primary" @click="editShopPerformancePreset(preset)">编辑</el-button>
+                <el-button
+                  v-if="!preset.is_builtin || preset.custom_sql"
+                  link
+                  :type="preset.is_builtin ? 'warning' : 'danger'"
+                  @click="deleteShopPerformancePreset(preset)"
+                >
+                  {{ preset.is_builtin ? '恢复内置' : '删除' }}
+                </el-button>
+              </div>
+            </article>
+          </div>
+          <div v-else class="response-empty">暂无记录，请点击“新增记录”。</div>
+        </div>
+      </el-dialog>
+
+      <el-dialog
+        v-model="shopPerformanceEditorVisible"
+        :title="editingShopPerformancePresetName ? `编辑店铺配置：${editingShopPerformancePresetName}` : '新增店铺配置'"
+        width="min(860px, 92vw)"
+        top="8vh"
+        append-to-body
+        class="mock-api-manager-dialog"
+        @closed="resetShopPerformancePresetForm"
+      >
+        <div class="mock-api-form mock-api-dialog-editor">
+          <div class="mock-api-form-head">
+            <div>
+              <h3>{{ editingShopPerformancePresetName ? `编辑：${editingShopPerformancePresetName}` : '新增经营数据参数' }}</h3>
+              <p>保存后会同步到接口测试的“准入类型”下拉框；内置记录保存同名 SQL 后覆盖原配置。</p>
+            </div>
+          </div>
+          <div class="mock-api-form-grid">
+            <el-form-item label="参数名称">
+              <el-input
+                v-model.trim="shopPerformancePresetForm.name"
+                :disabled="BUILTIN_SHOP_PERFORMANCE_NAME_SET.has(editingShopPerformancePresetName)"
+                placeholder="例如：店铺20"
+              />
+            </el-form-item>
+            <el-form-item label="自定义经营数据 SQL">
+              <el-input
+                v-model="shopPerformancePresetForm.custom_sql"
+                type="textarea"
+                :autosize="{ minRows: 8, maxRows: 16 }"
+                placeholder="填写 UPDATE dpu_3pl_shop_performance ... WHERE amazon_3pl_offer_id = '${platform_offer_id}'；不修改时继续使用后端内置配置"
+              />
+              <p v-if="shopPerformancePresetError" class="mock-api-validation-error">{{ shopPerformancePresetError }}</p>
+            </el-form-item>
+          </div>
+          <div class="scenario-step-config-actions">
+            <el-button type="primary" :loading="shopPerformancePresetSaving" @click="saveShopPerformancePreset">保存记录</el-button>
+            <el-button @click="shopPerformanceEditorVisible = false">取消</el-button>
+          </div>
+        </div>
+      </el-dialog>
+
+      <el-dialog
+        v-model="dowsureCompanyTemplateManagerVisible"
+        title="三接口公司模板详情"
+        width="min(1180px, 94vw)"
+        top="3vh"
+        append-to-body
+        class="mock-api-manager-dialog"
+      >
+        <div class="mock-api-dialog-toolbar">
+          <span>每条记录包含企业、法人和联系人三份模板。</span>
+          <el-button type="primary" plain :icon="Plus" @click="startNewDowsureCompanyTemplate">新增记录</el-button>
+        </div>
+        <div class="mock-api-preset-list">
+          <div class="mock-api-preset-grid">
+            <article v-for="item in dowsureCnyCompanyTemplates" :key="`dialog-company-${item.name}`" class="mock-api-preset-item">
+              <div>
+                <strong>{{ item.name }}</strong>
+                <code>{{ item.template.cnName }} · 法人 {{ item.directorTemplate.nameCn }} · 联系人 {{ item.contactTemplate.fullChineseName }}/{{ item.contactTemplate.mobileNumber }}</code>
+              </div>
+              <div class="mock-api-preset-actions">
+                <el-button link type="primary" @click="editDowsureCompanyTemplate(item)">编辑</el-button>
+                <el-button
+                  v-if="!BUILTIN_DOWSURE_CNY_COMPANY_TEMPLATE_NAMES.has(item.name)"
+                  link
+                  type="danger"
+                  @click="deleteDowsureCompanyTemplate(item)"
+                >
+                  删除
+                </el-button>
+              </div>
+            </article>
+          </div>
+        </div>
+        <div class="mock-api-form mock-api-dialog-editor">
+          <div class="mock-api-form-head">
+            <div>
+              <h3>{{ editingDowsureCompanyTemplateName ? `编辑：${editingDowsureCompanyTemplateName}` : '新增三接口公司模板' }}</h3>
+              <p>三份模板必须同时完整配置并一次保存。</p>
+            </div>
+            <el-button v-if="editingDowsureCompanyTemplateName" plain @click="startNewDowsureCompanyTemplate">取消编辑</el-button>
+          </div>
+          <el-form class="mock-api-form-grid dowsure-template-form-grid" label-position="left" label-width="250px">
+            <el-form-item label="参数名称">
+              <el-input v-model.trim="dowsureCompanyTemplateForm.name" placeholder="例如：广州测试科技有限公司" />
+            </el-form-item>
+            <el-form-item label="/api/mock/fp-business-profile">
+              <el-input v-model="dowsureCompanyTemplateForm.templateText" type="textarea" :autosize="{ minRows: 8, maxRows: 16 }" />
+            </el-form-item>
+            <el-form-item label="/api/mock/fp-director-info">
+              <el-input v-model="dowsureCompanyTemplateForm.directorTemplateText" type="textarea" :autosize="{ minRows: 12, maxRows: 22 }" />
+            </el-form-item>
+            <el-form-item label="/api/mock/fp-add-contact-information">
+              <el-input v-model="dowsureCompanyTemplateForm.contactTemplateText" type="textarea" :autosize="{ minRows: 7, maxRows: 14 }" />
+              <p v-if="dowsureCompanyTemplateError" class="mock-api-validation-error">{{ dowsureCompanyTemplateError }}</p>
+            </el-form-item>
+          </el-form>
+          <div class="scenario-step-config-actions">
+            <el-button type="primary" :loading="dowsureCompanyTemplateSaving" @click="saveDowsureCompanyTemplate">同步保存三接口记录</el-button>
+            <span class="scenario-step-config-hint">模板 id、营业执照和身份证文件地址由 Mock 后端自动补充。</span>
+          </div>
+        </div>
+      </el-dialog>
+
+      <el-dialog
+        v-model="companyImageManagerVisible"
+        title="三接口公司图片配置"
+        width="min(900px, 94vw)"
+        top="5vh"
+        append-to-body
+        class="mock-api-manager-dialog"
+        @closed="resetCompanyImageForm"
+      >
+        <div class="mock-api-dialog-toolbar">
+          <span>图片在执行对应接口时上传到当前环境的 dpu-file 网关。</span>
+          <el-button type="primary" plain :icon="Plus" @click="resetCompanyImageForm">新增图片</el-button>
+        </div>
+        <div class="mock-api-preset-list">
+          <div class="mock-api-preset-grid">
+            <article v-for="item in companyImageTemplates" :key="`company-image-${item.id}`" class="mock-api-preset-item">
+              <div>
+                <strong>{{ item.name }}</strong>
+                <code>{{ companyImageTypeLabel(item.image_type) }} · {{ item.filename }}<template v-if="item.file_size"> · {{ Math.ceil(item.file_size / 1024) }}KB</template></code>
+              </div>
+              <div class="mock-api-preset-actions">
+                <el-tag v-if="item.is_builtin" size="small" effect="plain">内置</el-tag>
+                <el-button link type="primary" @click="editCompanyImageTemplate(item)">编辑</el-button>
+                <template v-if="!item.is_builtin">
+                  <el-button link type="danger" @click="removeCompanyImageTemplate(item)">删除</el-button>
+                </template>
+              </div>
+            </article>
+          </div>
+        </div>
+        <div class="mock-api-form mock-api-dialog-editor">
+          <div class="mock-api-form-head">
+            <div>
+              <h3>
+                {{ companyImageForm.id
+                  ? `编辑：${companyImageForm.name}`
+                  : (companyImageForm.is_builtin ? `编辑内置图片：${companyImageForm.name}` : '新增公司图片') }}
+              </h3>
+              <p>支持 PNG、JPEG、WEBP，单张不超过 10MB。</p>
+            </div>
+            <el-button v-if="companyImageForm.id || companyImageForm.is_builtin" plain @click="resetCompanyImageForm">取消编辑</el-button>
+          </div>
+          <el-form class="mock-api-form-grid" label-position="top">
+            <el-form-item label="图片名称">
+              <el-input
+                v-model.trim="companyImageForm.name"
+                :disabled="companyImageForm.is_builtin"
+                placeholder="例如：测广州市昆袄祝山脸从股份有限公司营业执照"
+              />
+            </el-form-item>
+            <el-form-item label="图片用途">
+              <el-select v-model="companyImageForm.image_type" :disabled="companyImageForm.is_builtin">
+                <el-option label="企业营业执照" value="business_license" />
+                <el-option label="法人身份证正面" value="director_id_front" />
+                <el-option label="法人身份证反面" value="director_id_back" />
+              </el-select>
+            </el-form-item>
+            <el-form-item :label="companyImageForm.id ? '替换图片（可选）' : (companyImageForm.is_builtin ? '替换内置图片' : '上传图片')">
+              <input
+                :key="companyImageFileInputKey"
+                class="company-image-file-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                @change="handleCompanyImageFileChange"
+              />
+              <span v-if="companyImageFile" class="scenario-step-config-hint">已选择：{{ companyImageFile.name }}</span>
+              <span v-else-if="companyImageForm.filename" class="scenario-step-config-hint">当前文件：{{ companyImageForm.filename }}</span>
+              <div v-if="companyImagePreviewUrl" class="company-image-preview">
+                <img :src="companyImagePreviewUrl" :alt="companyImageForm.name || '公司图片预览'" />
+              </div>
+            </el-form-item>
+            <p v-if="companyImageError" class="mock-api-validation-error">{{ companyImageError }}</p>
+          </el-form>
+          <div class="scenario-step-config-actions">
+            <el-button type="primary" :loading="companyImageSaving" @click="saveCompanyImageRecord">
+              {{ companyImageForm.id || companyImageForm.is_builtin ? '保存修改' : '上传并保存' }}
+            </el-button>
+            <el-button @click="resetCompanyImageForm">清空</el-button>
+          </div>
+        </div>
+      </el-dialog>
     </section>
 
     <section v-else-if="currentView === 'activity'" class="tool-page-view activity-page-view">
@@ -7425,15 +10199,23 @@ function buildAiContext() {
         <div class="head-copy">
           <span class="eyebrow">
             <span class="eyebrow-dot"></span>
-            Activity Log
+            Usage Log
           </span>
-          <h2>操作轨迹</h2>
-          <p>当前账号的历史 mock 操作记录，可按手机号或 Session ID 过滤。</p>
+          <h2>使用日志</h2>
+          <p>{{ isAdmin ? '管理员可查看所有人的历史操作记录。' : '当前账号的历史 mock 操作记录，可按手机号或 Session ID 过滤。' }}</p>
         </div>
         <el-button :icon="Refresh" plain :loading="auditLoading" @click="refreshAuditOperations">刷新</el-button>
       </header>
 
       <el-card shadow="never" class="surface-card activity-page-card">
+        <div class="usage-log-stats">
+          <article v-for="stat in auditStats" :key="stat.label" class="usage-log-stat">
+            <span>{{ stat.label }}</span>
+            <strong>{{ stat.value }}</strong>
+            <small>{{ stat.hint }}</small>
+          </article>
+        </div>
+
         <el-form class="audit-query-form" :inline="true" @submit.prevent="refreshAuditOperations">
           <el-form-item label="手机号">
             <el-input
@@ -7470,74 +10252,180 @@ function buildAiContext() {
             <p class="session-empty__hint">登录、连接 session、执行 mock 等操作后会在这里出现。</p>
           </div>
           <div v-for="item in auditOperations" :key="item.id" class="activity-item">
-            <div class="activity-head">
-              <el-tag size="small" effect="dark">{{ item.operation_name || 'operation' }}</el-tag>
-              <el-tag v-if="item.success === false" size="small" type="danger" effect="plain">失败</el-tag>
-              <el-tag v-else-if="item.success === true" size="small" type="success" effect="plain">成功</el-tag>
-              <span>{{ item.created_at }}</span>
+            <div class="activity-summary-row">
+              <span
+                class="activity-status-line"
+                :class="{
+                  success: item.success === true,
+                  failed: item.success === false,
+                }"
+              ></span>
+              <div class="activity-summary-main">
+                <div class="activity-head">
+                  <div class="activity-title-group">
+                    <strong>{{ item.operation_name || 'operation' }}</strong>
+                    <el-tag v-if="item.success === false" size="small" type="danger" effect="plain">失败</el-tag>
+                    <el-tag v-else-if="item.success === true" size="small" type="success" effect="plain">成功</el-tag>
+                    <el-tag v-else size="small" type="info" effect="plain">未知</el-tag>
+                  </div>
+                  <time>{{ item.created_at }}</time>
+                </div>
+                <div class="audit-meta">
+                  <span v-if="isAdmin"><b>用户</b>{{ item.username || '-' }}</span>
+                  <span><b>手机号</b>{{ item.phone_number || '-' }}</span>
+                  <span><b>Session</b>{{ item.session_id || '-' }}</span>
+                  <span><b>环境</b>{{ item.env || '-' }}</span>
+                  <span><b>Merchant</b>{{ item.merchant_id || '-' }}</span>
+                </div>
+              </div>
+              <el-button
+                class="activity-detail-toggle"
+                size="small"
+                plain
+                :icon="isAuditOperationExpanded(item.id) ? ArrowDown : ArrowRight"
+                @click="toggleAuditOperationDetail(item.id)"
+              >
+                {{ isAuditOperationExpanded(item.id) ? '收起详情' : '详情' }}
+              </el-button>
             </div>
-            <div class="audit-meta">
-              <span><b>手机号</b>{{ item.phone_number || '-' }}</span>
-              <span><b>Session</b>{{ item.session_id || '-' }}</span>
-              <span><b>环境</b>{{ item.env || '-' }}</span>
-              <span><b>Merchant</b>{{ item.merchant_id || '-' }}</span>
+            <div v-if="isAuditOperationExpanded(item.id)" class="activity-detail-panel">
+              <section>
+                <strong>Request</strong>
+                <pre>{{ formatJsonBlock(item.request_payload) }}</pre>
+              </section>
+              <section>
+                <strong>Response</strong>
+                <pre>{{ formatJsonBlock(item.response_payload) }}</pre>
+              </section>
             </div>
-            <pre>{{ JSON.stringify({ request: item.request_payload, response: item.response_payload }, null, 2) }}</pre>
           </div>
         </div>
       </el-card>
+
     </section>
 
-    <section v-else-if="currentView === 'logs'" class="log-system-view">
-      <div class="log-system-head">
-        <div>
-          <p class="eyebrow">Log System</p>
-          <h2>日志系统</h2>
-          <p>按时间和关键字检索 mock 控台调用日志，包括请求方式、URL、请求体、响应体和异常信息。</p>
+    <section v-else-if="currentView === 'environmentMonitor'" class="tool-page-view environment-monitor-view">
+      <header class="tool-page-head">
+        <div class="head-copy">
+          <span class="eyebrow">
+            <span class="eyebrow-dot"></span>
+            Environment Monitor
+          </span>
+          <h2>环境监测</h2>
+          <p>网关检测 / 请求测试健康度。</p>
         </div>
-        <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-      </div>
-
-      <div class="log-search-bar">
-        <el-input
-          v-model.trim="logSearchForm.keyword"
-          clearable
-          placeholder="模糊搜索：URL / 请求体 / 响应体 / 手机号 / merchant / error"
-          @keyup.enter="runLogSearch"
-        />
-        <el-date-picker
-          v-model="logSearchForm.timeRange"
-          type="datetimerange"
-          range-separator="至"
-          start-placeholder="开始时间"
-          end-placeholder="结束时间"
-          value-format="YYYY-MM-DD HH:mm:ss"
-        />
-        <el-input-number v-model="logSearchForm.limit" :min="50" :max="2000" :step="50" controls-position="right" />
-        <el-button type="primary" :loading="logSearchLoading" @click="runLogSearch">查询</el-button>
-        <el-button plain @click="resetLogSearch">重置</el-button>
-      </div>
-
-      <div class="log-results">
-        <div class="log-results-meta">
-          <strong>{{ logSearchResults.length }}</strong>
-          <span>条匹配日志</span>
-          <el-tag v-if="isLogPreviewMode" type="info" effect="plain">默认最新 100 条</el-tag>
-          <el-tag :type="wsConnected ? 'success' : 'warning'">{{ logStatusText }}</el-tag>
+        <div class="environment-monitor-actions">
+          <el-tag type="info" effect="plain">自动刷新：{{ environmentMonitorRefreshSeconds }}s</el-tag>
+          <el-button :icon="Refresh" plain :loading="environmentMonitorLoading" @click="refreshEnvironmentMonitor(true)">刷新</el-button>
         </div>
-        <div v-if="logSearchResults.length === 0" class="log-empty">暂无匹配日志，执行一次 mock 操作后再搜索。</div>
-        <div v-for="entry in logSearchResults" :key="`${entry.created}-${entry.funcName}-${entry.lineno}`" class="log-entry log-entry-large">
-          <div class="log-entry-head">
-            <el-tag size="small" :type="levelTagType(entry.level)">{{ entry.level }}</el-tag>
-            <span>{{ entry.timestamp }}</span>
-            <span v-if="entry.username" class="log-user-chip">
-              <el-icon><User /></el-icon>
-              {{ entry.username }}
-            </span>
+      </header>
+
+      <el-card shadow="never" class="surface-card environment-monitor-card">
+        <template #header>
+          <div class="card-head environment-monitor-head">
+            <div class="head-copy">
+              <h3>环境监测</h3>
+              <p>网关检测 / 请求测试健康度。</p>
+            </div>
+            <div class="environment-monitor-actions">
+              <span v-if="environmentMonitor.checked_at" class="environment-monitor-time">{{ environmentMonitor.checked_at }}</span>
+              <el-tag type="info" effect="plain">自动刷新：{{ environmentMonitorRefreshSeconds }}s</el-tag>
+              <el-button :icon="Refresh" plain :loading="environmentMonitorLoading" @click="refreshEnvironmentMonitor(true)">刷新</el-button>
+            </div>
           </div>
-          <pre>{{ entry.formatted || entry.message }}</pre>
+        </template>
+
+        <p v-if="environmentMonitorError" class="login-error">{{ environmentMonitorError }}</p>
+        <div class="environment-monitor-grid">
+          <article
+            v-for="item in environmentMonitorItems"
+            :key="item.env"
+            class="environment-card"
+            :class="environmentCardState(item)"
+          >
+            <div class="environment-card-head">
+              <div class="environment-badge">
+                <strong>{{ item.env === 'preprod' ? 'PPROD' : item.label }}</strong>
+              </div>
+              <div>
+                <h4>{{ item.display_env || item.env }}</h4>
+                <p>{{ item.base_url }}</p>
+              </div>
+              <el-tag
+                class="environment-status-tag"
+                :type="availabilityTagType(item.availability)"
+                effect="light"
+              >
+                {{ availabilityLabel(item.availability) }}
+              </el-tag>
+            </div>
+            <section class="environment-check-block channel-check-block">
+              <div class="environment-metrics">
+                <div>
+                  <span>请求延迟</span>
+                  <strong>{{ item.latency_ms ?? '-' }}<small>ms</small></strong>
+                </div>
+                <div>
+                  <span>端点 PING</span>
+                  <strong>{{ item.endpoint_ping_ms ?? '-' }}<small>ms</small></strong>
+                </div>
+              </div>
+              <div class="environment-availability" :class="availabilityState(item.availability)">
+                <span>网关可用性</span>
+                <strong>{{ item.availability ?? '--' }}<small v-if="item.availability !== null && item.availability !== undefined">%</small></strong>
+              </div>
+              <div class="environment-history" :class="{ empty: !item.history?.length }" aria-label="最近请求记录">
+                <template v-if="item.history?.length">
+                  <i
+                    v-for="(status, index) in item.history"
+                    :key="`${item.env}-gateway-${index}`"
+                    :class="status"
+                  ></i>
+                </template>
+                <span v-else>暂无历史请求样本</span>
+              </div>
+              <div class="environment-card-foot">
+                <span>最近 {{ item.sample_count || 0 }}/60 次请求</span>
+                <span>实时日志样本</span>
+              </div>
+            </section>
+
+            <section class="environment-check-block channel-check-block">
+              <div class="environment-channel-head">
+                <div>
+                  <span>渠道健康度</span>
+                </div>
+                <el-tag
+                  size="small"
+                  :type="availabilityTagType(item.channel_availability)"
+                  effect="light"
+                >
+                  {{ availabilityLabel(item.channel_availability) }}
+                </el-tag>
+              </div>
+              <div class="environment-availability" :class="availabilityState(item.channel_availability)">
+                <span>自动测试可用性</span>
+                <strong>{{ item.channel_availability ?? '--' }}<small v-if="item.channel_availability !== null && item.channel_availability !== undefined">%</small></strong>
+              </div>
+              <div class="environment-history channel" :class="{ empty: !item.channel_history?.length }" aria-label="最近 send-sms 自动测试记录">
+                <template v-if="item.channel_history?.length">
+                  <i
+                    v-for="(status, index) in item.channel_history"
+                    :key="`${item.env}-channel-${index}`"
+                    :class="status"
+                  ></i>
+                </template>
+                <span v-else>等待半小时自动测试样本</span>
+              </div>
+              <div class="environment-card-foot">
+                <span>最近 {{ item.channel_sample_count || 0 }}/60 次测试</span>
+                <span>{{ item.channel_checked_at || '启动后自动执行' }}</span>
+              </div>
+            </section>
+          </article>
         </div>
-      </div>
+      </el-card>
+
     </section>
 
     <section v-else-if="currentView === 'about'" class="tool-page-view about-page-view">
@@ -7572,8 +10460,8 @@ function buildAiContext() {
             <li>在“连接与注册”选择目标环境，输入手机号连接已有 session，或按 Journey、币种、资方代码注册新账号。</li>
             <li>确认右侧“当前会话”中的环境、手机号、Merchant 等信息，避免跨环境或跨账号误操作。</li>
             <li>进入“Mock 操作面板”，选择需要推进的业务节点，填写金额、状态、失败原因或 state 等参数。</li>
-            <li>执行后查看当前步骤下方的返回结果，同时观察“实时日志”和“操作轨迹”确认请求已被记录。</li>
-            <li>如果结果异常，进入“日志系统”按关键字、时间范围或 session 过滤日志，定位接口链路和具体错误。</li>
+            <li>执行后查看当前步骤下方的返回结果，同时进入“使用日志”确认请求已被记录。</li>
+            <li>如果结果异常，可先在“使用日志”查看操作请求和响应；需要确认环境可用性时进入“环境监测”。</li>
             <li>需要交接时，在“联系我们”记录现象、预期、复现步骤、手机号、session、关键日志和截图线索。</li>
           </ol>
         </div>
@@ -7584,8 +10472,10 @@ function buildAiContext() {
             <dd>用于创建或连接测试账号上下文。注册支持 Journey、币种、资方代码和线上/线下模式选择；连接成功后会建立 session，后续 mock 操作都会绑定这个上下文。</dd>
             <dt>Mock 操作面板</dt>
             <dd>集中触发 DPU 关键业务节点，包括 SP/3PL 关联、核保、审批、PSP started/completed、电子签、放款、还款、系统事件和 Abandon。每个操作保留独立参数区，降低误填风险。</dd>
-            <dt>日志系统</dt>
-            <dd>用于检索后端调用日志，重点查看请求方法、URL、请求体、响应体、状态码、traceId、业务错误和异常堆栈。适合确认“接口是否真的发出”和“后端实际返回什么”。</dd>
+            <dt>使用日志</dt>
+            <dd>用于追溯账号操作记录，重点查看每次 mock 操作的请求参数、响应结果、执行账号、手机号、session 和 merchant。</dd>
+            <dt>环境监测</dt>
+            <dd>用于查看 dev、reg、sit、uat、preprod 网关可用性、响应延迟和近期状态条，辅助判断是否为环境波动。</dd>
             <dt>AI 助手</dt>
             <dd>用于辅助分析当前 session、日志和 mock 结果，也可以帮助整理 SQL、接口现象和排查思路。AI 输出只作为诊断辅助，关键业务结论仍应以接口返回、日志和数据库状态为准。</dd>
             <dt>联系我们</dt>
@@ -7602,9 +10492,9 @@ function buildAiContext() {
             <dt>测试数据</dt>
             <dd>本工具面向测试和联调用例，不应输入真实客户敏感信息。需要生产或迁移相关操作时，应按专项流程和授权要求执行。</dd>
             <dt>结果判定</dt>
-            <dd>按钮执行成功只代表接口调用完成，不等同于完整业务链路成功。关键节点应结合返回体、实时日志、历史日志和必要的数据库状态共同确认。</dd>
+            <dd>按钮执行成功只代表接口调用完成，不等同于完整业务链路成功。关键节点应结合返回体、使用日志和必要的数据库状态共同确认。</dd>
             <dt>审计线索</dt>
-            <dd>操作轨迹和日志用于辅助追溯，但不替代正式测试报告。重要验证结论仍应沉淀到 MeterSphere、缺陷单或版本验证记录中。</dd>
+            <dd>使用日志用于辅助追溯，但不替代正式测试报告。重要验证结论仍应沉淀到 MeterSphere、缺陷单或版本验证记录中。</dd>
           </dl>
         </div>
         <div class="help-section">
@@ -7861,6 +10751,13 @@ function buildAiContext() {
           </p>
         </div>
         <div class="prompt-templates-head-actions">
+          <el-input
+            v-model="promptTemplateSearch"
+            class="prompt-templates-search"
+            placeholder="按名称/描述搜索模板"
+            clearable
+            :prefix-icon="Search"
+          />
           <el-button :icon="Refresh" plain :loading="promptTemplatesLoading" @click="refreshPromptTemplates">刷新</el-button>
           <el-button v-if="isAdmin" type="primary" :icon="Plus" @click="openPromptTemplateForm(null)">新建模板</el-button>
         </div>
@@ -7876,9 +10773,15 @@ function buildAiContext() {
         </p>
       </div>
 
-      <div v-else class="prompt-templates-grid">
+      <div v-else-if="!promptTemplatesLoading && promptTemplatesTotal === 0" class="session-empty">
+        <span class="session-empty__icon"><el-icon><Search /></el-icon></span>
+        <p class="session-empty__title">没有匹配的模板</p>
+        <p class="session-empty__hint">换个关键词，或清空搜索框查看全部。</p>
+      </div>
+
+      <div v-else-if="promptTemplatesTotal > 0" class="prompt-templates-grid">
         <article
-          v-for="template in promptTemplates"
+          v-for="template in pagedPromptTemplates"
           :key="template.id"
           class="prompt-template-card"
           :class="{ 'is-disabled': template.is_disabled }"
@@ -7942,6 +10845,17 @@ function buildAiContext() {
             </template>
           </footer>
         </article>
+      </div>
+
+      <div v-if="promptTemplatesTotal > promptTemplatePageSize" class="prompt-templates-pagination">
+        <el-pagination
+          layout="prev, pager, next, total"
+          background
+          :total="promptTemplatesTotal"
+          :page-size="promptTemplatePageSize"
+          :current-page="promptTemplatePage"
+          @current-change="(pg) => (promptTemplatePage = pg)"
+        />
       </div>
 
       <el-dialog
@@ -8032,18 +10946,47 @@ function buildAiContext() {
                 该模板已锁定到「{{ promptTemplateUseTarget.locked_env }}」环境，不可修改。
               </p>
             </el-form-item>
-            <el-form-item :label="useDialogInputLabel">
-              <div v-if="useDialogParamHints.length" class="prompt-template-use__hint">
-                <span>需要提供：</span>
-                <el-tag
-                  v-for="hint in useDialogParamHints"
-                  :key="hint"
-                  size="small"
-                  type="info"
-                  effect="plain"
-                >{{ hint }}</el-tag>
+            <el-form-item :label="useDialogParamFields.length ? '请提供参数' : useDialogInputLabel">
+              <div v-if="useDialogParamFields.length" class="prompt-template-use__params">
+                <div
+                  v-for="field in useDialogParamFields"
+                  :key="field.key"
+                  class="prompt-template-use__param"
+                >
+                  <label class="prompt-template-use__param-label">
+                    <span>{{ field.label }}</span>
+                    <code>{{ field.key }}</code>
+                  </label>
+                  <small v-if="field.help" class="prompt-template-use__param-help">
+                    {{ field.help }}
+                  </small>
+                  <el-select
+                    v-if="field.options"
+                    v-model="promptTemplateUseParams[field.key]"
+                    :placeholder="`请选择${field.label}`"
+                    :disabled="field.disabled"
+                    :clearable="!field.disabled"
+                    @change="handlePromptTemplateParamChange(field.key)"
+                  >
+                    <el-option
+                      v-for="option in field.options"
+                      :key="option.value"
+                      :label="option.label"
+                      :value="option.value"
+                    />
+                  </el-select>
+                  <el-input
+                    v-else
+                    v-model="promptTemplateUseParams[field.key]"
+                    :disabled="field.disabled"
+                    :placeholder="field.disabled
+                      ? '不准入店铺不允许填写 CUSTOM 年销售额'
+                      : `请输入${field.label}`"
+                  />
+                </div>
               </div>
               <el-input
+                v-else
                 v-model="promptTemplateUseForm.user_input"
                 type="textarea"
                 :rows="4"
@@ -8406,8 +11349,8 @@ function buildAiContext() {
                     plain
                     :icon="Connection"
                     :loading="registeringAndBinding"
-                    :disabled="onlineUsdHsbcBlocked"
-                    :title="onlineUsdHsbcBlocked ? onlineUsdHsbcBlockedReason : ''"
+                    :disabled="registerAndBindingBlocked"
+                    :title="registerAndBindingBlocked ? registerAndBindingBlockedReason : ''"
                     @click="handleRegisterAndRunMultiShop"
                   >
                     注册并完成绑店
@@ -8450,9 +11393,15 @@ function buildAiContext() {
       <el-card shadow="never" class="surface-card mock-panel-card">
         <template #header>
           <div class="card-head">
-            <div class="head-copy">
-              <h2>Mock 操作面板</h2>
-                <p>按当前 session 执行 webhook 模拟操作，执行结果会保留在对应步骤下方。</p>
+              <div class="head-copy">
+                <h2>Mock 操作面板</h2>
+                <p>{{ mockOperationEditMode ? '排版模式：拖动模块调整顺序，保存后全局生效。' : '按当前 session 执行 webhook 模拟操作，执行结果会保留在对应步骤下方。' }}</p>
+              </div>
+              <div v-if="isAdmin" class="mock-layout-actions">
+                <el-tag v-if="mockOperationEditMode" size="small" type="warning" effect="plain">排版中</el-tag>
+                <el-button v-if="mockOperationEditMode" size="small" @click="cancelMockOperationLayout">取消</el-button>
+                <el-button v-if="mockOperationEditMode" size="small" type="primary" @click="saveMockOperationLayout">保存排版</el-button>
+                <span v-else class="mock-layout-hint">长按模块进入排版</span>
               </div>
             </div>
           </template>
@@ -8518,10 +11467,19 @@ function buildAiContext() {
           </div>
 
           <div class="operation-panels operation-button-list">
-            <template v-for="operation in operations" :key="operation.key">
+            <template v-for="operation in visibleOperations" :key="operation.key">
             <div
               class="operation-row"
-              :class="{ active: activeOperationKey === operation.key, disabled: isOperationDisabled(operation) }"
+              :class="{ active: activeOperationKey === operation.key, disabled: isOperationDisabled(operation), 'is-layout-item': mockOperationEditMode, 'is-layout-dragging': mockOperationDragState === operation.key }"
+              :draggable="isAdmin && mockOperationEditMode"
+              @pointerdown="startMockOperationLongPress"
+              @pointerup="stopMockOperationLongPress"
+              @pointerleave="stopMockOperationLongPress"
+              @pointercancel="stopMockOperationLongPress"
+              @dragstart="onMockOperationDragStart($event, operation.key)"
+              @dragover.prevent="isAdmin && mockOperationEditMode"
+              @drop="onMockOperationDrop($event, operation.key)"
+              @dragend="onMockOperationDragEnd"
             >
               <button
                 type="button"
@@ -8561,7 +11519,10 @@ function buildAiContext() {
                 收起
               </el-button>
             </div>
-            <div class="operation-body">
+            <div
+              class="operation-body"
+              :class="{ 'dowsure-credit-body': activeOperation.key === 'dowsureCreditResult' }"
+            >
               <code class="endpoint-chip">{{ activeOperation.endpoint }}</code>
               <el-form label-position="top" class="tight-form">
                 <div v-if="shouldShowPspAuthorizationRows" class="psp-status-panel">
@@ -8653,6 +11614,7 @@ function buildAiContext() {
                   <div class="drawdown-repayment-table">
                     <div class="drawdown-repayment-row drawdown-repayment-header">
                       <span>lender_loan_id</span>
+                      <span>{{ activeOperation.key === 'cgbRepaymentResult' ? 'CGB loanCode（lender_drawdown_id）' : 'WEBANK loanCode' }}</span>
                       <span>total_interest_rate</span>
                       <span>outstanding_amount</span>
                       <span>repayment_status</span>
@@ -8663,52 +11625,86 @@ function buildAiContext() {
                     </div>
                     <div
                       v-for="row in drawdownRepaymentRows"
-                      :key="row.lender_loan_id"
+                      :key="`${row.lender_loan_id || row.lender_drawdown_id}-${row.lender_drawdown_id || ''}`"
                       class="drawdown-repayment-row"
-                      :class="{ selected: row.lender_loan_id === selectedDowsureRepaymentLoanCode }"
+                      :class="{ selected: repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode }"
                     >
                       <strong>{{ row.lender_loan_id || '-' }}</strong>
+                      <span>{{ row.lender_drawdown_id || '-' }}</span>
                       <span>{{ row.total_interest_rate ?? '-' }}</span>
                       <span>{{ row.outstanding_amount ?? '-' }}</span>
                       <span>{{ row.repayment_status || '-' }}</span>
                       <el-button
                         size="small"
-                        :type="row.lender_loan_id === selectedDowsureRepaymentLoanCode ? 'primary' : 'default'"
+                        :type="repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode ? 'primary' : 'default'"
                         @click="selectDrawdownRepaymentRow(row)"
                       >
-                        {{ row.lender_loan_id === selectedDowsureRepaymentLoanCode ? '已选中' : '选择' }}
+                        {{ repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode ? '已选中' : '选择' }}
                       </el-button>
                     </div>
                   </div>
                 </div>
 
+                <div
+                  v-if="activeOperation.key === 'dowsureCreditResult'"
+                  class="operation-fields"
+                  :class="{ empty: activeOperation.fields.length === 0 }"
+                >
+                  <template v-if="activeOperation.fields.length">
+                    <template v-for="field in activeOperation.fields" :key="`${activeOperation.key}-${field.prop}`">
+                      <el-form-item v-if="!field.visible || field.visible(operationForms[activeOperation.key])" :label="field.label">
+                        <el-input
+                          v-if="field.type === 'text'"
+                          v-model="operationForms[activeOperation.key][field.prop]"
+                          :placeholder="field.placeholder"
+                        />
+                        <el-input-number
+                          v-else-if="field.type === 'number'"
+                          v-model="operationForms[activeOperation.key][field.prop]"
+                          :min="field.min"
+                          :step="field.step || 1"
+                          controls-position="right"
+                          class="full-width"
+                        />
+                        <el-select v-else-if="field.type === 'select'" v-model="operationForms[activeOperation.key][field.prop]">
+                          <el-option
+                            v-for="option in fieldOptions(field)"
+                            :key="`${field.prop}-${option.value}`"
+                            :label="option.label"
+                            :value="option.value"
+                          />
+                        </el-select>
+                      </el-form-item>
+                    </template>
+                  </template>
+                  <div v-else class="no-params">这个操作不需要额外参数。</div>
+                </div>
+
                 <div v-if="shouldShowDowsureMerchantAccounts" class="dowsure-accounts-panel">
                   <div class="psp-status-head">
-                    <span>DOWSURE 店铺额度</span>
+                    <span>DOWSURE 店铺额度（offerId / sellerId 自动带出）</span>
                     <el-button size="small" text :loading="loadingDowsureMerchantAccounts" @click="loadDowsureMerchantAccounts">
                       刷新
                     </el-button>
                   </div>
                   <div class="dowsure-accounts-table">
                     <div class="dowsure-accounts-row dowsure-accounts-header">
-                      <span>merchant_account_id</span>
-                      <span>SP authorization_id</span>
-                      <span>created_at</span>
-                      <span>merchantAccountLimit</span>
+                      <span>offerId</span>
+                      <span>sellerId</span>
+                      <span>amount</span>
                     </div>
-                    <div v-if="!loadingDowsureMerchantAccounts && operationForms.underwrittenDowsure.merchant_accounts.length === 0" class="psp-status-empty">
+                    <div v-if="!loadingDowsureMerchantAccounts && operationForms.dowsureCreditResult.creditResultList.length === 0" class="psp-status-empty">
                       暂无 DOWSURE 店铺记录。
                     </div>
                     <div
-                      v-for="row in operationForms.underwrittenDowsure.merchant_accounts"
-                      :key="row.merchantAccountId"
+                      v-for="row in operationForms.dowsureCreditResult.creditResultList"
+                      :key="row.offerId || row.sellerId"
                       class="dowsure-accounts-row"
                     >
-                      <strong>{{ row.merchant_account_id || '-' }}</strong>
-                      <strong>{{ row.merchantAccountId || '-' }}</strong>
-                      <span>{{ row.created_at || '-' }}</span>
+                      <strong>{{ row.offerId || '-' }}</strong>
+                      <strong>{{ row.sellerId || '-' }}</strong>
                       <el-input-number
-                        v-model="row.merchantAccountLimit"
+                        v-model="row.amount"
                         :min="0"
                         :step="1000"
                         controls-position="right"
@@ -8718,7 +11714,52 @@ function buildAiContext() {
                   </div>
                 </div>
 
-                <div class="operation-fields" :class="{ empty: activeOperation.fields.length === 0 }">
+                <div v-if="shouldShowWebankSellerOffers" class="dowsure-accounts-panel">
+                  <div class="psp-status-head">
+                    <span>WEBANK 店铺额度</span>
+                    <el-button size="small" text :loading="loadingWebankSellerOffers" @click="loadWebankSellerOffers">
+                      刷新
+                    </el-button>
+                  </div>
+                  <div class="dowsure-accounts-table webank-seller-offers-table">
+                    <div class="dowsure-accounts-row dowsure-accounts-header">
+                      <span>offer_id</span>
+                      <span>seller_id</span>
+                      <span>marketplace_country</span>
+                      <span>准入状态</span>
+                      <span>applySellerBusinessSum</span>
+                    </div>
+                    <div v-if="!loadingWebankSellerOffers && operationForms.webankCreditResult.seller_offers.length === 0" class="psp-status-empty">
+                      暂无 WEBANK 店铺记录。
+                    </div>
+                    <div
+                      v-for="row in operationForms.webankCreditResult.seller_offers"
+                      :key="row.offer_id || row.seller_id"
+                      class="dowsure-accounts-row"
+                    >
+                      <strong>{{ row.offer_id || '-' }}</strong>
+                      <strong>{{ row.seller_id || '-' }}</strong>
+                      <span>{{ row.marketplace_country || '-' }}</span>
+                      <el-select v-model="row.admissionStatus" class="full-width">
+                        <el-option label="准入" value="ADMITTED" />
+                        <el-option label="不准入" value="NOT_ADMITTED" />
+                      </el-select>
+                      <el-input-number
+                        v-model="row.applySellerBusinessSum"
+                        :min="0"
+                        :step="1000"
+                        controls-position="right"
+                        class="full-width"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  v-if="activeOperation.key !== 'dowsureCreditResult'"
+                  class="operation-fields"
+                  :class="{ empty: activeOperation.fields.length === 0 }"
+                >
                   <template v-if="activeOperation.fields.length">
                     <template v-for="field in activeOperation.fields" :key="`${activeOperation.key}-${field.prop}`">
                       <el-form-item v-if="!field.visible || field.visible(operationForms[activeOperation.key])" :label="field.label">
@@ -8750,6 +11791,7 @@ function buildAiContext() {
                 </div>
 
                 <el-button
+                  class="operation-run-button"
                   type="primary"
                   :disabled="!activeSessionId || isOperationDisabled(activeOperation)"
                   :loading="runningOperationKey === activeOperation.key"

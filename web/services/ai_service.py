@@ -247,8 +247,35 @@ def _matched_rows_from_conn(conn: Any) -> Optional[int]:
 
 
 def _is_direct_sql(message: str) -> bool:
-    statement = _safe_sql(message)
-    return bool(re.match(r"^\s*(select|show|describe|desc|explain|with|update|insert|delete)\b", statement, flags=re.I))
+    return _extract_direct_sql(message) is not None
+
+
+def _extract_direct_sql(message: str) -> Optional[str]:
+    """提取用户明确要求执行的 SQL，保留多语句、变量和事务语句。"""
+    raw = (message or "").strip()
+    blocks = re.findall(r"```(?:sql|mysql)?\s*([\s\S]*?)```", raw, flags=re.I)
+    candidates = blocks or [raw]
+    execution_hint = bool(
+        re.search(
+            r"(?:执行|运行|跑|run|execute)\s*(?:(?:一下|这个|以下|该|this|the|following)\s*)*sql\s*[:：]?",
+            raw,
+            flags=re.I,
+        )
+    )
+    sql_start = re.compile(
+        r"(?im)(?:^|[：:]\s*)(?:--[^\n]*\n\s*)*"
+        r"(?:set|start\s+transaction|begin|commit|rollback|select|show|describe|desc|explain|with|update|insert|delete|call)\b"
+    )
+    for candidate in candidates:
+        match = sql_start.search(candidate.strip())
+        if not match:
+            continue
+        if not blocks and match.start() > 0 and not execution_hint:
+            continue
+        sql = candidate.strip()[match.start():].lstrip("：:").strip().strip("`").strip()
+        if sql:
+            return sql
+    return None
 
 
 def _signature_tokens(text: str) -> list[str]:
@@ -1266,8 +1293,9 @@ class DPUAIService:
             "reasoning_effort": override_effort,
         }
 
+        direct_sql = _extract_direct_sql(message)
         disabled_match = _match_disabled_prompt_template(message)
-        if disabled_match:
+        if disabled_match and not direct_sql:
             reply = (
                 f"模板「{disabled_match.get('title') or '该提示词'}」当前已被管理员禁用，"
                 "不能通过 AI 助手触发对应的底层逻辑。如有需要，请联系管理员重新启用。"
@@ -1281,6 +1309,20 @@ class DPUAIService:
                     "id": disabled_match.get("id"),
                     "title": disabled_match.get("title"),
                 },
+            }
+
+        if direct_sql:
+            tool_args = {"sql": direct_sql, "env": context.get("selected_env") or context.get("session", {}).get("env")}
+            tool_result = ToolExecutor(context).execute("execute_sql", tool_args)
+            reply = self._format_sql_result(tool_result)
+            return {
+                "success": True,
+                "mode": "tool",
+                "reply": reply,
+                "tool_name": "execute_sql",
+                "tool_args": tool_args,
+                "tool_result": tool_result,
+                "decision": {"mode": "tool", "tool": {"name": "execute_sql", "args": tool_args}},
             }
 
         enabled_match = _match_enabled_prompt_template(message)
@@ -1325,20 +1367,6 @@ class DPUAIService:
                     "tool": {"name": "execute_sql", "args": tool_args},
                     "intent": "update_3pl_sales_value",
                 },
-            }
-
-        if _is_direct_sql(message):
-            tool_args = {"sql": message, "env": context.get("selected_env") or context.get("session", {}).get("env")}
-            tool_result = ToolExecutor(context).execute("execute_sql", tool_args)
-            reply = self._format_sql_result(tool_result)
-            return {
-                "success": True,
-                "mode": "tool",
-                "reply": reply,
-                "tool_name": "execute_sql",
-                "tool_args": tool_args,
-                "tool_result": tool_result,
-                "decision": {"mode": "tool", "tool": {"name": "execute_sql", "args": tool_args}},
             }
 
         if _is_greeting_request(message):
@@ -1416,7 +1444,7 @@ class DPUAIService:
 
         intent_text = _normalize_text(message)
         account_slots = _extract_account_creation_slots(message)
-        if any(token in intent_text for token in ("create account", "create an account", "register account", "signup", "account", "\u521b\u5efa", "\u8d26\u53f7", "\u6ce8\u518c")):
+        if any(token in intent_text for token in ("create account", "create an account", "register account", "signup", "\u521b\u5efa\u8d26\u53f7", "\u6ce8\u518c\u8d26\u53f7")):
             missing_fields = _account_creation_missing_fields(account_slots)
             if missing_fields:
                 question = "要创建账号的话，请先告诉我" + "、".join(missing_fields) + "。"
