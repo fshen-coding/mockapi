@@ -281,6 +281,11 @@ const PROMPT_PARAM_HINT_MAP = {
   phone_number: '手机号',
   merchant_id: '商户号',
   user_id: '用户 ID',
+  id_card_match: '身份证是否一致',
+  company_name_match: '企业名字是否一致',
+  legal_name_match: '法人名字是否一致',
+  psp_type: 'PSP 服务商类型',
+  psp_subject_type: '主体类型',
   env: '环境',
   shop_type: '店铺类型（DPU_3PL/SP/3PL）',
   country: '国家（US/CA/DE/UK/GB/FR/IT/ES/JP）',
@@ -294,6 +299,20 @@ const PROMPT_PARAM_HINT_MAP = {
 // 使用模板弹窗里可留空的占位符（后端会自动生成/兜底），不做必填校验。
 const OPTIONAL_PROMPT_PARAMS = new Set(['seller_id', 'quota_year1_sales_value'])
 const PROMPT_PARAM_SELECT_OPTIONS = {
+  company_name_match: [
+    { label: '一致（Y）', value: 'Y' },
+    { label: '不一致（N）', value: 'N' },
+  ],
+  legal_name_match: [
+    { label: '一致（Y）', value: 'Y' },
+    { label: '不一致（N）', value: 'N' },
+  ],
+  id_card_match: [
+    { label: '一致（Y）', value: 'Y' },
+    { label: '不一致（N）', value: 'N' },
+  ],
+  psp_type: ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P8', 'P9', 'P11']
+    .map((value) => ({ label: value, value })),
   shop_type: [
     { label: 'DPU_3PL', value: 'DPU_3PL' },
     { label: 'SP', value: 'SP' },
@@ -324,6 +343,21 @@ const PROMPT_PARAM_SELECT_OPTIONS = {
   ],
 }
 
+const PSP_SUBJECT_TYPE_OPTIONS = {
+  payment_user: [
+    { label: '个人（PERSONAL）', value: 'PERSONAL' },
+    { label: '企业（ENTERPRISE）', value: 'ENTERPRISE' },
+  ],
+  P3: [
+    { label: '个人（CN_ID_CARD）', value: 'CN_ID_CARD' },
+    { label: '企业（CREDIT_CODE）', value: 'CREDIT_CODE' },
+  ],
+  P2: [
+    { label: '个人（0）', value: '0' },
+    { label: '企业（1）', value: '1' },
+  ],
+}
+
 const useDialogTargetPlaceholders = computed(() => {
   const logic = promptTemplateUseTarget.value?.logic || ''
   if (!logic) return []
@@ -333,7 +367,15 @@ const useDialogTargetPlaceholders = computed(() => {
   while ((m = regex.exec(logic)) !== null) {
     matches.add(m[1])
   }
-  return Array.from(matches)
+  const placeholders = Array.from(matches)
+  // 将三个一致性选项连续展示：身份证、企业名字、法人名字。
+  if (matches.has('id_card_match')) {
+    const nameFields = ['company_name_match', 'legal_name_match'].filter((key) => matches.has(key))
+    const ordered = placeholders.filter((key) => !nameFields.includes(key))
+    ordered.splice(ordered.indexOf('id_card_match') + 1, 0, ...nameFields)
+    return ordered
+  }
+  return placeholders
 })
 
 const useDialogParamHints = computed(() => {
@@ -346,6 +388,9 @@ const useDialogParamFields = computed(() => {
     key,
     label: PROMPT_PARAM_HINT_MAP[key] || key,
     options: getPromptTemplateParamOptions(key),
+    placeholder: key === 'psp_subject_type' && !getPromptTemplateParamOptions(key).length
+      ? (promptTemplateUseParams.psp_type ? '不适用' : '请先选择 PSP 服务商类型')
+      : '',
     help: key === 'quota_year1_sales_value'
       ? '填写 5000 万到 2 亿，权重占比高。'
       : '',
@@ -357,6 +402,8 @@ const useDialogParamFields = computed(() => {
         (key === 'country' && promptTemplateUseParams.shop_type === '3PL')
         || (key === 'sp_mode' && ['3PL', 'SP'].includes(promptTemplateUseParams.shop_type))
       )
+    ) || (
+      key === 'psp_subject_type' && !getPromptTemplateParamOptions(key).length
     ),
   }))
 })
@@ -7773,6 +7820,9 @@ function openPromptTemplateUse(template) {
 }
 
 function handlePromptTemplateParamChange(key) {
+  if (key === 'psp_type') {
+    promptTemplateUseParams.psp_subject_type = ''
+  }
   if (key === 'access_mode' && promptTemplateUseParams.access_mode === 'NOT_ADMITTED') {
     promptTemplateUseParams.quota_year1_sales_value = ''
   }
@@ -7780,6 +7830,13 @@ function handlePromptTemplateParamChange(key) {
 }
 
 function getPromptTemplateParamOptions(key) {
+  if (key === 'psp_subject_type') {
+    const pspType = promptTemplateUseParams.psp_type
+    if (['P1', 'P4', 'P5', 'P6', 'P11'].includes(pspType)) {
+      return PSP_SUBJECT_TYPE_OPTIONS.payment_user
+    }
+    return PSP_SUBJECT_TYPE_OPTIONS[pspType] || []
+  }
   if (
     key === 'country'
     && promptTemplateUseTarget.value?.title === '广发-豆沙添加店铺'
@@ -7812,6 +7869,9 @@ function normalizePromptTemplateShopParams() {
 }
 
 function isPromptTemplateParamOptional(key) {
+  if (key === 'psp_subject_type') {
+    return !getPromptTemplateParamOptions(key).length
+  }
   return OPTIONAL_PROMPT_PARAMS.has(key)
 }
 
@@ -7842,6 +7902,14 @@ async function executePromptTemplateAction() {
     )
     if (missing.length) {
       ElMessage.warning(`请填写：${missing.map((f) => f.label).join('、')}`)
+      return
+    }
+    const invalidPhone = paramFields.find((f) => (
+      ['phone', 'phone_number'].includes(f.key)
+      && !/^(?:\d{8}|\d{11})$/.test(String(promptTemplateUseParams[f.key] ?? '').trim())
+    ))
+    if (invalidPhone) {
+      ElMessage.warning('请输入 8 位或 11 位数字手机号')
       return
     }
     userInput = paramFields
@@ -10963,7 +11031,7 @@ function buildAiContext() {
                   <el-select
                     v-if="field.options"
                     v-model="promptTemplateUseParams[field.key]"
-                    :placeholder="`请选择${field.label}`"
+                    :placeholder="field.placeholder || `请选择${field.label}`"
                     :disabled="field.disabled"
                     :clearable="!field.disabled"
                     @change="handlePromptTemplateParamChange(field.key)"
@@ -10975,6 +11043,22 @@ function buildAiContext() {
                       :value="option.value"
                     />
                   </el-select>
+                  <el-input
+                    v-else-if="['phone', 'phone_number'].includes(field.key)"
+                    v-model="promptTemplateUseParams[field.key]"
+                    type="tel"
+                    inputmode="numeric"
+                    maxlength="11"
+                    placeholder="请输入 8 位或 11 位手机号"
+                  />
+                  <el-input
+                    v-else-if="field.key === 'user_id'"
+                    v-model="promptTemplateUseParams[field.key]"
+                    type="number"
+                    min="1"
+                    step="1"
+                    :placeholder="`请输入${field.label}`"
+                  />
                   <el-input
                     v-else
                     v-model="promptTemplateUseParams[field.key]"

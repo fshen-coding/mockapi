@@ -15,6 +15,11 @@ services:
       - ./web/data:/app/web/data
     ports:
       - "8000:8000"
+    networks:
+      default: {}
+      dpu-services:
+        aliases:
+          - mockapi
     restart: unless-stopped
 
   mockapi-dev:
@@ -31,3 +36,8 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
     restart: unless-stopped
+
+networks:
+  dpu-services:
+    external: true
+    name: dpu-services_default
