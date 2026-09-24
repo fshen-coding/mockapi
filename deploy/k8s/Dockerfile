@@ -28,9 +28,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-COPY ui_automation/package.json /app/ui_automation/package.json
+COPY ui_automation/package.json ui_automation/package-lock.json /app/ui_automation/
 RUN cd /app/ui_automation \
-    && npm install --omit=dev --no-audit --no-fund \
+    && npm ci --omit=dev --no-audit --no-fund \
     && npx playwright install --with-deps chromium \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
