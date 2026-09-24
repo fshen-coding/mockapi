@@ -24,7 +24,7 @@ from web.models.requests import (
     PromptTemplateUpdateRequest,
 )
 from web.routes.auth_guard import require_admin, require_valid_username
-from web.services.audit_store import audit_store
+from web.services.audit_store import PSP_IDENTITY_TEMPLATE_TITLE, audit_store
 from web.services.ai_service import DPUAIService
 
 log = logging.getLogger(__name__)
@@ -52,6 +52,13 @@ SUPPORTED_ENVS = ("sit", "uat", "dev", "preprod", "reg", "local")
 SQL_EXECUTION_TIMEOUT = 30
 HTTP_EXECUTION_TIMEOUT = 30
 PYTHON_EXECUTION_TIMEOUT = 30
+PSP_IDENTITY_PARAM_KEYS = {"phone", "id_card_match", "psp_type", "psp_subject_type", "company_name_match", "legal_name_match"}
+PSP_IDENTITY_TYPES = {"P1", "P2", "P3", "P4", "P5", "P6", "P8", "P9", "P11"}
+PSP_SUBJECT_TYPES = {
+    **{key: ("PERSONAL", "ENTERPRISE") for key in ("P1", "P4", "P5", "P6", "P11")},
+    "P3": ("CN_ID_CARD", "CREDIT_CODE"),
+    "P2": ("0", "1"),
+}
 
 
 def _all_supported_envs() -> tuple[str, ...]:
@@ -176,7 +183,8 @@ async def execute_prompt_template(template_id: int, req: PromptTemplateExecuteRe
     # AI materialise pipeline that infers params from free-text user_input.
     if req.params:
         try:
-            rendered, missing = _apply_params(template["logic"], req.params)
+            params = _validated_template_params(template, req.params)
+            rendered, missing = _apply_params(template["logic"], params)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"参数替换失败: {exc}") from exc
         if missing:
@@ -194,9 +202,10 @@ async def execute_prompt_template(template_id: int, req: PromptTemplateExecuteRe
                     "ai_error": f"缺少参数：{hints}",
                 },
             )
-        params = dict(req.params)
         notes = "参数由前端分列输入，机械替换（未经过 AI）。"
     else:
+        if _is_psp_identity_template(template):
+            raise HTTPException(status_code=400, detail="请填写手机号、服务商及适用的主体类型，并选择身份证、企业名字和法人名字是否一致")
         try:
             materialised = await asyncio.to_thread(
                 _ai_materialise,
@@ -230,6 +239,12 @@ async def execute_prompt_template(template_id: int, req: PromptTemplateExecuteRe
         rendered = materialised.get("rendered") or template["logic"]
         params = materialised.get("params") or {}
         notes = materialised.get("notes") or ""
+
+    if _is_psp_identity_template(template):
+        try:
+            params["resolved_user_id"] = await asyncio.to_thread(_resolve_psp_user_id, params["phone"], env)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Step 2: execute the rendered logic.
     try:
@@ -396,6 +411,74 @@ def _apply_params(logic: str, params: dict[str, Any]) -> tuple[str, list[str]]:
             continue
         rendered = rendered.replace("${" + key + "}", str(value))
     return rendered, missing
+
+
+def _is_psp_identity_template(template: dict[str, Any]) -> bool:
+    placeholders = set(_extract_placeholders(template.get("logic", "")))
+    return template.get("title") == PSP_IDENTITY_TEMPLATE_TITLE or PSP_IDENTITY_PARAM_KEYS.issubset(placeholders)
+
+
+def _validated_template_params(template: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    if not _is_psp_identity_template(template):
+        return dict(params)
+
+    unknown = set(params) - PSP_IDENTITY_PARAM_KEYS
+    if unknown:
+        raise ValueError(f"不支持的参数：{'、'.join(sorted(unknown))}")
+    missing = (PSP_IDENTITY_PARAM_KEYS - {"psp_subject_type"}) - set(params)
+    if missing:
+        raise ValueError(f"缺少参数：{'、'.join(sorted(missing))}")
+
+    phone = str(params.get("phone") or "").strip()
+    if not re.fullmatch(r"(?:[0-9]{8}|[0-9]{11})", phone):
+        raise ValueError("手机号必须是 8 位或 11 位数字")
+
+    id_card_match = str(params.get("id_card_match") or "").strip().upper()
+    if id_card_match not in {"Y", "N"}:
+        raise ValueError("身份证是否一致只能选择 Y 或 N")
+
+    name_matches = {}
+    for key, label in (("company_name_match", "企业名字"), ("legal_name_match", "法人名字")):
+        value = str(params.get(key) or "").strip().upper()
+        if value not in {"Y", "N"}:
+            raise ValueError(f"{label}是否一致只能选择 Y 或 N")
+        name_matches[key] = value
+
+    psp_type = str(params.get("psp_type") or "").strip().upper()
+    if psp_type not in PSP_IDENTITY_TYPES:
+        raise ValueError(f"不支持的服务商类型：{psp_type}")
+
+    raw_subject_type = params.get("psp_subject_type")
+    subject_type = "" if raw_subject_type is None else str(raw_subject_type).strip().upper()
+    allowed_subject_types = PSP_SUBJECT_TYPES.get(psp_type)
+    if allowed_subject_types:
+        if subject_type not in allowed_subject_types:
+            raise ValueError(f"{psp_type} 主体类型必须选择 {' / '.join(allowed_subject_types)}")
+    elif subject_type:
+        raise ValueError(f"{psp_type} 无需主体类型，请留空")
+
+    return {"phone": phone, "id_card_match": id_card_match, "psp_type": psp_type, "psp_subject_type": subject_type, **name_matches}
+
+
+def _resolve_psp_user_id(phone: str, env: str) -> int:
+    # 独立校验以确保仅允许数字进入 SQL；查询必须先于任何实名资料写入。
+    if not re.fullmatch(r"(?:[0-9]{8}|[0-9]{11})", phone):
+        raise ValueError("手机号必须是 8 位或 11 位数字")
+    lookup = _execute_sql(
+        f"SELECT id FROM dsb_seller_center.t_user WHERE tel = '{phone}' LIMIT 2", env,
+    )
+    if not lookup.get("success"):
+        raise ValueError(f"手机号查询失败：{lookup.get('message') or '无法查询用户'}")
+    results = lookup.get("results") or []
+    rows = results[0].get("rows", []) if results else []
+    if not rows:
+        raise ValueError("该手机号未找到用户，请检查手机号和执行环境")
+    if len(rows) != 1:
+        raise ValueError("该手机号匹配到多个用户，已停止执行")
+    user_id = rows[0].get("id")
+    if user_id is None or not str(user_id).isdigit() or int(user_id) <= 0:
+        raise ValueError("手机号对应的用户 ID 无效，已停止执行")
+    return int(user_id)
 
 
 def _ai_materialise(template: dict[str, Any], user_input: str, env: str, model: Optional[str]) -> dict[str, Any]:

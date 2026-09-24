@@ -20,6 +20,246 @@ DEFAULT_DATABASE_URL = "postgresql://mockapi:mockapi@127.0.0.1:54329/mockapi"
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
 
+PSP_IDENTITY_TEMPLATE_TITLE = "PSP 服务商实名信息校验"
+PSP_IDENTITY_TEMPLATE_DESCRIPTION = (
+    "通过手机号查询用户，按服务商和主体类型设置实名资料，独立选择身份证、企业名字和法人名字是否一致。"
+    "P1/P4/P5/P6/P11、P2、P3 可选个人或企业，P8/P9 无需选择主体类型。"
+)
+PSP_IDENTITY_TEMPLATE_LOGIC = r"""-- 公共入参
+SET @phone = '${phone}';
+SET @id_card_match = '${id_card_match}';
+SET @psp_type = '${psp_type}';
+SET @psp_subject_type = '${psp_subject_type}';
+SET @company_name_match = '${company_name_match}';
+SET @legal_name_match = '${legal_name_match}';
+
+-- 按手机号反查用户；存在多个匹配时终止，未找到时不写入任何 PSP 资料。
+SET @user_id = (SELECT id FROM dsb_seller_center.t_user WHERE tel = @phone);
+
+-- 快融侧基准资料
+SET @kr_company_name = '微山县五金有限公司';
+SET @kr_legal_name = '造数香碧';
+SET @kr_legal_card_no = '654221197001057391';
+
+-- 三项一致性独立控制：Y 使用快融侧基准值，N 使用不同的测试值。
+SET @psp_subject_name = CASE @company_name_match
+    WHEN 'Y' THEN @kr_company_name
+    ELSE '测试企业不一致有限公司'
+END;
+SET @psp_person_name = CASE @legal_name_match
+    WHEN 'Y' THEN @kr_legal_name
+    ELSE '李明'
+END;
+SET @psp_card_no = CASE @id_card_match
+    WHEN 'Y' THEN '654221197001057391'
+    ELSE '654221197001057392'
+END;
+-- P9 会验证身份证校验位；N 使用校验有效且不同的号码，避免落入非身份证企业名分支。
+SET @ipaylinks_card_no = CASE @id_card_match
+    WHEN 'Y' THEN @kr_legal_card_no
+    ELSE '654221197001057308'
+END;
+
+-- 1. 快融侧：t_borrower
+UPDATE t_borrower b
+JOIN (
+    SELECT id
+    FROM t_borrower
+    WHERE user_id = @user_id
+    ORDER BY update_time DESC, create_time DESC, id DESC
+    LIMIT 1
+) x ON x.id = b.id
+SET b.b_name = @kr_legal_name,
+    b.b_card_id = HEX(AES_ENCRYPT(@kr_legal_card_no, 'DSBENCY')),
+    b.update_time = NOW();
+
+-- 2. 快融侧：t_borrower_company
+UPDATE t_borrower_company bc
+JOIN (
+    SELECT id
+    FROM t_borrower_company
+    WHERE user_id = @user_id
+    ORDER BY update_time DESC, create_time DESC, id DESC
+    LIMIT 1
+) x ON x.id = bc.id
+SET bc.bc_name = @kr_company_name,
+    bc.bc_legalperson = @kr_legal_name,
+    bc.bc_legalperson_id_card = @kr_legal_card_no,
+    bc.update_time = NOW();
+
+-- 3. P1/P4/P5/P6/P11：共用 t_payment_user，以 payment_code 区分服务商。
+SET @payment_code = CASE @psp_type
+    WHEN 'P1' THEN 'P1'
+    WHEN 'P4' THEN 'P4'
+    WHEN 'P5' THEN 'P5'
+    WHEN 'P6' THEN 'P6'
+    WHEN 'P11' THEN 'P11'
+    ELSE NULL
+END;
+SET @psp_credentials_type = @psp_subject_type;
+SET @payment_user_subject_name = CASE
+    WHEN @psp_credentials_type = 'PERSONAL' THEN @psp_person_name
+    ELSE @psp_subject_name
+END;
+
+UPDATE t_payment_user pu
+JOIN (
+    SELECT id
+    FROM t_payment_user
+    WHERE user_id = @user_id
+      AND payment_code = @payment_code
+      AND @psp_type IN ('P1', 'P4', 'P5', 'P6', 'P11')
+    ORDER BY id DESC
+    LIMIT 1
+) x ON x.id = pu.id
+SET pu.credentials_type = @psp_credentials_type,
+    pu.payment_subject_name = @payment_user_subject_name,
+    pu.payment_name = @psp_person_name,
+    pu.legal_name = @psp_person_name,
+    pu.credentials_code = @psp_card_no,
+    pu.update_time = NOW();
+
+INSERT INTO t_payment_user (
+    user_id, payment_code, payment_subject_name, payment_name,
+    credentials_type, legal_name, credentials_code, create_time, update_time
+)
+SELECT @user_id, @payment_code, @payment_user_subject_name, @psp_person_name,
+       @psp_credentials_type, @psp_person_name, @psp_card_no, NOW(), NOW()
+WHERE @psp_type IN ('P1', 'P4', 'P5', 'P6', 'P11')
+  AND @user_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM t_payment_user
+      WHERE user_id = @user_id AND payment_code = @payment_code
+      LIMIT 1
+  );
+
+-- 4. P8：t_epay_user
+UPDATE t_epay_user eu
+JOIN (
+    SELECT id
+    FROM t_epay_user
+    WHERE dowsure_user_id = @user_id AND @psp_type = 'P8'
+    ORDER BY id DESC
+    LIMIT 1
+) x ON x.id = eu.id
+SET eu.cert_name = @psp_subject_name,
+    eu.merchant_name = @psp_subject_name,
+    eu.merchant_name_cn = @psp_subject_name,
+    eu.id_card_name = @psp_person_name,
+    eu.id_card_no = @psp_card_no,
+    eu.update_time = NOW();
+
+INSERT INTO t_epay_user (
+    dowsure_user_id, cert_name, merchant_name, merchant_name_cn,
+    id_card_name, id_card_no, create_time, update_time
+)
+SELECT @user_id, @psp_subject_name, @psp_subject_name, @psp_subject_name,
+       @psp_person_name, @psp_card_no, NOW(), NOW()
+WHERE @psp_type = 'P8'
+  AND @user_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM t_epay_user WHERE dowsure_user_id = @user_id LIMIT 1
+  );
+
+-- 5. P9：t_ipaylinks_user
+UPDATE t_ipaylinks_user iu
+JOIN (
+    SELECT id
+    FROM t_ipaylinks_user
+    WHERE dowsure_user_id = @user_id AND @psp_type = 'P9'
+    ORDER BY id DESC
+    LIMIT 1
+) x ON x.id = iu.id
+SET iu.merchant_accountname = @psp_subject_name,
+    iu.idcard_certname = @psp_person_name,
+    iu.idcard_certno = @ipaylinks_card_no,
+    iu.update_time = NOW();
+
+INSERT INTO t_ipaylinks_user (
+    dowsure_user_id, merchant_accountname, idcard_certname,
+    idcard_certno, create_time, update_time
+)
+SELECT @user_id, @psp_subject_name, @psp_person_name,
+       @ipaylinks_card_no, NOW(), NOW()
+WHERE @psp_type = 'P9'
+  AND @user_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM t_ipaylinks_user WHERE dowsure_user_id = @user_id LIMIT 1
+  );
+
+-- 6. P3：CN_ID_CARD 为个人，CREDIT_CODE 为企业。
+SET @pp_payment_subject_type = @psp_subject_type;
+SET @pp_subject_name = CASE
+    WHEN @pp_payment_subject_type = 'CREDIT_CODE' THEN @psp_subject_name
+    ELSE @psp_person_name
+END;
+UPDATE t_pp_user pp
+JOIN (
+    SELECT id
+    FROM t_pp_user
+    WHERE dowsure_user_id = @user_id AND @psp_type = 'P3'
+    ORDER BY id DESC
+    LIMIT 1
+) x ON x.id = pp.id
+SET pp.payment_subject_type = @pp_payment_subject_type,
+    pp.name = @pp_subject_name,
+    pp.legal_name = @psp_person_name,
+    pp.id_no = @psp_card_no,
+    pp.legal_card_number = @psp_card_no,
+    pp.update_time = NOW();
+
+INSERT INTO t_pp_user (
+    dowsure_user_id, name, legal_name, payment_subject_type,
+    id_no, legal_card_number, create_time, update_time
+)
+SELECT @user_id, @pp_subject_name, @psp_person_name,
+       @pp_payment_subject_type, @psp_card_no, @psp_card_no, NOW(), NOW()
+WHERE @psp_type = 'P3'
+  AND @user_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM t_pp_user WHERE dowsure_user_id = @user_id LIMIT 1
+  );
+
+-- 7. P2：t_llpay_user，0=个人，1=企业。
+SET @llpay_id_type = @psp_subject_type;
+SET @llpay_user_name = CASE
+    WHEN @llpay_id_type = '1' THEN @psp_subject_name
+    ELSE @psp_person_name
+END;
+UPDATE t_llpay_user lu
+JOIN (
+    SELECT id
+    FROM t_llpay_user
+    WHERE dowsure_user_id = @user_id AND @psp_type = 'P2'
+    ORDER BY id DESC
+    LIMIT 1
+) x ON x.id = lu.id
+SET lu.user_name = @llpay_user_name,
+    lu.legal_name = @psp_person_name,
+    lu.id_type = @llpay_id_type,
+    lu.id_no = @psp_card_no,
+    lu.legal_id_no = @psp_card_no,
+    lu.update_time = NOW();
+
+INSERT INTO t_llpay_user (
+    dowsure_user_id, user_name, legal_name, id_type,
+    id_no, legal_id_no, create_time, update_time
+)
+SELECT @user_id, @llpay_user_name, @psp_person_name,
+       @llpay_id_type, @psp_card_no, @psp_card_no, NOW(), NOW()
+WHERE @psp_type = 'P2'
+  AND @user_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM t_llpay_user WHERE dowsure_user_id = @user_id LIMIT 1
+  );"""
+PSP_IDENTITY_TEMPLATE_EXAMPLE = (
+    "phone=13410276504，id_card_match=Y，psp_type=P1，psp_subject_type=PERSONAL，"
+    "company_name_match=Y，legal_name_match=Y。企业名字与法人名字是否一致分别可选 Y/N；"
+    "身份证是否一致可选 Y/N；P1/P4/P5/P6/P11 主体类型为 PERSONAL/ENTERPRISE；"
+    "P3 为 CN_ID_CARD/CREDIT_CODE；P2 为 0/1；P8/P9 主体类型留空。"
+)
+
 
 class AuditStore:
     def __init__(self) -> None:
@@ -229,6 +469,48 @@ class AuditStore:
                 # Registration approval workflow: pending → active / rejected
                 conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
                 self.ensure_admin_user(conn)
+                template = conn.execute(
+                    "SELECT id, logic, deleted_at FROM prompt_templates WHERE title = %s ORDER BY id LIMIT 1",
+                    (PSP_IDENTITY_TEMPLATE_TITLE,),
+                ).fetchone()
+                if not template:
+                    conn.execute(
+                        """
+                        INSERT INTO prompt_templates (
+                            title, description, logic_type, logic, example_prompt,
+                            created_by, updated_by
+                        )
+                        VALUES (%s, %s, 'sql', %s, %s, %s, %s)
+                        """,
+                        (
+                            PSP_IDENTITY_TEMPLATE_TITLE,
+                            PSP_IDENTITY_TEMPLATE_DESCRIPTION,
+                            PSP_IDENTITY_TEMPLATE_LOGIC,
+                            PSP_IDENTITY_TEMPLATE_EXAMPLE,
+                            ADMIN_USERNAME,
+                            ADMIN_USERNAME,
+                        ),
+                    )
+                elif not template["deleted_at"] and (
+                    "${user_id}" in template["logic"]
+                    or ("${phone}" in template["logic"] and "${company_name_match}" not in template["logic"])
+                ):
+                    # 升级旧版参数，保留模板 ID、环境锁和禁用状态。
+                    conn.execute(
+                        """
+                        UPDATE prompt_templates
+                        SET description = %s, logic = %s, example_prompt = %s,
+                            updated_by = %s, updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (
+                            PSP_IDENTITY_TEMPLATE_DESCRIPTION,
+                            PSP_IDENTITY_TEMPLATE_LOGIC,
+                            PSP_IDENTITY_TEMPLATE_EXAMPLE,
+                            ADMIN_USERNAME,
+                            template["id"],
+                        ),
+                    )
             log.info("Mock API audit database schema ready")
         except Exception as exc:
             log.warning("Mock API audit database is unavailable: %s", exc)
