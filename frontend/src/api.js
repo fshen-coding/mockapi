@@ -62,6 +62,11 @@ export async function fetchLogs(params = {}) {
   return unwrap(response)
 }
 
+export async function fetchEnvironmentMonitor(params = {}) {
+  const response = await client.get('/api/environment-monitor', { params })
+  return unwrap(response)
+}
+
 export async function fetchUserOperations(params = {}) {
   const response = await client.get('/api/audit/operations', { params })
   return unwrap(response)
@@ -123,6 +128,20 @@ export async function registerAndRunMultiShop(payload) {
 
 export async function fetchDowsureMerchantAccounts(sessionId) {
   const response = await client.get('/api/mock/dowsure-merchant-accounts', {
+    params: { session_id: sessionId },
+  })
+  return unwrap(response)
+}
+
+export async function fetchApplicationCodes(sessionId) {
+  const response = await client.get('/api/mock/application-codes', {
+    params: { session_id: sessionId },
+  })
+  return unwrap(response)
+}
+
+export async function fetchWebankSellerOffers(sessionId) {
+  const response = await client.get('/api/mock/webank-seller-offers', {
     params: { session_id: sessionId },
   })
   return unwrap(response)
@@ -232,6 +251,92 @@ export async function executePromptTemplate(templateId, payload) {
 
 export async function fetchScenarioStepOverrides(username) {
   const response = await client.get('/api/scenario-overrides', { params: { username } })
+  return unwrap(response)
+}
+
+export async function fetchAiUiRuntimeStatus(username) {
+  const response = await client.get('/api/ai-ui/status', { params: { username } })
+  return unwrap(response)
+}
+
+export async function fetchAiUiCases(username) {
+  const response = await client.get('/api/ai-ui/cases', { params: { username } })
+  return unwrap(response)
+}
+
+export async function generateAiUiCase(payload) {
+  const response = await client.post('/api/ai-ui/generate', payload)
+  return unwrap(response)
+}
+
+export async function saveAiUiCase(payload, caseId = null) {
+  const response = caseId
+    ? await client.put(`/api/ai-ui/cases/${encodeURIComponent(caseId)}`, payload)
+    : await client.post('/api/ai-ui/cases', payload)
+  return unwrap(response)
+}
+
+export async function deleteAiUiCase(caseId, username) {
+  const response = await client.delete(`/api/ai-ui/cases/${encodeURIComponent(caseId)}`, {
+    params: { username },
+  })
+  return unwrap(response)
+}
+
+export async function fetchAiUiRuns(username) {
+  const response = await client.get('/api/ai-ui/runs', { params: { username } })
+  return unwrap(response)
+}
+
+export async function startAiUiRun(payload) {
+  const response = await client.post('/api/ai-ui/runs', payload)
+  return unwrap(response)
+}
+
+export async function fetchAiUiRun(runId, username) {
+  const response = await client.get(`/api/ai-ui/runs/${encodeURIComponent(runId)}`, {
+    params: { username },
+  })
+  return unwrap(response)
+}
+
+export async function stopAiUiRun(runId, username) {
+  const response = await client.post(`/api/ai-ui/runs/${encodeURIComponent(runId)}/stop`, null, {
+    params: { username },
+  })
+  return unwrap(response)
+}
+
+export async function fetchShopPerformanceBuiltinPresets(username) {
+  const response = await client.get('/api/mock/shop-performance-cny-boost/presets', {
+    params: { username },
+  })
+  return unwrap(response)
+}
+
+export async function fetchCompanyImageTemplates(username) {
+  const response = await client.get('/api/company-image-templates', {
+    params: { username },
+  })
+  return unwrap(response)
+}
+
+export async function saveCompanyImageTemplate(payload, templateId = null) {
+  const formData = new FormData()
+  formData.append('username', payload.username)
+  formData.append('name', payload.name)
+  formData.append('image_type', payload.image_type)
+  if (payload.file) formData.append('file', payload.file)
+  const response = templateId
+    ? await client.put(`/api/company-image-templates/${templateId}`, formData)
+    : await client.post('/api/company-image-templates', formData)
+  return unwrap(response)
+}
+
+export async function deleteCompanyImageTemplate(templateId, username) {
+  const response = await client.delete(`/api/company-image-templates/${templateId}`, {
+    params: { username },
+  })
   return unwrap(response)
 }
 

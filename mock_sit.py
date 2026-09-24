@@ -277,8 +277,8 @@ class DatabaseConfig:
             "port": 3306,
             "charset": "utf8mb4",
             "connect_timeout": 15,
-            "read_timeout": 15,
-        },
+            "read_timeout": 15,  
+          },
         "preprod": {
             "host": "43.199.241.190",
             "user": "dpu_preprod",

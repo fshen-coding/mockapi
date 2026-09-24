@@ -89,7 +89,10 @@ async def create_prompt_template(req: PromptTemplateCreateRequest):
 @router.put("/{template_id}", response_model=ApiResponse)
 async def update_prompt_template(template_id: int, req: PromptTemplateUpdateRequest):
     caller = require_admin(req.username)
-    payload = {k: v for k, v in req.model_dump(exclude={"username"}).items() if v is not None}
+    # `locked_env: null` is the only way the UI can clear a pinned env, so it has
+    # to survive the None filter that keeps omitted fields from being overwritten.
+    sent = req.model_dump(exclude={"username"}, exclude_unset=True)
+    payload = {k: v for k, v in sent.items() if v is not None or k == "locked_env"}
     try:
         row = await asyncio.to_thread(
             audit_store.update_prompt_template,
@@ -165,40 +168,68 @@ async def execute_prompt_template(template_id: int, req: PromptTemplateExecuteRe
     if env and env not in allowed_envs:
         raise HTTPException(status_code=400, detail=f"不支持的环境: {env}")
 
-    # Step 1: ask AI to materialise the logic with concrete parameters.
-    try:
-        materialised = await asyncio.to_thread(
-            _ai_materialise,
-            template,
-            req.user_input,
-            env,
-            req.model,
-        )
-    except Exception as exc:  # pragma: no cover - AI failures bubble up
-        log.exception("AI materialise failed")
-        raise HTTPException(status_code=500, detail=f"AI 翻译失败: {exc}") from exc
+    # Step 1: resolve concrete parameters into the template logic.
+    # When the caller passes structured `params` (front-end split inputs), do a
+    # deterministic mechanical `${key}` substitution and skip the AI entirely —
+    # this is safe for very long scripts (stored procedures) where an AI round
+    # trip risks truncation or accidental rewrites. Otherwise fall back to the
+    # AI materialise pipeline that infers params from free-text user_input.
+    if req.params:
+        try:
+            rendered, missing = _apply_params(template["logic"], req.params)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"参数替换失败: {exc}") from exc
+        if missing:
+            hints = "、".join(missing)
+            return ApiResponse(
+                success=False,
+                message=f"缺少参数：{hints}",
+                data={
+                    "template": template,
+                    "user_input": req.user_input,
+                    "env": env or "",
+                    "rendered": template["logic"],
+                    "params": dict(req.params),
+                    "placeholders": _extract_placeholders(template["logic"]),
+                    "ai_error": f"缺少参数：{hints}",
+                },
+            )
+        params = dict(req.params)
+        notes = "参数由前端分列输入，机械替换（未经过 AI）。"
+    else:
+        try:
+            materialised = await asyncio.to_thread(
+                _ai_materialise,
+                template,
+                req.user_input,
+                env,
+                req.model,
+            )
+        except Exception as exc:  # pragma: no cover - AI failures bubble up
+            log.exception("AI materialise failed")
+            raise HTTPException(status_code=500, detail=f"AI 翻译失败: {exc}") from exc
 
-    # If the AI flagged the request as under-specified, return a structured
-    # diagnostic instead of trying to execute placeholder-laden SQL.
-    if materialised.get("error"):
-        return ApiResponse(
-            success=False,
-            message=materialised["error"],
-            data={
-                "template": template,
-                "user_input": req.user_input,
-                "env": env or "",
-                "rendered": materialised.get("rendered") or template["logic"],
-                "params": materialised.get("params") or {},
-                "placeholders": materialised.get("placeholders") or [],
-                "ai_error": materialised["error"],
-                "raw_reply": materialised.get("raw_reply"),
-            },
-        )
+        # If the AI flagged the request as under-specified, return a structured
+        # diagnostic instead of trying to execute placeholder-laden SQL.
+        if materialised.get("error"):
+            return ApiResponse(
+                success=False,
+                message=materialised["error"],
+                data={
+                    "template": template,
+                    "user_input": req.user_input,
+                    "env": env or "",
+                    "rendered": materialised.get("rendered") or template["logic"],
+                    "params": materialised.get("params") or {},
+                    "placeholders": materialised.get("placeholders") or [],
+                    "ai_error": materialised["error"],
+                    "raw_reply": materialised.get("raw_reply"),
+                },
+            )
 
-    rendered = materialised.get("rendered") or template["logic"]
-    params = materialised.get("params") or {}
-    notes = materialised.get("notes") or ""
+        rendered = materialised.get("rendered") or template["logic"]
+        params = materialised.get("params") or {}
+        notes = materialised.get("notes") or ""
 
     # Step 2: execute the rendered logic.
     try:
@@ -340,6 +371,33 @@ def _extract_placeholders(logic: str) -> list[str]:
     return found
 
 
+def _apply_params(logic: str, params: dict[str, Any]) -> tuple[str, list[str]]:
+    """Mechanically substitute `${key}` placeholders with provided values.
+
+    Returns (rendered, missing) where `missing` lists placeholder names that the
+    template requires but the caller did not supply a non-empty value for.
+    Values are substituted verbatim (caller is responsible for the SQL literal
+    quoting inside the template, e.g. SET @phone = '${phone}').
+    """
+    placeholders = _extract_placeholders(logic)
+    rendered = logic
+    missing: list[str] = []
+    for key in placeholders:
+        value = params.get(key)
+        if value is None or str(value).strip() == "":
+            # Blank is allowed only when the template author intends optional
+            # slots; we treat empty as "missing" for required-looking keys, but
+            # still substitute an empty string so optional ones (e.g. seller_id
+            # auto-generate) work when explicitly left blank by the user.
+            if key in params:
+                rendered = rendered.replace("${" + key + "}", "")
+            else:
+                missing.append(key)
+            continue
+        rendered = rendered.replace("${" + key + "}", str(value))
+    return rendered, missing
+
+
 def _ai_materialise(template: dict[str, Any], user_input: str, env: str, model: Optional[str]) -> dict[str, Any]:
     """Use the AI service to plug user_input into the template logic.
 
@@ -416,6 +474,95 @@ def _try_parse_json(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _normalise_error_message(message: Any) -> str:
+    text = str(message or "").strip()
+    # PyMySQL formats SIGNAL errors as: (1644, 'message') or (1644, "message").
+    match = re.search(r"\(\s*\d+\s*,\s*['\"](.+?)['\"]\s*\)", text)
+    return match.group(1) if match else text
+
+
+def _known_template_error_summary(
+    execution: dict[str, Any],
+    env: str,
+    params: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if execution.get("success"):
+        return None
+
+    message = _normalise_error_message(execution.get("message"))
+    lowered = message.lower()
+    phone = str(params.get("phone") or "").strip()
+    offer_id = str(params.get("offer_id") or params.get("source_dpu_offer_id") or "").strip()
+    prefix = f"执行失败：{message}"
+
+    if "source offerid not found under this user" in lowered:
+        detail = []
+        if phone:
+            detail.append(f"手机号={phone}")
+        if offer_id:
+            detail.append(f"source offerId={offer_id}")
+        suffix = f"（{', '.join(detail)}）" if detail else ""
+        return {
+            "summary": (
+                f"{prefix}。这个 source offerId 没有挂在当前手机号对应的豆沙用户下面{suffix}。"
+                "请换成该手机号名下的 DPU_3PL offerId，或改用这个 offerId 实际所属的手机号后再执行。"
+            ),
+            "target_missing": True,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "SOURCE_OFFER_USER_MISMATCH",
+        }
+    if "source offerid must be dpu_3pl" in lowered:
+        return {
+            "summary": f"{prefix}。源店铺必须是 offer_source=DPU_3PL，不能用 SP/3PL 或其它类型的 offerId。",
+            "target_missing": False,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "SOURCE_OFFER_NOT_DPU_3PL",
+        }
+    if "source dpu_3pl must have exactly one dsb_offer" in lowered:
+        return {
+            "summary": f"{prefix}。源 DPU_3PL 在 dsb_offer 中必须刚好有 1 条数据；当前是 0 条或多条，不能作为克隆源。",
+            "target_missing": True,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "SOURCE_DSB_OFFER_INVALID",
+        }
+    if "source dpu_3pl missing dsb_offer_history" in lowered:
+        return {
+            "summary": f"{prefix}。源 DPU_3PL 缺少 dsb_offer_history 最新经营数据，不能克隆新店铺。",
+            "target_missing": True,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "SOURCE_HISTORY_MISSING",
+        }
+    if "phone must match exactly one user" in lowered:
+        return {
+            "summary": f"{prefix}。手机号在豆沙 t_user 里必须且只能命中 1 个用户；当前手机号={phone or '-'} 不满足条件。",
+            "target_missing": True,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "PHONE_USER_NOT_UNIQUE",
+        }
+    if "quota_year1_sales_value must be >= 1000" in lowered:
+        return {
+            "summary": f"{prefix}。ADMITTED + CUSTOM 时年销售额必须 >= 1000；如果是不准入，请选择 NOT_ADMITTED 并留空年销售额。",
+            "target_missing": False,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "CUSTOM_QUOTA_TOO_SMALL",
+        }
+    if "transaction characteristics can't be changed while a transaction is in progress" in lowered:
+        return {
+            "summary": f"{prefix}。脚本里有 SET TRANSACTION/事务特性语句，但当前连接已经开启事务；需要把该语句放到 START TRANSACTION 前，或由执行器使用 autocommit 执行。",
+            "target_missing": False,
+            "probe_sql": None,
+            "probe_label": None,
+            "error_code": "TRANSACTION_CHARACTERISTICS_IN_PROGRESS",
+        }
+    return None
+
+
 def _execute_logic(logic_type: str, rendered: str, env: str) -> dict[str, Any]:
     logic_type = (logic_type or "sql").lower()
     if logic_type == "sql":
@@ -452,6 +599,86 @@ def _matched_rows_from_conn(conn: Any) -> Optional[int]:
         return None
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split multi-statement SQL into individual statements.
+
+    Understands the ``DELIMITER`` client directive so stored-procedure bodies
+    (CREATE PROCEDURE ... BEGIN ...; ...; END$$) are kept as a single statement.
+    String literals ('...', "...", `...`), line comments (-- / #) and block
+    comments (/* */) are respected so their inner ``;`` never split a statement.
+    Templates without DELIMITER behave exactly like the old ``split(';')``.
+    """
+    statements: list[str] = []
+    delimiter = ";"
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+    at_stmt_start = True
+
+    def flush() -> None:
+        stmt = "".join(buf).strip()
+        if stmt:
+            statements.append(stmt)
+        buf.clear()
+
+    while i < n:
+        if at_stmt_start:
+            m = re.match(r"[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:\r?\n|$)", sql[i:], re.IGNORECASE)
+            if m:
+                flush()
+                delimiter = m.group(1)
+                i += m.end()
+                at_stmt_start = True
+                continue
+        ch = sql[i]
+        # string literal ('...', "...", `...`)
+        if ch in ("'", '"', "`"):
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = sql[i]
+                buf.append(c)
+                i += 1
+                if c == "\\" and ch != "`":
+                    if i < n:
+                        buf.append(sql[i])
+                        i += 1
+                    continue
+                if c == ch:
+                    break
+            at_stmt_start = False
+            continue
+        # line comment (-- ... or # ...)
+        if sql.startswith("--", i) or ch == "#":
+            while i < n and sql[i] not in "\r\n":
+                buf.append(sql[i])
+                i += 1
+            continue
+        # block comment (/* ... */)
+        if sql.startswith("/*", i):
+            buf.append("/*")
+            i += 2
+            while i < n and not sql.startswith("*/", i):
+                buf.append(sql[i])
+                i += 1
+            if sql.startswith("*/", i):
+                buf.append("*/")
+                i += 2
+            continue
+        # statement delimiter
+        if sql.startswith(delimiter, i):
+            i += len(delimiter)
+            flush()
+            at_stmt_start = True
+            continue
+        buf.append(ch)
+        if not ch.isspace():
+            at_stmt_start = False
+        i += 1
+    flush()
+    return statements
+
+
 def _execute_sql(rendered: str, env: str) -> dict[str, Any]:
     if not env:
         return {"success": False, "message": "SQL 执行需要指定环境"}
@@ -464,7 +691,7 @@ def _execute_sql(rendered: str, env: str) -> dict[str, Any]:
         return _execute_sql_external(rendered, env, external_sources[env])
     if env not in SUPPORTED_ENVS:
         return {"success": False, "message": f"不支持的环境: {env}"}
-    statements = [stmt.strip() for stmt in rendered.split(";") if stmt.strip()]
+    statements = _split_sql_statements(rendered)
     if not statements:
         return {"success": False, "message": "无可执行的 SQL"}
     results: list[dict[str, Any]] = []
@@ -472,8 +699,9 @@ def _execute_sql(rendered: str, env: str) -> dict[str, Any]:
         with DatabaseExecutor(env=env) as db:
             for stmt in statements:
                 db.cursor.execute(stmt)
-                is_select = stmt.lower().startswith("select")
-                if is_select:
+                # Detect a result set via cursor.description rather than the
+                # leading keyword — CALL / stored procedures return rows too.
+                if db.cursor.description is not None:
                     columns = [desc[0] for desc in (db.cursor.description or [])]
                     rows = db.cursor.fetchall()
                     truncated = len(rows) > 100
@@ -501,6 +729,13 @@ def _execute_sql(rendered: str, env: str) -> dict[str, Any]:
                     if matched is not None:
                         entry["matched_rows"] = matched
                     results.append(entry)
+                # Drain any extra result sets a CALL leaves behind so the next
+                # statement doesn't hit "commands out of sync".
+                try:
+                    while db.cursor.nextset():
+                        pass
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
     except Exception as exc:
         return {
             "success": False,
@@ -522,7 +757,7 @@ def _execute_sql_external(rendered: str, env: str, source: Any) -> dict[str, Any
     """Run multi-statement SQL against an external data source (douke/dowsure)."""
     import pymysql  # local import to keep top-level imports lean
 
-    statements = [stmt.strip() for stmt in rendered.split(";") if stmt.strip()]
+    statements = _split_sql_statements(rendered)
     if not statements:
         return {"success": False, "message": "无可执行的 SQL"}
 
@@ -536,6 +771,13 @@ def _execute_sql_external(rendered: str, env: str, source: Any) -> dict[str, Any
                     "env": env,
                 }
 
+    uses_transaction_characteristics = bool(
+        re.search(
+            r"\bSET\s+TRANSACTION\s+(?:ISOLATION\s+LEVEL|READ\s+(?:ONLY|WRITE))\b",
+            rendered,
+            re.IGNORECASE,
+        )
+    )
     results: list[dict[str, Any]] = []
     connection = None
     try:
@@ -547,15 +789,16 @@ def _execute_sql_external(rendered: str, env: str, source: Any) -> dict[str, Any
             database=source.database or None,
             charset=source.charset,
             connect_timeout=15,
-            read_timeout=30,
-            write_timeout=30,
-            autocommit=False,
+            read_timeout=60,
+            write_timeout=60,
+            autocommit=uses_transaction_characteristics,
         )
         with connection.cursor() as cursor:
             for stmt in statements:
                 cursor.execute(stmt)
-                is_select = stmt.lower().startswith("select")
-                if is_select:
+                # Detect a result set via cursor.description rather than the
+                # leading keyword — CALL / stored procedures return rows too.
+                if cursor.description is not None:
                     columns = [desc[0] for desc in (cursor.description or [])]
                     rows = cursor.fetchall()
                     truncated = len(rows) > 100
@@ -581,6 +824,13 @@ def _execute_sql_external(rendered: str, env: str, source: Any) -> dict[str, Any
                     if matched is not None:
                         entry["matched_rows"] = matched
                     results.append(entry)
+                # Drain any extra result sets a CALL leaves behind so the next
+                # statement doesn't hit "commands out of sync".
+                try:
+                    while cursor.nextset():
+                        pass
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
         connection.commit()
     except Exception as exc:
         if connection is not None:
@@ -965,6 +1215,9 @@ def _ai_summarise_execution(
         + "\n```\n按系统指示输出 JSON。"
     )
     mechanical = _build_mechanical_summary(execution, env)
+    known_summary = _known_template_error_summary(execution, env, params)
+    if known_summary:
+        return known_summary
 
     try:
         reply = _call_ai_raw(prompt_message, model, system_prompt=_AI_SUMMARY_SYSTEM_PROMPT)

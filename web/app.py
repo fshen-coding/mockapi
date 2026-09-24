@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from web.routes import system_routes, register_routes, mock_routes, ws_routes, ai_routes, auth_routes, contact_routes, prompt_routes, scenario_routes, admin_routes
+from web.routes import system_routes, register_routes, mock_routes, ws_routes, ai_routes, ai_ui_routes, auth_routes, contact_routes, prompt_routes, scenario_routes, admin_routes, company_image_routes
+from web.services.ai_ui_automation import prune_orphan_reports
 from web.services.audit_store import audit_store
 from web.services.log_capture import ws_log_handler
 from web.services.session_manager import session_manager
@@ -35,12 +36,15 @@ async def lifespan(app: FastAPI):
         mock_logger.removeHandler(ws_log_handler)
 
     audit_store.init_schema()
+    prune_orphan_reports()
+    system_routes.start_environment_channel_monitor()
     logging.getLogger(__name__).info("DPU Mock Web 应用已启动")
     yield
 
     # 关闭时：清理所有会话
     for sid in list(session_manager._sessions.keys()):
         session_manager.destroy_session(sid)
+    await system_routes.stop_environment_channel_monitor()
     logging.getLogger(__name__).info("DPU Mock Web 应用已关闭")
 
 
@@ -114,9 +118,11 @@ app.include_router(register_routes.router)
 app.include_router(mock_routes.router)
 app.include_router(ws_routes.router)
 app.include_router(ai_routes.router)
+app.include_router(ai_ui_routes.router)
 app.include_router(prompt_routes.router)
 app.include_router(scenario_routes.router)
 app.include_router(admin_routes.router)
+app.include_router(company_image_routes.router)
 
 # 静态文件（前端构建产物，部署时启用）
 _static_dir = Path(__file__).parent / "static"

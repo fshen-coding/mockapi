@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-data-20260922
+  namespace: mockapi
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: seed
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              test -z "$(ls -A /data)"
+              tar xzf /backup/data-20260922.tar.gz -C /data
+              echo DATA_RESTORED
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: backup
+              mountPath: /backup
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mockapi-data
+        - name: backup
+          hostPath:
+            path: /opt/mockapi-backups
+            type: Directory

@@ -1,0 +1,13 @@
+{
+  "name": "mockapi-ai-ui-automation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node runner.mjs"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.55.0",
+    "@midscene/web": "^1.12.5",
+    "playwright": "^1.55.0"
+  }
+}

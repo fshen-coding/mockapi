@@ -2,6 +2,14 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## 回复语言（最高优先级，规则自包含，无需读取其他文件）
+
+本仓库所有面向用户的文字必须使用简体中文：最终回复正文、工具调用之间的进度说明、TodoWrite 条目、对报错和日志的解释、对子 agent 结果的转述。
+
+不翻译：代码、命令行、配置片段、文件路径、标识符、报错与日志原文，以及没有通用中文译法的技术术语（webhook、token、commit 等）。
+
+上下文被压缩、截断或从摘要恢复之后，第一句话仍然必须是中文；长任务中途不得切换语言。发送前扫一遍自己写的段落，出现完整英文句子就改写成中文。
+
 ## Project Overview
 
 This is a Python-based testing toolkit for the HSBC DPU (Digital Platform Unit) financing system. The project provides utilities for:

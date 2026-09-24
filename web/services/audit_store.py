@@ -150,6 +150,29 @@ class AuditStore:
                     "CREATE INDEX IF NOT EXISTS idx_scenario_step_overrides_user "
                     "ON scenario_step_overrides(username)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS company_image_templates (
+                        id BIGSERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        image_type TEXT NOT NULL CHECK (
+                            image_type IN ('business_license', 'director_id_front', 'director_id_back')
+                        ),
+                        filename TEXT NOT NULL,
+                        content_type TEXT NOT NULL,
+                        file_data BYTEA NOT NULL,
+                        created_by TEXT REFERENCES app_users(username),
+                        updated_by TEXT REFERENCES app_users(username),
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (name, image_type)
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_company_image_templates_type "
+                    "ON company_image_templates(image_type)"
+                )
                 # Global scenario meta overrides: admins can rename scenarios or
                 # rewrite their descriptions; all users see the override.
                 conn.execute(
@@ -746,6 +769,140 @@ class AuditStore:
         return result.rowcount > 0
 
     # ---------- Scenario step overrides ----------
+
+    # ---------- Company image templates ----------
+
+    @staticmethod
+    def _company_image_metadata(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "image_type": row["image_type"],
+            "filename": row["filename"],
+            "content_type": row["content_type"],
+            "file_size": len(row.get("file_data") or b""),
+            "created_by": row.get("created_by"),
+            "updated_by": row.get("updated_by"),
+            "created_at": (
+                row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("created_at") else ""
+            ),
+            "updated_at": (
+                row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("updated_at") else ""
+            ),
+        }
+
+    def list_company_image_templates(self) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, image_type, filename, content_type,
+                       octet_length(file_data) AS file_size,
+                       created_by, updated_by, created_at, updated_at
+                FROM company_image_templates
+                ORDER BY image_type, name, id
+                """
+            ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "image_type": row["image_type"],
+                "filename": row["filename"],
+                "content_type": row["content_type"],
+                "file_size": int(row.get("file_size") or 0),
+                "created_by": row.get("created_by"),
+                "updated_by": row.get("updated_by"),
+                "created_at": (
+                    row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("created_at") else ""
+                ),
+                "updated_at": (
+                    row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("updated_at") else ""
+                ),
+            }
+            for row in rows
+        ]
+
+    def get_company_image_template(self, template_id: int) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, image_type, filename, content_type, file_data,
+                       created_by, updated_by, created_at, updated_at
+                FROM company_image_templates
+                WHERE id = %s
+                """,
+                (template_id,),
+            ).fetchone()
+        if not row:
+            return None
+        result = self._company_image_metadata(row)
+        result["file_data"] = bytes(row["file_data"])
+        return result
+
+    def create_company_image_template(
+        self,
+        name: str,
+        image_type: str,
+        filename: str,
+        content_type: str,
+        file_data: bytes,
+        username: str,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO company_image_templates (
+                    name, image_type, filename, content_type, file_data,
+                    created_by, updated_by, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now())
+                RETURNING id, name, image_type, filename, content_type, file_data,
+                          created_by, updated_by, created_at, updated_at
+                """,
+                (name, image_type, filename, content_type, file_data, username, username),
+            ).fetchone()
+        return self._company_image_metadata(row)
+
+    def update_company_image_template(
+        self,
+        template_id: int,
+        name: str,
+        image_type: str,
+        username: str,
+        filename: str | None = None,
+        content_type: str | None = None,
+        file_data: bytes | None = None,
+    ) -> dict[str, Any] | None:
+        assignments = ["name = %s", "image_type = %s", "updated_by = %s", "updated_at = now()"]
+        values: list[Any] = [name, image_type, username]
+        if file_data is not None:
+            assignments.extend(["filename = %s", "content_type = %s", "file_data = %s"])
+            values.extend([filename or "image.png", content_type or "image/png", file_data])
+        values.append(template_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                UPDATE company_image_templates
+                SET {", ".join(assignments)}
+                WHERE id = %s
+                RETURNING id, name, image_type, filename, content_type, file_data,
+                          created_by, updated_by, created_at, updated_at
+                """,
+                tuple(values),
+            ).fetchone()
+        return self._company_image_metadata(row) if row else None
+
+    def delete_company_image_template(self, template_id: int) -> bool:
+        with self.connect() as conn:
+            result = conn.execute(
+                "DELETE FROM company_image_templates WHERE id = %s",
+                (template_id,),
+            )
+        return result.rowcount > 0
 
     def list_scenario_step_overrides(self, username: str) -> list[dict[str, Any]]:
         if not self.enabled or not (username or "").strip():

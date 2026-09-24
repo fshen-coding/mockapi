@@ -12,8 +12,10 @@ from fastapi import APIRouter, HTTPException
 
 from web.models.requests import (
     LinkSp3plRequest, UnderwrittenRequest, ApprovedOfferRequest,
-    UnderwrittenDowsureRequest,
-    DowsureCreditResultRequest, DowsureEsignDrawdownResultRequest,
+    DowsureCreditResultRequest, WebankCreditResultRequest,
+    CgbCreditResultRequest, CgbLoanResultRequest, CgbRepaymentResultRequest,
+    WebankDrawdownResultRequest, WebankRepaymentResultRequest,
+    DowsureEsignDrawdownResultRequest,
     DowsureRepaymentResultRequest, DowsureRetryCallbackRequest,
     PspStartRequest, PspCompletedRequest, StartReassessmentRequest, EsignRequest, DrawdownRequest,
     RepaymentStartRequest, RepaymentRequest,
@@ -26,8 +28,9 @@ from web.models.requests import (
     UpstreamDebugRequest,
 )
 from web.models.responses import ApiResponse
-from web.routes.auth_guard import require_valid_username
-from web.services.audit_store import audit_store
+from web.routes.auth_guard import require_admin, require_valid_username
+from web.services.audit_store import ADMIN_USERNAME, audit_store
+from web.services.mock_adapter import WebDPUMockService
 from web.services.session_manager import session_manager
 
 router = APIRouter(prefix="/api/mock", tags=["Mock"])
@@ -35,6 +38,33 @@ router = APIRouter(prefix="/api/mock", tags=["Mock"])
 _scheduled_submit_jobs: dict[str, dict] = {}
 _scheduled_submit_jobs_lock = threading.Lock()
 _SCHEDULED_SUBMIT_JOB_TTL_SECONDS = 3600
+_DOWSURE_COMPANY_TEMPLATE_SCENARIO = "mockApi"
+_DOWSURE_COMPANY_TEMPLATE_STEP = "dowsure-cny-company-templates"
+
+
+def _find_dowsure_company_template(username: str | None, cn_name: str | None) -> dict | None:
+    if not (username or "").strip() or not (cn_name or "").strip():
+        return None
+    selected_name = str(cn_name).strip()
+    rows = audit_store.list_scenario_step_overrides(ADMIN_USERNAME)
+    for row in rows:
+        if (
+            row.get("scenario_key") != _DOWSURE_COMPANY_TEMPLATE_SCENARIO
+            or row.get("step_key") != _DOWSURE_COMPANY_TEMPLATE_STEP
+        ):
+            continue
+        templates = (row.get("payload") or {}).get("templates")
+        if not isinstance(templates, list):
+            return None
+        for item in templates:
+            template = item.get("template") if isinstance(item, dict) else None
+            if not isinstance(template, dict):
+                continue
+            if str(item.get("name") or "").strip() == selected_name:
+                return item
+            if str(template.get("cnName") or "").strip() == selected_name:
+                return item
+    return None
 
 
 def _cleanup_scheduled_submit_jobs() -> None:
@@ -385,7 +415,11 @@ async def mock_repayment(req: RepaymentRequest):
 @router.post("/multi-shop-binding", response_model=ApiResponse)
 async def mock_multi_shop_binding(req: MultiShopBindingRequest):
     service = _get_service(req.session_id, req.application_unique_id, req.username)
-    result = await asyncio.to_thread(service.mock_multi_shop_binding, state=req.state)
+    result = await asyncio.to_thread(
+        service.mock_multi_shop_binding,
+        state=req.state,
+        platform_seller_id=req.platform_seller_id,
+    )
     msg = "operation succeeded" if result.get("success") else "operation failed"
     return _operation_response(req, req.__class__.__name__, result, msg)
 
@@ -431,11 +465,19 @@ async def create_application_context(req: CreateApplicationContextRequest):
 @router.post("/fp-business-profile", response_model=ApiResponse)
 async def submit_fp_business_profile(req: FpApplicationStepRequest):
     service = _get_service(req.session_id, req.application_unique_id, req.username)
+    company_template_bundle = await asyncio.to_thread(
+        _find_dowsure_company_template,
+        req.username,
+        req.cnName,
+    )
     result = await asyncio.to_thread(
         service.submit_fp_business_profile_web,
         req.journey,
         req.currency,
         req.funder_resource,
+        req.cnName,
+        (company_template_bundle or {}).get("template"),
+        req.businessLicenseImageId,
     )
     msg = "business profile submitted" if result.get("success") else result.get("error", "business profile submit failed")
     return _operation_response(req, "SubmitFpBusinessProfile", result, msg)
@@ -444,6 +486,12 @@ async def submit_fp_business_profile(req: FpApplicationStepRequest):
 @router.post("/fp-director-info", response_model=ApiResponse)
 async def submit_fp_director_info(req: FpApplicationStepRequest):
     service = _get_service(req.session_id, req.application_unique_id, req.username)
+    selected_company = getattr(service, "_dowsure_selected_company_cn_name", "") or req.cnName
+    company_template_bundle = await asyncio.to_thread(
+        _find_dowsure_company_template,
+        req.username,
+        selected_company,
+    )
     result = await asyncio.to_thread(
         service.submit_fp_director_info_web,
         req.journey,
@@ -451,6 +499,9 @@ async def submit_fp_director_info(req: FpApplicationStepRequest):
         req.funder_resource,
         req.nameCn,
         req.addressDetail,
+        (company_template_bundle or {}).get("directorTemplate"),
+        req.directorIdFrontImageId,
+        req.directorIdBackImageId,
     )
     msg = "director info submitted" if result.get("success") else result.get("error", "director info submit failed")
     return _operation_response(req, "SubmitFpDirectorInfo", result, msg)
@@ -483,10 +534,18 @@ async def submit_fp_registration_documents(req: FpApplicationStepRequest):
 @router.post("/fp-add-contact-information", response_model=ApiResponse)
 async def submit_fp_add_contact_information(req: FpApplicationStepRequest):
     service = _get_service(req.session_id, req.application_unique_id, req.username)
+    selected_company = getattr(service, "_dowsure_selected_company_cn_name", "") or req.cnName
+    company_template_bundle = await asyncio.to_thread(
+        _find_dowsure_company_template,
+        req.username,
+        selected_company,
+    )
     result = await asyncio.to_thread(
         service.submit_fp_add_contact_information_web,
         req.currency,
         req.funder_resource,
+        req.nameCn,
+        (company_template_bundle or {}).get("contactTemplate"),
     )
     msg = "contact information submitted" if result.get("success") else result.get("error", "contact information submit failed")
     return _operation_response(req, "SubmitFpAddContactInformation", result, msg)
@@ -631,8 +690,32 @@ async def update_shop_performance_cny_boost(req: ShopPerformanceUpdateRequest):
     result = await asyncio.to_thread(
         service.update_shop_performance_cny_boost_web,
         req.offer_id,
+        req.access_type,
+        req.custom_sql,
     )
     msg = "shop performance updated" if result.get("success") else result.get("error", "shop performance update failed")
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.get("/shop-performance-cny-boost/presets", response_model=ApiResponse)
+async def list_shop_performance_cny_boost_presets(username: str | None = None):
+    require_admin(username)
+    presets = await asyncio.to_thread(WebDPUMockService.list_shop_performance_builtin_presets_web)
+    return ApiResponse(
+        success=True,
+        message=f"{len(presets)} builtin shop performance presets",
+        data={"presets": presets},
+    )
+
+
+@router.post("/kiosk-seller-id-check", response_model=ApiResponse)
+async def check_kiosk_seller_id(req: ShopPerformanceUpdateRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.check_kiosk_seller_id_web,
+        req.offer_id,
+    )
+    msg = "kiosk seller_id ready" if result.get("success") else result.get("error", "kiosk seller_id check failed")
     return _operation_response(req, req.__class__.__name__, result, msg)
 
 
@@ -837,6 +920,17 @@ async def list_dowsure_merchant_accounts(session_id: str):
     )
 
 
+@router.get("/application-codes", response_model=ApiResponse)
+async def list_application_codes(session_id: str):
+    service = _get_service(session_id)
+    result = await asyncio.to_thread(service.get_application_code_options)
+    return ApiResponse(
+        success=result.get("success", False),
+        message="application codes loaded" if result.get("success") else result.get("error", "application codes load failed"),
+        data=result,
+    )
+
+
 @router.get("/psp-authorization-rows", response_model=ApiResponse)
 async def list_psp_authorization_rows(session_id: str):
     service = _get_service(session_id)
@@ -874,26 +968,107 @@ async def list_drawdown_repayment_rows(session_id: str):
     )
 
 
-@router.post("/underwritten-dowsure", response_model=ApiResponse)
-async def mock_underwritten_dowsure(req: UnderwrittenDowsureRequest):
-    service = _get_service(req.session_id, req.application_unique_id, req.username)
-    result = await asyncio.to_thread(
-        service.mock_underwritten_status_dowsure,
-        status=req.status,
-        merchant_accounts=[item.model_dump() for item in req.merchant_accounts],
-    )
-    msg = "operation succeeded" if result.get("success") else "operation failed"
-    return _operation_response(req, req.__class__.__name__, result, msg)
-
-
 @router.post("/dowsure-credit-result", response_model=ApiResponse)
 async def send_dowsure_credit_result(req: DowsureCreditResultRequest):
     service = _get_service(req.session_id, req.application_unique_id, req.username)
     result = await asyncio.to_thread(
         service.send_dowsure_credit_result_web,
-        application_code=req.application_code,
+        application_code=req.applicationCode,
         amount=req.amount,
-        credit_status=req.credit_status,
+        processing_fee=req.processingFee,
+        credit_result_list=[item.model_dump() for item in req.creditResultList],
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.get("/webank-seller-offers", response_model=ApiResponse)
+async def list_webank_seller_offers(session_id: str):
+    service = _get_service(session_id)
+    result = await asyncio.to_thread(service.get_webank_seller_offers)
+    return ApiResponse(
+        success=result.get("success", False),
+        message="WEBANK seller offers loaded" if result.get("success") else result.get("error", "WEBANK seller offers load failed"),
+        data=result,
+    )
+
+
+@router.post("/webank-credit-result", response_model=ApiResponse)
+async def send_webank_credit_result(req: WebankCreditResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_webank_credit_result_web,
+        application_code=req.application_code,
+        business_sum=req.businessSum,
+        seller_offers=[item.model_dump() for item in req.seller_offers],
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.post("/cgb-credit-result", response_model=ApiResponse)
+async def send_cgb_credit_result(req: CgbCreditResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_cgb_credit_result_web,
+        amount=req.amount,
+        processing_fee=req.processingFee,
+        credit_status=req.creditStatus,
+        application_code=req.application_code,
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.post("/cgb-loan-result", response_model=ApiResponse)
+async def send_cgb_loan_result(req: CgbLoanResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_cgb_loan_result_web,
+        amount=req.amount,
+        processing_fee=req.processingFee,
+        application_code=req.application_code,
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.post("/cgb-repayment-result", response_model=ApiResponse)
+async def send_cgb_repayment_result(req: CgbRepaymentResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_cgb_repayment_result_web,
+        application_code=req.application_code,
+        loan_code=req.loan_code,
+        payment_principal=req.payment_principal,
+        payment_interest=req.payment_interest,
+        payment_overdue_interest=req.payment_overdue_interest,
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.post("/webank-drawdown-result", response_model=ApiResponse)
+async def send_webank_drawdown_result(req: WebankDrawdownResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_webank_drawdown_result_web,
+        loan_amount=req.loan_amount,
+        service_fee_amount=req.service_fee_amount,
+    )
+    msg = "operation succeeded" if result.get("success") else "operation failed"
+    return _operation_response(req, req.__class__.__name__, result, msg)
+
+
+@router.post("/webank-repayment-result", response_model=ApiResponse)
+async def send_webank_repayment_result(req: WebankRepaymentResultRequest):
+    service = _get_service(req.session_id, req.application_unique_id, req.username)
+    result = await asyncio.to_thread(
+        service.send_webank_repayment_result_web,
+        loan_code=req.loan_code,
+        payment_principal=req.payment_principal,
+        payment_interest=req.payment_interest,
+        payment_penalty_interest=req.payment_penalty_interest,
     )
     msg = "operation succeeded" if result.get("success") else "operation failed"
     return _operation_response(req, req.__class__.__name__, result, msg)
