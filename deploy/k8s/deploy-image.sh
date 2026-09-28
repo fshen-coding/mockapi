@@ -8,7 +8,7 @@ readonly ROLLOUT_TIMEOUT="1200s"
 readonly ROLLBACK_TIMEOUT="300s"
 
 image="${1:-}"
-if [[ ! "$image" =~ ^ghcr\.io/fshen1999/mockapi:sha-[0-9a-f]{40}$ ]]; then
+if [[ ! "$image" =~ ^ghcr\.io/fshen-coding/mockapi:sha-[0-9a-f]{40}$ ]]; then
   echo "Refusing unexpected image: $image" >&2
   exit 64
 fi
