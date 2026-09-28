@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ghcr.io/fshen1999/mockapi
+  IMAGE_NAME: ghcr.io/fshen-coding/mockapi
 
 jobs:
   validate:
