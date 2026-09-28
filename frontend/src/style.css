@@ -5472,10 +5472,10 @@ pre {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr);
   gap: 10px;
-  /* 页面本身负责纵向滚动，避免工作区拦截鼠标滚轮。 */
-  min-height: 0;
+  /* 右侧场景卡片保留足够的纵向工作区，页面可继续向下滚动。 */
+  height: max(900px, calc(100vh + 120px));
+  min-height: 900px;
   min-width: 0;
-  align-items: start;
 }
 
 .interface-automation-shell.is-report {
@@ -5497,8 +5497,7 @@ pre {
   align-content: start;
   gap: 10px;
   min-height: 0;
-  max-height: calc(100vh - 120px);
-  overflow: visible;
+  overflow: hidden;
   padding: 12px;
 }
 
@@ -5512,9 +5511,8 @@ pre {
   display: grid;
   gap: 6px;
   min-height: 0;
-  max-height: calc(100vh - 220px);
   overflow-y: auto;
-  overscroll-behavior-y: auto;
+  overscroll-behavior: auto;
   padding-right: 4px;
 }
 
@@ -6278,6 +6276,7 @@ pre {
   align-content: start;
   min-height: 0;
   overflow: visible;
+  overscroll-behavior: auto;
 }
 
 .scenario-toolbar {
