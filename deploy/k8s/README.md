@@ -158,13 +158,20 @@ restrict,command="/opt/mockapi-deploy/ci-ssh-entrypoint.sh" ssh-ed25519 AAAA... 
 - 入口：`https://sit.mockapi.fshencoding.cn`，由 `gateway.yaml` 中独立的 `server_name` 转发到 `Service/mockapi-sit`。
 - `app-sit.yaml` 定义 `Deployment/mockapi-sit`、`Service/mockapi-sit` 和 PVC `mockapi-sit-data`。
 - 与生产共用 PostgreSQL（`postgres-credentials`）和 `mockapi-env`；`/app/web/data` 使用独立 PVC。SIT 上的数据改动会直接出现在生产库中。
-- 推送 `developer-fshen`：执行检查，构建并推送 `sha-<SHA>` 与 `sit` 标签，然后经 `sit` Environment 自动发布到 `mockapi-sit`。
-- 发布命令为 `deploy-mockapi-sit <受信 GHCR SHA 镜像>`，由同一个受限 SSH key 执行；`deploy-image.sh` 第二个参数只接受 `production` 或 `sit`。
-- GitHub 仓库需新建 `sit` Environment，并配置与 `production` 相同的四个 Secrets（或改为仓库级 Secrets）。
+- SIT 不走 CI，手动发布。`deploy-image.sh` 第二个参数只接受 `production`（默认）或 `sit`。
 
-手动发布 SIT：
+手动发布 SIT（本地构建镜像，传到服务器导入后发布）：
 
 ```sh
+# 本地，项目根目录
+sha=$(git rev-parse HEAD)
+image=ghcr.io/fshen-coding/mockapi:sha-$sha
+docker build -f deploy/k8s/Dockerfile --platform linux/amd64 -t "$image" .
+docker save "$image" | gzip > /tmp/mockapi-sit.tar.gz
+scp /tmp/mockapi-sit.tar.gz fshen:/tmp/
+
+# 服务器
+gunzip -c /tmp/mockapi-sit.tar.gz | k3s ctr images import --platform linux/amd64 -
 /opt/mockapi-deploy/deploy-image.sh ghcr.io/fshen-coding/mockapi:sha-<40位 SHA> sit
 ```
 

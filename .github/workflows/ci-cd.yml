@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main, developer-fshen]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -63,23 +63,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image tags
+      - name: Set immutable image name
         id: image
         shell: bash
-        run: |
-          image="${IMAGE_NAME}:sha-${GITHUB_SHA}"
-          echo "value=${image}" >> "$GITHUB_OUTPUT"
-          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            channel_tag="${IMAGE_NAME}:main"
-          else
-            channel_tag="${IMAGE_NAME}:sit"
-          fi
-          {
-            echo "tags<<EOF"
-            echo "$image"
-            echo "$channel_tag"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+        run: echo "value=${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -88,7 +75,9 @@ jobs:
           file: deploy/k8s/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.image.outputs.tags }}
+          tags: |
+            ${{ steps.image.outputs.value }}
+            ${{ env.IMAGE_NAME }}:main
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -118,33 +107,3 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           IMAGE: ${{ needs.image.outputs.image }}
         run: ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "deploy-mockapi $IMAGE"
-
-  deploy-sit:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/developer-fshen'
-    needs: image
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    environment: sit
-    concurrency:
-      group: mockapi-deploy-sit
-      cancel-in-progress: false
-    steps:
-      - name: Configure SSH
-        shell: bash
-        env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-        run: |
-          install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-      - name: Deploy immutable image to SIT
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          IMAGE: ${{ needs.image.outputs.image }}
-        run: ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "deploy-mockapi-sit $IMAGE"
