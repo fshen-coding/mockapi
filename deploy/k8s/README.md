@@ -153,6 +153,28 @@ restrict,command="/opt/mockapi-deploy/ci-ssh-entrypoint.sh" ssh-ed25519 AAAA... 
 | `DEPLOY_SSH_KEY` | 单独生成的 Ed25519 私钥全文 |
 | `DEPLOY_KNOWN_HOSTS` | 已核验的服务器 SSH host key 行 |
 
+## SIT 测试环境
+
+- 入口：`https://sit.mockapi.fshencoding.cn`，由 `gateway.yaml` 中独立的 `server_name` 转发到 `Service/mockapi-sit`。
+- `app-sit.yaml` 定义 `Deployment/mockapi-sit`、`Service/mockapi-sit` 和 PVC `mockapi-sit-data`。
+- 与生产共用 PostgreSQL（`postgres-credentials`）和 `mockapi-env`；`/app/web/data` 使用独立 PVC。SIT 上的数据改动会直接出现在生产库中。
+- SIT 不走 CI，手动发布。`deploy-image.sh` 第二个参数只接受 `production`（默认）或 `sit`。
+
+手动发布 SIT（本地构建镜像，传到服务器导入后发布）：
+
+```sh
+# 本地，项目根目录
+sha=$(git rev-parse HEAD)
+image=ghcr.io/fshen-coding/mockapi:sha-$sha
+docker build -f deploy/k8s/Dockerfile --platform linux/amd64 -t "$image" .
+docker save "$image" | gzip > /tmp/mockapi-sit.tar.gz
+scp /tmp/mockapi-sit.tar.gz fshen:/tmp/
+
+# 服务器
+gunzip -c /tmp/mockapi-sit.tar.gz | k3s ctr images import --platform linux/amd64 -
+/opt/mockapi-deploy/deploy-image.sh ghcr.io/fshen-coding/mockapi:sha-<40位 SHA> sit
+```
+
 建议为 `production` Environment 配置 required reviewers。若当前 GitHub 套餐不支持 required reviewers，`workflow_dispatch` 本身仍保留手工发布步骤。
 
 原应用有部分仅基于用户名判断角色的接口，本次没有改变其业务鉴权逻辑。
