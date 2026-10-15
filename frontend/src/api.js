@@ -97,8 +97,8 @@ export async function replyContactIssueApi(issueId, payload) {
   return unwrap(response)
 }
 
-export async function deleteContactIssueApi(issueId) {
-  const response = await client.delete(`/api/contact-issues/${issueId}`)
+export async function deleteContactIssueApi(issueId, username) {
+  const response = await client.delete(`/api/contact-issues/${issueId}`, { params: { username } })
   return unwrap(response)
 }
 

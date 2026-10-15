@@ -5,8 +5,9 @@
 - 服务器：`47.107.112.226`，Alibaba Cloud Linux 3，单节点 K3s `v1.36.4+k3s1`。
 - 入口：`https://mockapi.fshencoding.cn`。HTTP 自动跳转 HTTPS。
 - 公网入口不再使用 Basic Auth 弹窗，访客可直接打开页面；应用内部仍按 MockAPI 账号和权限控制。
-- 使用 Let’s Encrypt 为 `mockapi.fshencoding.cn` 签发证书，有效期至 2026-12-21。
-- Certbot 使用 HTTP-01 challenge 自动续期；续期脚本会临时停止 gateway、更新 Kubernetes `gateway-tls` Secret 并恢复 gateway。
+- 使用 Let’s Encrypt 为 `mockapi.fshencoding.cn` 签发证书，有效期至 2026-12-28。
+- 阿里云 HTTP 入口返回未备案拦截页，不能使用 HTTP-01；证书由 acme.sh 使用 TLS-ALPN-01 在 443 端口自动续期。
+- `acme-renew.timer` 每日检查续期；验证期间暂时停止 gateway，完成后恢复，并将证书更新到 Kubernetes `gateway-tls` Secret。
 - 部署的是当前工作区代码，包括尚未提交的改动；没有创建分支或 commit。
 - 原有本地 8000 服务及数据库未停止、未切换、未重建。
 
@@ -84,6 +85,15 @@ kubectl -n mockapi logs deployment/mockapi --tail=100
 kubectl -n mockapi logs postgres-0 --tail=100
 kubectl -n mockapi rollout restart deployment/mockapi
 kubectl -n mockapi rollout status deployment/mockapi
+```
+
+证书续期状态：
+
+```sh
+systemctl status acme-renew.timer
+systemctl list-timers acme-renew.timer
+systemctl start acme-renew.service
+journalctl -u acme-renew.service -n 100 --no-pager
 ```
 
 手动备份数据库：

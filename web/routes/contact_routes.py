@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from web.models.requests import ContactIssueCreateRequest, ContactIssueReplyRequest
 from web.models.responses import ApiResponse
-from web.routes.auth_guard import require_valid_username
+from web.routes.auth_guard import require_admin, require_valid_username
 from web.services.audit_store import audit_store
 
 router = APIRouter(prefix="/api/contact-issues", tags=["联系我们"])
@@ -31,7 +31,7 @@ async def create_contact_issue(req: ContactIssueCreateRequest):
 
 @router.post("/{issue_id}/reply", response_model=ApiResponse)
 async def reply_contact_issue(issue_id: int, req: ContactIssueReplyRequest):
-    require_valid_username(req.replied_by)
+    require_admin(req.replied_by)
     try:
         issue = audit_store.reply_contact_issue(issue_id, req.reply, req.replied_by)
     except Exception as exc:
@@ -42,7 +42,8 @@ async def reply_contact_issue(issue_id: int, req: ContactIssueReplyRequest):
 
 
 @router.delete("/{issue_id}", response_model=ApiResponse)
-async def delete_contact_issue(issue_id: int):
+async def delete_contact_issue(issue_id: int, username: str | None = None):
+    require_admin(username)
     try:
         deleted = audit_store.delete_contact_issue(issue_id)
     except Exception as exc:

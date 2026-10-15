@@ -1,9 +1,9 @@
 ﻿<script setup>
-import { marked } from 'marked'
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue'
 import {
   ArrowDown,
   ArrowRight,
+  Back,
   Bell,
   CaretRight,
   Check,
@@ -103,19 +103,101 @@ import {
   approveAdminUser,
   rejectAdminUser,
 } from './api.js'
+import ConsoleView from './views/ConsoleView.vue'
+import { aiUiEnvironmentOptions, aiUiEnvironmentUrl, inferAiUiEnvironment } from './utils/aiUiEnvironments.js'
+import { disposeMotion, installSpotlight, playViewEnter, prefersReducedMotion } from './utils/motion.js'
+
+// 非默认视图和动效组件按需加载，避免首屏包过大。
+const AboutView = defineAsyncComponent(() => import('./views/AboutView.vue'))
+const ContactView = defineAsyncComponent(() => import('./views/ContactView.vue'))
+const ContactAdminView = defineAsyncComponent(() => import('./views/ContactAdminView.vue'))
+const ActivityView = defineAsyncComponent(() => import('./views/ActivityView.vue'))
+const EnvironmentMonitorView = defineAsyncComponent(() => import('./views/EnvironmentMonitorView.vue'))
+const UserManagementView = defineAsyncComponent(() => import('./views/UserManagementView.vue'))
+const PromptTemplatesView = defineAsyncComponent(() => import('./views/PromptTemplatesView.vue'))
+const AiChatView = defineAsyncComponent(() => import('./views/AiChatView.vue'))
+const AiUiView = defineAsyncComponent(() => import('./views/AiUiView.vue'))
+const MockApiView = defineAsyncComponent(() => import('./views/MockApiView.vue'))
+const InterfaceTestView = defineAsyncComponent(() => import('./views/InterfaceTestView.vue'))
+const WorkflowScene = defineAsyncComponent(() => import('./components/bits/WorkflowScene.vue'))
+const heroTitleLatin = Array.from('Mock API ')
+const heroTitleAccent = Array.from('操作台')
+const heroTitleMotionReduced = typeof window !== 'undefined'
+  && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+const HERO_TITLE_RADIUS = 140
+let heroTitleFrame = 0
+
+function heroTitleCharCenters(title) {
+  return Array.from(title.querySelectorAll('.hero-char')).map((ch) => {
+    const rect = ch.getBoundingClientRect()
+    return { ch, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  })
+}
+
+function onHeroTitlePointerMove(event) {
+  if (heroTitleMotionReduced) return
+  const title = event.currentTarget
+  const { clientX, clientY } = event
+  cancelAnimationFrame(heroTitleFrame)
+  heroTitleFrame = requestAnimationFrame(() => {
+    heroTitleCharCenters(title).forEach(({ ch, x, y }) => {
+      const p = Math.max(0, 1 - Math.hypot(clientX - x, clientY - y) / HERO_TITLE_RADIUS)
+      ch.style.setProperty('--p', (p * p).toFixed(3))
+    })
+  })
+}
+
+function onHeroTitlePointerLeave(event) {
+  cancelAnimationFrame(heroTitleFrame)
+  event.currentTarget.querySelectorAll('.hero-char').forEach((ch) => ch.style.setProperty('--p', '0'))
+}
+
+function onHeroTitleClick(event) {
+  if (heroTitleMotionReduced) return
+  const centers = heroTitleCharCenters(event.currentTarget)
+  let origin = 0
+  centers.forEach(({ x }, i) => {
+    if (Math.abs(event.clientX - x) < Math.abs(event.clientX - centers[origin].x)) origin = i
+  })
+  // 用独立的 translate 属性做波浪，避免覆盖靠近光标时的 transform
+  centers.forEach(({ ch }, i) => {
+    ch.animate?.(
+      [{ translate: '0 0' }, { translate: '0 -0.3em', offset: 0.35 }, { translate: '0 0' }],
+      { duration: 620, delay: Math.abs(i - origin) * 42, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+    )
+  })
+}
+const LoginScene3D = defineAsyncComponent(() => import('./components/bits/LoginScene3D.vue'))
+
+// 登录卡片随鼠标轻微 3D 倾斜，并在卡片上跟随一束高光
+let loginTiltFrame = 0
+function onLoginPointerMove(event) {
+  if (prefersReducedMotion()) return
+  const scene = event.currentTarget
+  const { clientX, clientY } = event
+  cancelAnimationFrame(loginTiltFrame)
+  loginTiltFrame = requestAnimationFrame(() => {
+    const rect = scene.getBoundingClientRect()
+    const nx = (clientX - rect.left) / rect.width - 0.5
+    const ny = (clientY - rect.top) / rect.height - 0.5
+    scene.style.setProperty('--tilt-x', `${(-ny * 8).toFixed(2)}deg`)
+    scene.style.setProperty('--tilt-y', `${(nx * 10).toFixed(2)}deg`)
+    scene.style.setProperty('--glow-x', `${((nx + 0.5) * 100).toFixed(1)}%`)
+    scene.style.setProperty('--glow-y', `${((ny + 0.5) * 100).toFixed(1)}%`)
+    scene.style.setProperty('--para-x', `${(nx * -24).toFixed(1)}px`)
+    scene.style.setProperty('--para-y', `${(ny * -16).toFixed(1)}px`)
+  })
+}
+function onLoginPointerLeave(event) {
+  cancelAnimationFrame(loginTiltFrame)
+  const s = event.currentTarget.style
+  ;['--tilt-x', '--tilt-y', '--para-x', '--para-y'].forEach((k) => s.setProperty(k, k.startsWith('--tilt') ? '0deg' : '0px'))
+}
 
 const defaultEnvironments = ['sit', 'uat', 'dev', 'preprod', 'reg', 'local']
 const defaultAiSqlDataSources = ['sit', 'uat', 'dev', 'preprod', 'reg', 'local', 'douke', 'dowsure']
 const defaultJourneys = ['200K', '500K', '2000K']
 const defaultCurrencies = ['USD', 'CNY']
-const aiUiEnvironmentOptions = [
-  { value: 'sit', label: 'SIT', url: 'https://expressfinance-dpu-sit.dowsure.com/en/' },
-  { value: 'dev', label: 'DEV', url: 'https://expressfinance-dpu-dev.dowsure.com/en/sign-up-step1' },
-  { value: 'uat', label: 'UAT', url: 'https://expressfinance-uat.business.hsbc.com/zh-Hans/' },
-  { value: 'preprod', label: 'PREPROD', url: 'https://expressfinance-preprod.business.hsbc.com/zh-Hans/sign-up' },
-  { value: 'reg', label: 'REG', url: 'https://expressfinance-dpu-reg.dowsure.com/en/' },
-  { value: 'custom', label: '自定义', url: '' },
-]
 const upstreamBaseUrls = {
   sit: 'https://sit.api.expressfinance.business.hsbc.com',
   dev: 'https://dpu-gateway-dev.dowsure.com',
@@ -185,7 +267,6 @@ const liveSessions = ref([])
 const eventLogs = ref([])
 const activityFeed = ref([])
 const auditOperations = ref([])
-const expandedAuditOperationIds = ref(new Set())
 const auditQuery = reactive({ phone_number: '', session_id: '' })
 const auditLoading = ref(false)
 const auditError = ref('')
@@ -197,29 +278,6 @@ let environmentMonitorRefreshTimer = null
 const promptTemplates = ref([])
 const promptTemplatesLoading = ref(false)
 const promptTemplatesError = ref('')
-// 提示词模板：名称/描述模糊搜索 + 分页
-const promptTemplateSearch = ref('')
-const promptTemplatePage = ref(1)
-const promptTemplatePageSize = ref(6)
-const filteredPromptTemplates = computed(() => {
-  const kw = promptTemplateSearch.value.trim().toLowerCase()
-  if (!kw) return promptTemplates.value
-  return promptTemplates.value.filter((t) => (
-    (t.title || '').toLowerCase().includes(kw)
-    || (t.description || '').toLowerCase().includes(kw)
-  ))
-})
-const promptTemplatesTotal = computed(() => filteredPromptTemplates.value.length)
-const pagedPromptTemplates = computed(() => {
-  const start = (promptTemplatePage.value - 1) * promptTemplatePageSize.value
-  return filteredPromptTemplates.value.slice(start, start + promptTemplatePageSize.value)
-})
-// 搜索变化时回到第 1 页；分页越界（如删到只剩前面几页）时自动收回。
-watch(promptTemplateSearch, () => { promptTemplatePage.value = 1 })
-watch(promptTemplatesTotal, (total) => {
-  const maxPage = Math.max(1, Math.ceil(total / promptTemplatePageSize.value))
-  if (promptTemplatePage.value > maxPage) promptTemplatePage.value = maxPage
-})
 const promptTemplateFormVisible = ref(false)
 const promptTemplateSaving = ref(false)
 const promptTemplateForm = reactive({
@@ -247,12 +305,6 @@ const promptTemplateUseParams = reactive({})
 const adminUsers = ref([])
 const adminUsersLoading = ref(false)
 const adminUsersError = ref('')
-const adminUsersPage = ref(1)
-const adminUsersPageSize = ref(20)
-const adminUsersPagedData = computed(() => {
-  const start = (adminUsersPage.value - 1) * adminUsersPageSize.value
-  return adminUsers.value.slice(start, start + adminUsersPageSize.value)
-})
 const adminUserEditVisible = ref(false)
 const adminUserEditSaving = ref(false)
 const adminUserEditForm = reactive({
@@ -472,6 +524,14 @@ const aiReasoningOptions = [
   { value: 'extreme', label: '极高' },
 ]
 const currentView = ref('console')
+const reducedMotion = ref(prefersReducedMotion())
+let disposeSpotlight = () => {}
+let motionPreferenceQuery = null
+let motionPreferenceHandler = null
+watch(reducedMotion, (enabled) => {
+  disposeSpotlight()
+  disposeSpotlight = enabled ? () => {} : installSpotlight()
+})
 const aiUiCases = ref([])
 const aiUiRuns = ref([])
 const aiUiRuntime = ref(null)
@@ -488,10 +548,6 @@ const aiUiStructuredSpec = ref(null)
 const aiUiRunConfirmVisible = ref(false)
 const aiUiPendingCase = ref(null)
 const aiUiPageMode = ref('cases')
-const aiUiPageModes = [
-  { key: 'cases', label: '案例' },
-  { key: 'reports', label: '报告' },
-]
 let aiUiPollTimer = null
 const aiUiForm = reactive({
   id: null,
@@ -542,34 +598,12 @@ const logSearchForm = reactive({
   limit: DEFAULT_LOG_PREVIEW_LIMIT,
 })
 
-function formatJsonBlock(payload) {
-  return JSON.stringify(payload ?? {}, null, 2)
-}
-
-function isAuditOperationExpanded(id) {
-  return expandedAuditOperationIds.value.has(String(id))
-}
-
-function toggleAuditOperationDetail(id) {
-  const key = String(id)
-  const next = new Set(expandedAuditOperationIds.value)
-  if (next.has(key)) {
-    next.delete(key)
-  } else {
-    next.add(key)
-  }
-  expandedAuditOperationIds.value = next
-}
-
 const contactForm = reactive({
   issue: '',
 })
 const contactAdminForm = reactive({
-  username: '',
-  password: '',
   reply: '',
 })
-const contactAdminLoggedIn = ref(false)
 const contactAdminError = ref('')
 const contactIssues = ref([])
 const interfaceStepEnabled = reactive({})
@@ -982,7 +1016,7 @@ const operationForms = reactive({
     processingFee: 0,
     creditResultList: [],
   },
-  webankCreditResult: { application_code: '', businessSum: 500000, seller_offers: [] },
+  webankCreditResult: { application_code: '', businessSum: 500000, frontProductId: '501026D', seller_offers: [] },
   cgbCreditResult: { amount: 200000, processingFee: 0, creditStatus: 'APPROVE' },
   cgbLoanResult: { application_code: '', amount: 100000, processingFee: 0 },
   cgbRepaymentResult: {
@@ -1040,11 +1074,12 @@ const repaymentReasonOptions = computed(() => enumOptions.value?.repayment_failu
 const spFailureOptions = computed(() => enumOptions.value?.sp_update_failure_reasons ?? [])
 const applicationAbandonOptions = computed(() => enumOptions.value?.application_abandon_reasons ?? [])
 const aiSqlDataSources = computed(() => enumOptions.value?.ai_sql_data_sources ?? defaultAiSqlDataSources)
-const pendingContactIssuesCount = computed(() => contactIssues.value.filter((item) => item.status !== '已回复').length)
-const repliedContactIssuesCount = computed(() => contactIssues.value.filter((item) => item.status === '已回复').length)
 const pendingContactIssues = computed(() => contactIssues.value.filter((item) => item.status !== '已回复'))
 const isAuthenticated = computed(() => Boolean(authUser.value))
 const isAdmin = computed(() => authUser.value?.role === 'admin')
+watch(isAuthenticated, (authenticated) => {
+  if (!authenticated) disposeMotion()
+})
 const authDisplayName = computed(() => authUser.value?.username || '未登录')
 const authRoleLabel = computed(() => (isAdmin.value ? '管理员账号' : '普通账号'))
 const auditStats = computed(() => {
@@ -1059,68 +1094,8 @@ const auditStats = computed(() => {
     { label: isAdmin.value ? '用户数' : '最近时间', value: isAdmin.value ? userCount : (rows[0]?.created_at || '-'), hint: isAdmin.value ? '涉及账号' : '最新操作' },
   ]
 })
-const environmentMonitorItems = computed(() => environmentMonitor.value?.items || [])
-const environmentMonitorOverallLabel = computed(() => {
-  const status = environmentMonitor.value?.overall
-  if (status === 'operational') return 'OPERATIONAL'
-  if (status === 'degraded') return 'DEGRADED'
-  if (status === 'down') return 'DOWN'
-  return 'CHECKING'
-})
-const environmentMonitorOverallType = computed(() => {
-  const status = environmentMonitor.value?.overall
-  if (status === 'operational') return 'success'
-  if (status === 'down') return 'danger'
-  if (status === 'degraded') return 'warning'
-  return 'info'
-})
-function statusLabel(status) {
-  if (status === 'operational' || status === 'ok') return '正常'
-  if (status === 'down') return '异常'
-  if (status === 'checking') return '检测中'
-  return '波动'
-}
-function statusTagType(status) {
-  if (status === 'operational' || status === 'ok') return 'success'
-  if (status === 'down') return 'danger'
-  if (status === 'checking') return 'info'
-  return 'warning'
-}
-function availabilityState(value) {
-  if (value === null || value === undefined || value === '') return 'checking'
-  const numericValue = Number(value)
-  if (!Number.isFinite(numericValue)) return 'checking'
-  if (numericValue < 60) return 'down'
-  if (numericValue < 80) return 'degraded'
-  return 'ok'
-}
-function availabilityLabel(value) {
-  return statusLabel(availabilityState(value))
-}
-function availabilityTagType(value) {
-  return statusTagType(availabilityState(value))
-}
-function environmentCardState(item) {
-  const states = [availabilityState(item?.availability), availabilityState(item?.channel_availability)]
-  if (states.includes('down')) return 'down'
-  if (states.includes('degraded')) return 'degraded'
-  if (states.every((state) => state === 'ok')) return 'operational'
-  return 'checking'
-}
-const activeToolModule = computed(() => {
-  if (currentView.value === 'interfaceTest') return 'interfaceTest'
-  if (currentView.value === 'aiUi') return 'aiUi'
-  if (currentView.value === 'mockApi') return 'mockApi'
-  if (currentView.value === 'activity') return 'activity'
-  if (currentView.value === 'environmentMonitor') return 'environmentMonitor'
-  if (currentView.value === 'ai') return 'ai'
-  if (currentView.value === 'promptTemplates') return 'promptTemplates'
-  if (currentView.value === 'about') return 'about'
-  if (currentView.value === 'contact') return 'contact'
-  if (currentView.value === 'contactAdmin') return 'contactAdmin'
-  if (currentView.value === 'userManagement') return 'userManagement'
-  return ''
-})
+const activeToolModule = computed(() => (currentView.value === 'console' ? '' : currentView.value))
+const activeNavKey = computed(() => currentView.value)
 
 const sessionSummary = computed(() => {
   const current = liveSessions.value.find((item) => item.session_id === activeSessionId.value)
@@ -1901,33 +1876,6 @@ const shouldLoadApplicationCodes = computed(() => (
   applicationCodeOperationKeys.includes(activeOperation.value?.key)
 ))
 
-const consoleStatusCards = computed(() => [
-  {
-    label: 'API',
-    value: health.value === 'ok' ? '正常' : '异常',
-    detail: health.value === 'ok' ? 'health check passed' : String(health.value || 'checking'),
-    tone: health.value === 'ok' ? 'success' : 'error',
-  },
-  {
-    label: 'Session',
-    value: activeSessionId.value ? '已连接' : '未连接',
-    detail: activeSessionId.value ? activeSessionId.value : '先连接 session 再执行 mock',
-    tone: activeSessionId.value ? 'success' : 'warning',
-  },
-  {
-    label: 'Env',
-    value: sessionSummary.value?.env || connectionForm.env,
-    detail: sessionSummary.value?.phone_number || '当前选择环境',
-    tone: 'info',
-  },
-  {
-    label: 'Logs',
-    value: wsConnected.value ? '实时' : '未连接',
-    detail: wsError.value || String(eventLogs.value.length) + ' 条缓存日志',
-    tone: wsConnected.value ? 'success' : 'warning',
-  },
-])
-
 const logStatusText = computed(() => {
   if (!activeSessionId.value) return '未连接会话'
   if (wsConnected.value) return '实时日志已连接'
@@ -1985,6 +1933,10 @@ const operations = computed(() => [
   { key: 'webankCreditResult', title: '授信结果 WEBANK', icon: Check, endpoint: '/api/mock/webank-credit-result', description: '输入 businessSum，并按店铺输入 applySellerBusinessSum；applicationCode 从数据库带出，默认最新一条。', fields: [
     { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
     { prop: 'businessSum', label: 'businessSum', type: 'number', min: 0, step: 1000 },
+    { prop: 'frontProductId', label: 'frontProductId', type: 'select', allowCreate: true, placeholder: '选择或输入自定义值', options: [
+      { label: '501026D（对公）', value: '501026D' },
+      { label: '2010010DG（个贷）', value: '2010010DG' },
+    ] },
   ] },
   { key: 'cgbCreditResult', title: '授信结果 CGB', icon: Check, endpoint: '/api/mock/cgb-credit-result', description: '按当前 Session 手机号查询 applicationCode（默认最新一条，可切换），自动拼接 creditCode 和 creditContractNo；creditStatus 由前端输入。', fields: [
     { prop: 'application_code', label: 'Application Code', type: 'select', options: applicationCodeOptions.value },
@@ -3613,6 +3565,8 @@ watch(activeInterfaceScenarioKey, () => {
 
 watch(darkMode, (value) => {
   document.documentElement.classList.toggle('mockapi-dark', value)
+  // Element Plus 的暗色变量挂在 html.dark 上
+  document.documentElement.classList.toggle('dark', value)
   window.localStorage.setItem('mockapi-theme', value ? 'dark' : 'light')
 }, { immediate: true })
 
@@ -3651,10 +3605,15 @@ onMounted(async () => {
   } else {
     darkMode.value = window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
   }
+  reducedMotion.value = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
   syncRailViewport()
   window.addEventListener('resize', syncRailViewport)
+  motionPreferenceQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+  motionPreferenceHandler = () => { reducedMotion.value = motionPreferenceQuery.matches }
+  motionPreferenceQuery.addEventListener?.('change', motionPreferenceHandler)
   restoreScenarioExecutionHistory()
   restoreAuthUser()
+  disposeSpotlight = installSpotlight()
   loadContactIssues()
   startEnvironmentMonitorAutoRefresh()
   await Promise.all([refreshHealth(), loadEnums(), loadSessions(), refreshScenarioMetaOverrides(), refreshScenarioStepMetaOverrides()])
@@ -3704,6 +3663,11 @@ onBeforeUnmount(() => {
   closeSocket()
   stopSessionPolling()
   stopEnvironmentMonitorAutoRefresh()
+  disposeSpotlight()
+  disposeMotion()
+  if (motionPreferenceQuery && motionPreferenceHandler) {
+    motionPreferenceQuery.removeEventListener?.('change', motionPreferenceHandler)
+  }
   window.removeEventListener('resize', syncRailViewport)
 })
 
@@ -5400,70 +5364,6 @@ async function copyResponseText(payload) {
   }
 }
 
-function renderMarkdown(text) {
-  if (!text) return ''
-  // 解码 JSON unicode 转义序列（如 \u003d → =）和字面 \n，让粘贴的 JSON 字符串可读
-  const decoded = text
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\n/g, '\n')
-    .replace(/\\t/g, '\t')
-  const html = marked.parse(decoded, { breaks: true, gfm: true })
-  return html.replace(
-    /<pre><code(?: class="language-([^"]*)")?>([\s\S]*?)<\/code><\/pre>/g,
-    (_, lang, code) => {
-      const label = lang || 'plaintext'
-      const raw = code.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-      const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      return `<div class="chat-code-block"><div class="chat-code-header"><span class="chat-code-lang">${label}</span><button type="button" class="chat-code-copy" data-code="${encodeURIComponent(raw)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> 复制</button></div><pre class="chat-code-pre"><code>${escaped}</code></pre></div>`
-    }
-  )
-}
-
-async function onChatBubbleClick(event) {
-  const btn = event.target.closest('.chat-code-copy')
-  if (!btn) return
-  const raw = decodeURIComponent(btn.dataset.code || '')
-  try {
-    await navigator.clipboard.writeText(raw)
-    const original = btn.innerHTML
-    btn.innerHTML = '✓ 已复制'
-    btn.disabled = true
-    setTimeout(() => { btn.innerHTML = original; btn.disabled = false }, 1800)
-  } catch {
-    ElMessage({ type: 'warning', message: '复制失败，请手动选择文本', duration: 2000 })
-  }
-}
-
-function renderInlineText(text) {
-  if (!text) return ''
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/`([^`]+)`/g, '<code class="chat-inline-code">$1</code>')
-    .replace(/\n/g, '<br>')
-}
-
-function parseChatContent(text) {
-  if (!text) return [{ type: 'text', content: '' }]
-  const segments = []
-  const codeBlockRegex = /```(\w*)\n?([\s\S]*?)```/g
-  let lastIndex = 0
-  let match
-  while ((match = codeBlockRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ type: 'text', content: text.slice(lastIndex, match.index) })
-    }
-    const lang = match[1] || 'plaintext'
-    segments.push({ type: 'code', lang, content: match[2].replace(/\n$/, '') })
-    lastIndex = match.index + match[0].length
-  }
-  if (lastIndex < text.length) {
-    segments.push({ type: 'text', content: text.slice(lastIndex) })
-  }
-  return segments.length ? segments : [{ type: 'text', content: text }]
-}
-
 function restoreScenarioExecutionHistory() {
   try {
     const raw = window.localStorage.getItem(scenarioHistoryStorageKey)
@@ -6093,19 +5993,8 @@ function clearAiUiPoll() {
   aiUiPollTimer = null
 }
 
-function aiUiEnvironmentLabel(environment) {
-  return aiUiEnvironmentOptions.find((item) => item.value === environment)?.label || '自定义'
-}
-
-function inferAiUiEnvironment(url) {
-  const normalizedUrl = String(url || '').trim().replace(/\/+$/, '')
-  return aiUiEnvironmentOptions.find((item) => item.url && item.url.replace(/\/+$/, '') === normalizedUrl)?.value || 'custom'
-}
-
 function handleAiUiEnvironmentChange(environment) {
-  const option = aiUiEnvironmentOptions.find((item) => item.value === environment)
-  if (option?.url) aiUiForm.url = option.url
-  else aiUiForm.url = ''
+  aiUiForm.url = aiUiEnvironmentUrl(environment)
 }
 
 function resetAiUiForm() {
@@ -6132,7 +6021,7 @@ function editAiUiCase(item) {
   aiUiForm.id = item.id
   aiUiForm.environment = item.environment || inferAiUiEnvironment(item.url)
   aiUiForm.name = item.name || ''
-  aiUiForm.url = item.url || aiUiEnvironmentOptions.find((option) => option.value === aiUiForm.environment)?.url || ''
+  aiUiForm.url = item.url || aiUiEnvironmentUrl(aiUiForm.environment)
   aiUiForm.context = item.context || ''
   aiUiForm.prompt = item.prompt || ''
   aiUiForm.headed = Boolean(item.headed)
@@ -6170,16 +6059,6 @@ function openAiUiView() {
   closeToolRail()
   currentView.value = 'aiUi'
   void refreshAiUiPage()
-}
-
-function switchAiUiPageMode(mode) {
-  aiUiPageMode.value = mode === 'reports' ? 'reports' : 'cases'
-  if (aiUiPageMode.value === 'reports') void refreshAiUiPage()
-}
-
-function openAiUiReport(path) {
-  if (!path) return
-  window.open(path, '_blank', 'noopener,noreferrer')
 }
 
 async function generateAiUiStructuredCase() {
@@ -6408,7 +6287,6 @@ async function refreshAuditOperations() {
     if (session) params.session_id = session
     const rows = await fetchUserOperations(params)
     auditOperations.value = Array.isArray(rows) ? rows : []
-    expandedAuditOperationIds.value = new Set()
   } catch (error) {
     auditError.value = error?.payload?.message || error?.message || '查询失败'
     auditOperations.value = []
@@ -6454,7 +6332,6 @@ async function refreshAdminUsers() {
   if (!authUser.value?.username) return
   adminUsersLoading.value = true
   adminUsersError.value = ''
-  adminUsersPage.value = 1
   try {
     const rows = await fetchAdminUsers(authUser.value.username)
     adminUsers.value = Array.isArray(rows) ? rows : []
@@ -8133,10 +8010,6 @@ function selectPspAuthorizationRow(row) {
   pspSelectionTouched.value = true
 }
 
-function useAiPrompt(prompt) {
-  aiInput.value = prompt
-}
-
 async function submitContactIssue() {
   const issue = contactForm.issue.trim()
   if (!issue) {
@@ -8158,27 +8031,6 @@ async function submitContactIssue() {
   } catch (error) {
     pushActivity('error', '提交问题失败', normalizeError(error))
   }
-}
-
-function handleContactAdminLogin() {
-  const username = contactAdminForm.username.trim()
-  const password = contactAdminForm.password.trim()
-  if (username === 'admin' && password === 'admin') {
-    contactAdminLoggedIn.value = true
-    contactAdminError.value = ''
-    contactAdminForm.password = ''
-    pushActivity('contact', '联系我们管理员已登录', { username })
-    return
-  }
-  contactAdminError.value = '账号或密码不正确'
-}
-
-function handleContactAdminLogout() {
-  contactAdminLoggedIn.value = false
-  contactAdminForm.username = ''
-  contactAdminForm.password = ''
-  contactAdminForm.reply = ''
-  contactAdminError.value = ''
 }
 
 async function replyContactIssue(issue) {
@@ -8211,7 +8063,7 @@ async function deleteContactIssue(issueId) {
   const confirmed = window.confirm('确认删除这个问题吗？删除后不会再展示在问题记录里。')
   if (!confirmed) return
   try {
-    await deleteContactIssueApi(issueId)
+    await deleteContactIssueApi(issueId, authUser.value?.username)
     contactIssues.value = contactIssues.value.filter((item) => item.id !== issueId)
     contactAdminError.value = ''
     pushActivity('contact', '已删除联系我们问题', {
@@ -8292,12 +8144,6 @@ function levelTagType(level) {
   return 'info'
 }
 
-function fieldOptions(field) {
-  return (field.options ?? []).map((option) => (
-    typeof option === 'object' ? option : { label: option, value: option }
-  ))
-}
-
 function journeyLabel(journey) {
   return journeyLabels[journey] ?? journey
 }
@@ -8353,6 +8199,209 @@ function buildAiContext() {
     recent_activities: activityFeed.value.slice(0, 12),
   }
 }
+
+const NAV_DEFINITIONS = [
+  { key: 'console', label: 'Mock 控制台', hint: 'session 与 mock 操作', icon: Monitor, tone: 'console', open: () => backToConsole() },
+  { key: 'interfaceTest', label: '接口测试', hint: 'workflow 调试入口', icon: Tickets, tone: 'api', open: () => openInterfaceTestView() },
+  { key: 'aiUi', label: 'AI UI 自动化', hint: '视觉驱动 UI 用例', icon: Cpu, tone: 'ai-ui', open: () => openAiUiView() },
+  { key: 'mockApi', label: 'Mock 接口', hint: '经营数据参数配置', icon: Monitor, tone: 'api', adminOnly: true, open: () => openMockApiView() },
+  { key: 'activity', label: '使用日志', hint: (admin) => (admin ? '所有用户操作记录' : '我的历史操作记录'), icon: Clock, tone: 'activity', open: () => openActivityView() },
+  { key: 'environmentMonitor', label: '环境监测', hint: '网关检测/请求测试健康度', icon: Cpu, tone: 'monitor', open: () => openEnvironmentMonitorView() },
+  { key: 'ai', label: 'AI 助手', hint: '智能问答 / SQL 生成', icon: ChatLineRound, tone: 'ai', open: () => openAiPage() },
+  { key: 'promptTemplates', label: '提示词模板', hint: (admin) => (admin ? '管理模板 / 描述触发' : '描述触发 admin 预设逻辑'), icon: Tickets, tone: 'prompt', open: () => openPromptTemplatesView() },
+  { key: 'about', label: '关于我们', hint: '项目说明与使用指引', icon: Document, tone: 'about', open: () => openAboutView() },
+  { key: 'contact', label: '联系我们', hint: '提交问题与建议', icon: Position, tone: 'contact', open: () => openContactView() },
+  { key: 'contactAdmin', label: '回复问题', hint: '管理员答复入口', icon: Connection, tone: 'reply', adminOnly: true, open: () => openContactAdminView() },
+  { key: 'userManagement', label: '用户管理', hint: '账号查看与权限维护', icon: Setting, tone: 'users', adminOnly: true, open: () => openUserManagementView() },
+]
+
+const navItems = computed(() => NAV_DEFINITIONS
+  .filter((item) => !item.adminOnly || isAdmin.value)
+  .map((item) => ({ ...item, hint: typeof item.hint === 'function' ? item.hint(isAdmin.value) : item.hint })))
+
+provide('interfaceTestContext', {
+  activeInterfaceScenario,
+  activeInterfaceScenarioKey,
+  activeOperationKey,
+  activeScenarioTab,
+  activeSessionId,
+  activeStepEditorTabs,
+  addScenarioStepAfter,
+  backToConsole,
+  connectionForm,
+  copyResponseText,
+  debugActualMethod,
+  debugActualUrlText,
+  debugInterfaceSearch,
+  debugInterfaceSteps,
+  debugRequestBodyText,
+  debugRequestError,
+  debugRequestHeadersText,
+  debugRequestQueryText,
+  debugSending,
+  defaultEnvironments,
+  enabledInterfaceStepCount,
+  enumOptions,
+  expandedScenarioTrees,
+  filteredDebugInterfaceSteps,
+  filteredInterfaceScenarioCount,
+  filteredInterfaceScenarioGroups,
+  formatStepDuration,
+  getDebugStepPayload,
+  getScenarioResponseState,
+  getScenarioStepActualRequests,
+  getScenarioStepActualResponses,
+  getScenarioStepDescription,
+  getScenarioStepLogic,
+  getScenarioStepOverrideDraft,
+  getScenarioStepResponse,
+  getScenarioStepSourceEndpoint,
+  handleDebugStepRun,
+  handleScenarioSave,
+  handleScenarioServerExecute,
+  handleScenarioStop,
+  hideScenarioStepMeta,
+  interfaceAutomationSteps,
+  interfaceFocusMode,
+  interfacePageMode,
+  interfacePageModes,
+  interfaceScenarios,
+  interfaceStepEnabled,
+  isAdmin,
+  isAuthenticated,
+  isStepFieldDisabled,
+  isStepFieldVisible,
+  latestScenarioRunContext,
+  methodBadgeClass,
+  onScenarioStepDragEnd,
+  onScenarioStepDragOver,
+  onScenarioStepDragStart,
+  onScenarioStepDrop,
+  openScenarioAddStep,
+  openScenarioHistoryDetail,
+  openScenarioMetaEditor,
+  openScenarioStepMetaEditor,
+  prettifyDebugJsonDraft,
+  resetDebugRequestDraft,
+  resetScenarioStepMetaEditor,
+  resetScenarioStepOverrideForStep,
+  saveScenarioMetaEditor,
+  saveScenarioStepMetaEditor,
+  saveScenarioStepOverrideForStep,
+  scenarioAddStepForm,
+  scenarioAddStepVisible,
+  scenarioAssertions,
+  scenarioDirectoryExpanded,
+  scenarioDragState,
+  scenarioExecuting,
+  scenarioExecutionHistory,
+  scenarioMetaEditForm,
+  scenarioMetaEditSaving,
+  scenarioMetaEditVisible,
+  scenarioSettings,
+  scenarioStepMetaEditDeleting,
+  scenarioStepMetaEditForm,
+  scenarioStepMetaEditSaving,
+  scenarioStepMetaEditVisible,
+  scenarioStepOverrideKey,
+  scenarioStepOverrideSaving,
+  scenarioStepOverrides,
+  scenarioStepResults,
+  scenarioStepSourceErrors,
+  scenarioStepSourceLoading,
+  scenarioStepStatus,
+  scenarioStopRequested,
+  scenarioTabs,
+  scenarioVariables,
+  selectDebugInterface,
+  selectScenarioFromTree,
+  selectStepFromTree,
+  selectedInterfaceStep,
+  stepFocusTab,
+  switchInterfacePageMode,
+  toggleScenarioDirectory,
+  toggleScenarioTreeNode,
+})
+
+provide('consoleContext', {
+  activeOperation,
+  activeOperationKey,
+  activeSessionId,
+  applicationOptions,
+  cancelMockOperationLayout,
+  connecting,
+  connectionForm,
+  defaultCurrencies,
+  defaultEnvironments,
+  defaultFunderResources,
+  defaultJourneys,
+  disconnecting,
+  drawdownRepaymentRows,
+  enumOptions,
+  handleConnect,
+  handleDisconnect,
+  handleOperationRun,
+  handleRegister,
+  handleRegisterAndRunMultiShop,
+  isAdmin,
+  isOperationDisabled,
+  isPspRowSelectable,
+  journeyLabel,
+  limitApplicationRows,
+  loadDowsureMerchantAccounts,
+  loadDrawdownRepaymentRows,
+  loadLimitApplications,
+  loadPspAuthorizationRows,
+  loadSessions,
+  loadWebankSellerOffers,
+  loadingDowsureMerchantAccounts,
+  loadingDrawdownRepaymentRows,
+  loadingHealth,
+  loadingLimitApplications,
+  loadingPspAuthorizationRows,
+  loadingSessions,
+  loadingWebankSellerOffers,
+  mockOperationDragState,
+  mockOperationEditMode,
+  onMockOperationDragEnd,
+  onMockOperationDragStart,
+  onMockOperationDrop,
+  onlineUsdHsbcBlocked,
+  onlineUsdHsbcBlockedReason,
+  operationDisabledChip,
+  operationDisabledReason,
+  operationForms,
+  operationResults,
+  pspAuthorizationRows,
+  refreshHealth,
+  registerAndBindingBlocked,
+  registerAndBindingBlockedReason,
+  registerForm,
+  registering,
+  registeringAndBinding,
+  repaymentRowSelectionKey,
+  runningOperationKey,
+  saveMockOperationLayout,
+  selectDrawdownRepaymentRow,
+  selectLimitApplicationRow,
+  selectPspAuthorizationRow,
+  selectedApplication,
+  selectedApplicationCurrency,
+  selectedApplicationUniqueId,
+  selectedDowsureRepaymentLoanCode,
+  selectedLimitApplicationUniqueId,
+  selectedPspMerchantAccountId,
+  sessionSummary,
+  shouldShowDowsureMerchantAccounts,
+  shouldShowDrawdownRepaymentRows,
+  shouldShowLimitApplications,
+  shouldShowPspAuthorizationRows,
+  shouldShowWebankSellerOffers,
+  startMockOperationLongPress,
+  stopMockOperationLongPress,
+  toggleOperationPanel,
+  visibleOperations,
+})
 </script>
 
 <template>
@@ -8366,51 +8415,37 @@ function buildAiContext() {
     >
       <el-icon><Moon v-if="darkMode" /><Sunny v-else /></el-icon>
     </button>
-    <div v-if="isAuthenticated" class="console-skyscape" aria-hidden="true">
-      <div class="console-skyscape__mountain console-skyscape__mountain--haze"></div>
-      <div class="console-skyscape__mountain console-skyscape__mountain--mid"></div>
-      <div class="console-skyscape__mountain console-skyscape__mountain--near"></div>
-    </div>
     <section v-if="!isAuthenticated" class="login-view">
       <el-card shadow="never" class="login-panel">
-        <div class="login-scene" :class="{ active: authMode === 'register' }">
-          <div class="login-skyscape" aria-hidden="true">
-            <div class="login-skyscape__sky"></div>
-            <div class="login-skyscape__sunlight"></div>
-            <div class="login-skyscape__mountain login-skyscape__mountain--haze"></div>
-            <div class="login-skyscape__mountain login-skyscape__mountain--mid"></div>
-            <div class="login-skyscape__mountain login-skyscape__mountain--near"></div>
-            <div class="login-skyscape__mountain login-skyscape__mountain--front"></div>
-            <div class="login-skyscape__palm login-skyscape__palm--a">
-              <span class="login-skyscape__trunk"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--l"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--r"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--lu"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--ru"></span>
-            </div>
-            <div class="login-skyscape__palm login-skyscape__palm--b">
-              <span class="login-skyscape__trunk"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--l"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--r"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--lu"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--ru"></span>
-            </div>
-            <div class="login-skyscape__palm login-skyscape__palm--c">
-              <span class="login-skyscape__trunk"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--l"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--r"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--lu"></span>
-              <span class="login-skyscape__leaf login-skyscape__leaf--ru"></span>
-            </div>
+        <div
+          class="login-scene"
+          :class="{ active: authMode === 'register' }"
+          @pointermove="onLoginPointerMove"
+          @pointerleave="onLoginPointerLeave"
+        >
+          <div class="login-mist" aria-hidden="true"></div>
+          <LoginScene3D :key="darkMode ? 'dark' : 'light'" :dark="darkMode" />
+          <div class="login-brand">
+            <h2 class="login-brand__name" aria-label="mockapi">
+              <span
+                v-for="(ch, i) in 'mockapi'"
+                :key="i"
+                aria-hidden="true"
+                :style="{ '--i': i }"
+              >{{ ch }}</span>
+            </h2>
+            <p class="login-brand__tagline">
+              <span class="login-brand__rule" aria-hidden="true"></span>
+              <span>企业级 Mock 平台</span>
+            </p>
           </div>
-
           <div class="login-area">
             <div class="login-access">
               <div class="login-card-outer">
                 <div class="login-card-inner">
                   <div class="login-card-head">
-                    <h1 class="login-title">欢迎回来</h1>
-                    <p class="login-subtitle">登录后进入 DPU Mock 控台，管理 session、触发 workflow 并查看实时日志。</p>
+                    <h1 class="login-title">欢迎登录</h1>
+                    <p class="login-subtitle">使用账号访问智能控制台</p>
                   </div>
 
                   <el-form label-position="top" class="tight-form login-form" @submit.prevent="handleLogin">
@@ -8418,9 +8453,8 @@ function buildAiContext() {
                       <el-form-item label="账号">
                         <el-input
                           v-model.trim="loginForm.username"
-                          :prefix-icon="User"
                           autocomplete="username"
-                          placeholder="请输入账号 / 邮箱"
+                          placeholder="企业邮箱 / 账号"
                         />
                       </el-form-item>
                       <el-form-item label="密码">
@@ -8428,9 +8462,8 @@ function buildAiContext() {
                           v-model="loginForm.password"
                           type="password"
                           show-password
-                          :prefix-icon="Lock"
                           autocomplete="current-password"
-                          placeholder="请输入密码"
+                          placeholder="登录密码"
                           @keydown.enter.prevent="handleLogin"
                         />
                       </el-form-item>
@@ -8439,22 +8472,16 @@ function buildAiContext() {
                     <div class="login-meta-row">
                       <label class="login-remember">
                         <input v-model="loginForm.remember" type="checkbox" />
-                        <span>记住我</span>
+                        <span>记住登录状态</span>
                       </label>
-                      <button type="button" class="login-forgot">忘记密码？</button>
+                      <button type="button" class="login-forgot">忘记密码</button>
                     </div>
 
                     <p v-if="loginError" class="login-error">{{ loginError }}</p>
 
                     <el-button class="login-main-button" type="primary" native-type="submit">
-                      <span>登 录</span>
-                      <el-icon class="login-main-arrow"><Right /></el-icon>
+                      <span>登录</span>
                     </el-button>
-
-                    <div class="login-secure-pill">
-                      <el-icon><CircleCheck /></el-icon>
-                      安全连接已启用
-                    </div>
 
                     <p class="login-switch">
                       还没有账号？<button type="button" @click="openRegisterPage">创建账号</button>
@@ -8469,7 +8496,7 @@ function buildAiContext() {
                 <div class="login-card-inner">
                   <div class="login-card-head">
                     <h1 class="login-title">创建账号</h1>
-                    <p class="login-subtitle">注册一个新账号以使用 Mock 控台，体验完整的 mock 工作流。</p>
+                    <p class="login-subtitle">注册后需管理员审核通过方可登录</p>
                   </div>
 
                   <el-form v-if="!pendingReviewUsername" label-position="top" class="tight-form login-form register-form" @submit.prevent="handleUserRegister">
@@ -8477,7 +8504,6 @@ function buildAiContext() {
                       <el-form-item label="账号">
                         <el-input
                           v-model.trim="userRegisterForm.username"
-                          :prefix-icon="User"
                           autocomplete="username"
                           placeholder="设置账号 / 邮箱"
                         />
@@ -8487,13 +8513,12 @@ function buildAiContext() {
                           v-model="userRegisterForm.password"
                           type="password"
                           show-password
-                          :prefix-icon="Lock"
                           autocomplete="new-password"
                           placeholder="设置登录密码"
                           @keydown.enter.prevent="handleUserRegister"
                         />
                       </el-form-item>
-                      <el-form-item :label="`验证题：${captchaChallenge.left} + ${captchaChallenge.right} = ?`">
+                      <el-form-item class="captcha-item" :label="`验证题：${captchaChallenge.left} + ${captchaChallenge.right} = ?`">
                         <div class="captcha-row">
                           <el-input
                             v-model.trim="userRegisterForm.answer"
@@ -8509,14 +8534,8 @@ function buildAiContext() {
                     <p v-if="registerError" class="login-error">{{ registerError }}</p>
 
                     <el-button class="login-main-button" type="primary" native-type="submit">
-                      <span>注 册</span>
-                      <el-icon class="login-main-arrow"><Right /></el-icon>
+                      <span>注册</span>
                     </el-button>
-
-                    <div class="login-secure-pill">
-                      <el-icon><CircleCheck /></el-icon>
-                      安全连接已启用
-                    </div>
 
                     <p class="login-switch">
                       已有账号？<button type="button" @click="openLoginPage">登录</button>
@@ -8587,89 +8606,20 @@ function buildAiContext() {
           <small>{{ authRoleLabel }}</small>
         </span>
       </div>
-      <nav class="side-tool-nav">
-        <button class="side-tool-action tone-console" :class="{ active: currentView === 'console' }" type="button" @click="backToConsole">
-          <span class="side-tool-icon"><el-icon><Monitor /></el-icon></span>
+      <nav class="side-tool-nav" aria-label="功能导航">
+        <button
+          v-for="item in navItems"
+          :key="item.key"
+          class="side-tool-action"
+          :class="[`tone-${item.tone}`, { active: activeNavKey === item.key }]"
+          type="button"
+          :aria-current="activeNavKey === item.key ? 'page' : undefined"
+          @click="item.open"
+        >
+          <span class="side-tool-icon"><el-icon><component :is="item.icon" /></el-icon></span>
           <span class="side-tool-label">
-            <strong>Mock 控制台</strong>
-            <small>session 与 mock 操作</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-api" :class="{ active: activeToolModule === 'interfaceTest' }" type="button" @click="openInterfaceTestView">
-          <span class="side-tool-icon"><el-icon><Tickets /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>接口测试</strong>
-            <small>workflow 调试入口</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-ai-ui" :class="{ active: activeToolModule === 'aiUi' }" type="button" @click="openAiUiView">
-          <span class="side-tool-icon"><el-icon><Cpu /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>AI UI 自动化</strong>
-            <small>视觉驱动 UI 用例</small>
-          </span>
-        </button>
-        <button v-if="isAdmin" class="side-tool-action tone-api" :class="{ active: activeToolModule === 'mockApi' }" type="button" @click="openMockApiView">
-          <span class="side-tool-icon"><el-icon><Monitor /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>Mock 接口</strong>
-            <small>经营数据参数配置</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-activity" :class="{ active: activeToolModule === 'activity' }" type="button" @click="openActivityView">
-          <span class="side-tool-icon"><el-icon><Clock /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>使用日志</strong>
-            <small>{{ isAdmin ? '所有用户操作记录' : '我的历史操作记录' }}</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-monitor" :class="{ active: activeToolModule === 'environmentMonitor' }" type="button" @click="openEnvironmentMonitorView">
-          <span class="side-tool-icon"><el-icon><Cpu /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>环境监测</strong>
-            <small>网关检测/请求测试健康度</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-ai" :class="{ active: activeToolModule === 'ai' }" type="button" @click="openAiPage">
-          <span class="side-tool-icon"><el-icon><ChatLineRound /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>AI 助手</strong>
-            <small>智能问答 / SQL 生成</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-prompt" :class="{ active: activeToolModule === 'promptTemplates' }" type="button" @click="openPromptTemplatesView">
-          <span class="side-tool-icon"><el-icon><Tickets /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>提示词模板</strong>
-            <small>{{ isAdmin ? '管理模板 / 描述触发' : '描述触发 admin 预设逻辑' }}</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-about" :class="{ active: activeToolModule === 'about' }" type="button" @click="openAboutView">
-          <span class="side-tool-icon"><el-icon><Document /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>关于我们</strong>
-            <small>项目说明与使用指引</small>
-          </span>
-        </button>
-        <button class="side-tool-action tone-contact" :class="{ active: activeToolModule === 'contact' }" type="button" @click="openContactView">
-          <span class="side-tool-icon"><el-icon><Position /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>联系我们</strong>
-            <small>提交问题与建议</small>
-          </span>
-        </button>
-        <button v-if="isAdmin" class="side-tool-action tone-reply" :class="{ active: activeToolModule === 'contactAdmin' }" type="button" @click="openContactAdminView">
-          <span class="side-tool-icon"><el-icon><Connection /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>回复问题</strong>
-            <small>管理员答复入口</small>
-          </span>
-        </button>
-        <button v-if="isAdmin" class="side-tool-action tone-users" :class="{ active: activeToolModule === 'userManagement' }" type="button" @click="openUserManagementView">
-          <span class="side-tool-icon"><el-icon><Setting /></el-icon></span>
-          <span class="side-tool-label">
-            <strong>用户管理</strong>
-            <small>账号查看与权限维护</small>
+            <strong>{{ item.label }}</strong>
+            <small>{{ item.hint }}</small>
           </span>
         </button>
       </nav>
@@ -8683,6 +8633,15 @@ function buildAiContext() {
       </button>
     </aside>
     <section class="hero-panel">
+      <WorkflowScene
+        v-if="!reducedMotion"
+        class="hero-aurora"
+        :color-stops="['#bfdbfe', '#60a5fa', '#e0f2fe']"
+        :amplitude="1.1"
+        :blend="0.6"
+        :speed="0.6"
+        aria-hidden="true"
+      />
       <button
         class="hero-tool-toggle"
         :class="{ active: activeToolModule }"
@@ -8694,27 +8653,40 @@ function buildAiContext() {
         <el-icon><Expand v-if="toolRailCollapsed" /><Fold v-else /></el-icon>
         <span>{{ toolRailCollapsed ? '展开工具' : '收起工具' }}</span>
       </button>
-      <div>
-        <span class="eyebrow">
-          <span class="eyebrow-dot"></span>
-          DPU Mock Console
-        </span>
-        <h1>DPU Mock API 操作台</h1>
+      <span class="hero-orbs" aria-hidden="true">
+        <span class="hero-orb orb-a"></span>
+        <span class="hero-orb orb-b"></span>
+        <span class="hero-orb orb-c"></span>
+        <span class="hero-sweep"></span>
+      </span>
+      <div class="hero-intro">
+        <h1
+          class="hero-title"
+          aria-label="Mock API 操作台"
+          @pointermove="onHeroTitlePointerMove"
+          @pointerleave="onHeroTitlePointerLeave"
+          @click="onHeroTitleClick"
+        >
+          <span class="hero-title-latin" aria-hidden="true">
+            <span
+              v-for="(ch, i) in heroTitleLatin"
+              :key="`l-${i}`"
+              class="hero-char"
+              :style="{ '--i': i }"
+            >{{ ch === ' ' ? '\u00a0' : ch }}</span>
+          </span>
+          <span class="hero-title-accent" aria-hidden="true">
+            <span
+              v-for="(ch, j) in heroTitleAccent"
+              :key="`a-${j}`"
+              class="hero-char"
+              :style="{ '--i': heroTitleLatin.length + j, '--j': j }"
+            >{{ ch }}</span>
+          </span>
+        </h1>
         <p class="hero-copy">
-          连接账号、触发 workflow webhook、查看实时日志；所有操作都绑定当前环境和 session。
+          连接账号、触发 <span class="hero-term">workflow webhook</span>、查看实时日志；所有操作都绑定当前环境和 <span class="hero-term">session</span>。
         </p>
-        <div class="hero-status-grid" aria-label="console status">
-          <div
-            v-for="card in consoleStatusCards"
-            :key="card.label"
-            class="status-card"
-            :class="`tone-${card.tone}`"
-          >
-            <span>{{ card.label }}</span>
-            <strong>{{ card.value }}</strong>
-            <code>{{ card.detail }}</code>
-          </div>
-        </div>
       </div>
       <div class="hero-action-stack">
         <div class="hero-action hero-user-chip" title="当前登录账号">
@@ -8734,41 +8706,17 @@ function buildAiContext() {
           <span>{{ toolRailCollapsed ? '展开工具' : '收起工具' }}</span>
         </button>
         <template v-if="!toolRailCollapsed">
-          <button class="hero-action" :class="{ active: currentView === 'console' }" type="button" @click="backToConsole">
-            <el-icon><Monitor /></el-icon>
-            <span>Mock 控制台</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'interfaceTest' }" type="button" @click="openInterfaceTestView">
-            <el-icon><Tickets /></el-icon>
-            <span>接口测试</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'activity' }" type="button" @click="openActivityView">
-            <el-icon><Clock /></el-icon>
-            <span>使用日志</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'environmentMonitor' }" type="button" @click="openEnvironmentMonitorView">
-            <el-icon><Cpu /></el-icon>
-            <span>环境监测</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'ai' }" type="button" @click="openAiPage">
-            <el-icon><ChatLineRound /></el-icon>
-            <span>AI 助手</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'about' }" type="button" @click="openAboutView">
-            <el-icon><Document /></el-icon>
-            <span>关于我们</span>
-          </button>
-          <button class="hero-action" :class="{ active: activeToolModule === 'contact' }" type="button" @click="openContactView">
-            <el-icon><Position /></el-icon>
-            <span>联系我们</span>
-          </button>
-          <button v-if="isAdmin" class="hero-action" :class="{ active: activeToolModule === 'contactAdmin' }" type="button" @click="openContactAdminView">
-            <el-icon><Connection /></el-icon>
-            <span>回复问题</span>
-          </button>
-          <button v-if="isAdmin" class="hero-action" :class="{ active: activeToolModule === 'userManagement' }" type="button" @click="openUserManagementView">
-            <el-icon><Setting /></el-icon>
-            <span>用户管理</span>
+          <button
+            v-for="item in navItems"
+            :key="`hero-${item.key}`"
+            class="hero-action"
+            :class="{ active: activeNavKey === item.key }"
+            type="button"
+            :aria-current="activeNavKey === item.key ? 'page' : undefined"
+            @click="item.open"
+          >
+            <el-icon><component :is="item.icon" /></el-icon>
+            <span>{{ item.label }}</span>
           </button>
           <button class="hero-action" type="button" @click="handleLogout">
             <el-icon><SwitchButton /></el-icon>
@@ -8779,1266 +8727,56 @@ function buildAiContext() {
     </section>
 
 
-    <section v-if="currentView === 'interfaceTest'" class="interface-test-view">
-      <div class="log-system-head interface-test-head">
-        <div>
-          <p class="eyebrow">Interface Test</p>
-          <h2>接口测试</h2>
-          <p>按 workflow 顺序列出所有 mock 接口，选择接口后可查看请求参数、预览 payload 并直接发起调用。</p>
-        </div>
-        <div class="interface-test-actions">
-          <div class="interface-page-switch" role="tablist" aria-label="接口测试页面切换">
-            <button
-              v-for="mode in interfacePageModes"
-              :key="mode.key"
-              type="button"
-              role="tab"
-              :aria-selected="interfacePageMode === mode.key"
-              :class="{ active: interfacePageMode === mode.key }"
-              @click="switchInterfacePageMode(mode.key)"
-            >{{ mode.label }}</button>
-          </div>
-          <el-tag :type="activeSessionId ? 'success' : 'warning'" effect="plain">{{ activeSessionId ? 'Session 已连接' : '未连接 Session' }}</el-tag>
-          <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-        </div>
-      </div>
+    <Transition
+      name="view-transition"
+      mode="out-in"
+      @before-leave="disposeMotion"
+      @after-enter="playViewEnter"
+    >
+      <div :key="currentView" class="view-transition-stage">
+    <InterfaceTestView v-if="currentView === 'interfaceTest'" />
 
-      <div v-if="false" class="interface-session-strip">
-        <section class="interface-session-card">
-          <div class="interface-session-head">
-            <div>
-              <h3>会话连接</h3>
-              <p>自动化执行会自行注册并建立 session，也可以手动绑定已有手机号。</p>
-            </div>
-            <el-tag :type="activeSessionId ? 'success' : 'warning'" effect="plain">{{ activeSessionId ? '已连接' : '未连接' }}</el-tag>
-          </div>
-          <div class="interface-session-form">
-            <el-select v-model="connectionForm.env" aria-label="连接环境">
-              <el-option
-                v-for="env in enumOptions?.environments ?? defaultEnvironments"
-                :key="`api-connect-${env}`"
-                :label="env"
-                :value="env"
-              />
-            </el-select>
-            <el-input v-model.trim="connectionForm.phone_number" placeholder="8位或11位数字" />
-            <el-button type="primary" :icon="Connection" :loading="connecting" @click="handleConnect">连接 session</el-button>
-          </div>
-        </section>
+    <AiUiView
+      v-else-if="currentView === 'aiUi'"
+      v-model:form="aiUiForm"
+      v-model:page-mode="aiUiPageMode"
+      v-model:natural-language="aiUiNaturalLanguage"
+      v-model:structured-yaml="aiUiStructuredYaml"
+      v-model:variables-text="aiUiVariablesText"
+      v-model:confirm-visible="aiUiRunConfirmVisible"
+      :cases="aiUiCases"
+      :runs="aiUiRuns"
+      :runtime="aiUiRuntime"
+      :loading="aiUiLoading"
+      :saving="aiUiSaving"
+      :generating="aiUiGenerating"
+      :error="aiUiError"
+      :selected-case-id="aiUiSelectedCaseId"
+      :active-run-id="aiUiActiveRunId"
+      :pending-case="aiUiPendingCase"
+      :username="authUser?.username || ''"
+      @back="backToConsole"
+      @refresh="refreshAiUiPage"
+      @new-case="resetAiUiForm"
+      @edit-case="editAiUiCase"
+      @run="runAiUiCase()"
+      @generate="generateAiUiStructuredCase"
+      @save="saveAiUiCaseRecord"
+      @remove="removeAiUiCase"
+      @stop="stopAiUiCaseRun"
+      @confirm-run="confirmAiUiRun"
+    />
 
-        <section class="interface-session-card">
-          <div class="interface-session-head">
-            <div>
-              <h3>新账号注册</h3>
-              <p>注册完成后会自动尝试连接，可直接继续接口测试。</p>
-            </div>
-            <el-switch v-model="registerForm.offline" active-text="线下模式" inactive-text="线上模式" />
-          </div>
-          <div class="interface-register-form">
-            <el-select v-model="registerForm.env" aria-label="注册环境">
-              <el-option
-                v-for="env in enumOptions?.environments ?? defaultEnvironments"
-                :key="`api-reg-${env}`"
-                :label="env"
-                :value="env"
-              />
-            </el-select>
-            <el-select v-if="!registerForm.offline" v-model="registerForm.journey" aria-label="Journey">
-              <el-option
-                v-for="journey in enumOptions?.journeys ?? defaultJourneys"
-                :key="`api-journey-${journey}`"
-                :label="journeyLabel(journey)"
-                :value="journey"
-              />
-            </el-select>
-            <el-select v-model="registerForm.currency" aria-label="币种">
-              <el-option
-                v-for="currency in enumOptions?.currencies ?? defaultCurrencies"
-                :key="`api-currency-${currency}`"
-                :label="currency"
-                :value="currency"
-              />
-            </el-select>
-            <el-select v-model="registerForm.funder_resource" aria-label="资方代码">
-              <el-option
-                v-for="resource in enumOptions?.funder_resources ?? defaultFunderResources"
-                :key="`api-funder-${resource}`"
-                :label="resource"
-                :value="resource"
-              />
-            </el-select>
-            <el-button
-              type="primary"
-              :icon="Promotion"
-              :loading="registering"
-              :disabled="onlineUsdHsbcBlocked"
-              :title="onlineUsdHsbcBlocked ? onlineUsdHsbcBlockedReason : ''"
-              @click="handleRegister"
-            >执行注册</el-button>
-            <el-button
-              type="primary"
-              plain
-              :icon="Link"
-              :loading="registeringAndBinding"
-              :disabled="registerAndBindingBlocked"
-              :title="registerAndBindingBlocked ? registerAndBindingBlockedReason : ''"
-              @click="handleRegisterAndRunMultiShop"
-            >注册并完成绑店</el-button>
-          </div>
-        </section>
-      </div>
-
-      <div class="interface-automation-shell" :class="{ 'is-report': interfacePageMode === 'report' }">
-        <aside v-if="interfacePageMode !== 'report'" class="scenario-library" aria-label="场景集合">
-          <div v-if="interfacePageMode === 'debug'" class="debug-interface-list">
-            <div class="scenario-tree-head">
-              <strong>
-                调试接口 ({{ filteredDebugInterfaceSteps.length }}<template v-if="debugInterfaceSearch.trim()">/{{ debugInterfaceSteps.length }}</template>)
-              </strong>
-              <el-tag size="small" effect="plain">全局接口</el-tag>
-            </div>
-            <el-input
-              v-model.trim="debugInterfaceSearch"
-              class="debug-interface-search"
-              size="small"
-              clearable
-              placeholder="搜索接口名 / endpoint / 场景"
-            />
-            <div v-if="!filteredDebugInterfaceSteps.length" class="debug-interface-empty">
-              没有匹配接口。
-            </div>
-            <button
-              v-for="(step, index) in filteredDebugInterfaceSteps"
-              :key="`debug-interface-${step.key}`"
-              class="debug-interface-item"
-              :class="{ active: activeOperationKey === step.key }"
-              type="button"
-              @click="selectDebugInterface(step.key)"
-            >
-              <span class="scenario-tree-step-index">{{ index + 1 }}</span>
-              <span
-                class="scenario-tree-step-method"
-                :class="step.type === 'script' ? 'is-script' : 'is-api'"
-              >{{ step.type === 'script' ? 'SCRIPT' : (step.method || 'POST') }}</span>
-              <span class="debug-interface-title" :title="`${step.title}\n${step.endpoint}`">
-                <strong>{{ step.title }}</strong>
-                <small>{{ step.endpoint }}</small>
-                <em>{{ step.debugSources?.length || 1 }} 个场景使用</em>
-              </span>
-              <span
-                class="scenario-tree-step-dot"
-                :class="`is-${scenarioStepStatus(step.key)}`"
-                :title="scenarioStepStatus(step.key)"
-              ></span>
-            </button>
-          </div>
-          <div v-else class="scenario-tree">
-            <div class="scenario-tree-head">
-              <strong>全部场景 ({{ filteredInterfaceScenarioCount }})</strong>
-              <el-tag size="small" effect="plain">DPU产品流程</el-tag>
-            </div>
-
-            <div
-              v-for="directory in filteredInterfaceScenarioGroups"
-              :key="directory.key"
-              class="scenario-tree-directory"
-            >
-              <div
-                class="scenario-tree-directory-node"
-                role="button"
-                tabindex="0"
-                @click="toggleScenarioDirectory(directory.key)"
-                @keydown.enter.prevent="toggleScenarioDirectory(directory.key)"
-                @keydown.space.prevent="toggleScenarioDirectory(directory.key)"
-              >
-                <button
-                  class="scenario-tree-toggle"
-                  type="button"
-                  :aria-label="scenarioDirectoryExpanded(directory.key) ? '收起' : '展开'"
-                  @click.stop="toggleScenarioDirectory(directory.key)"
-                >
-                  <el-icon>
-                    <ArrowDown v-if="scenarioDirectoryExpanded(directory.key)" />
-                    <ArrowRight v-else />
-                  </el-icon>
-                </button>
-                <span class="scenario-tree-name">{{ directory.name }}</span>
-                <small>{{ directory.scenarios.length }}</small>
-              </div>
-
-              <div v-if="scenarioDirectoryExpanded(directory.key)" class="scenario-tree-scenario-list">
-                <div
-                  v-for="scenario in directory.scenarios"
-                  :key="scenario.key"
-                  class="scenario-tree-group"
-                  :class="{ active: activeInterfaceScenarioKey === scenario.key }"
-                >
-                  <div
-                    class="scenario-tree-node"
-                    role="button"
-                    tabindex="0"
-                    @click="selectScenarioFromTree(scenario.key)"
-                    @keydown.enter.prevent="selectScenarioFromTree(scenario.key)"
-                    @keydown.space.prevent="selectScenarioFromTree(scenario.key)"
-                  >
-                    <button
-                      class="scenario-tree-toggle"
-                      type="button"
-                      :aria-label="expandedScenarioTrees[scenario.key] ? '收起' : '展开'"
-                      @click.stop="toggleScenarioTreeNode(scenario.key)"
-                    >
-                      <el-icon>
-                        <ArrowDown v-if="expandedScenarioTrees[scenario.key]" />
-                        <ArrowRight v-else />
-                      </el-icon>
-                    </button>
-                    <span class="scenario-tree-name">{{ scenario.name }}</span>
-                    <small>{{ scenario.steps.length }}</small>
-                  </div>
-
-                  <ul v-if="expandedScenarioTrees[scenario.key]" class="scenario-tree-step-list">
-                    <li
-                      v-for="(step, index) in scenario.steps"
-                      :key="`${scenario.key}-${step.key}`"
-                      class="scenario-tree-step"
-                      :class="{
-                        active: activeInterfaceScenarioKey === scenario.key && activeOperationKey === step.key && interfacePageMode === 'scenario' && interfaceFocusMode === 'step',
-                        disabled: interfaceStepEnabled[step.key] === false,
-                        'is-dragging': scenarioDragState.scenarioKey === scenario.key && scenarioDragState.stepKey === step.key,
-                        'not-draggable': !isAdmin,
-                      }"
-                      :draggable="isAdmin"
-                      @click="selectStepFromTree(scenario.key, step.key)"
-                      @dragstart="isAdmin && onScenarioStepDragStart($event, scenario.key, step.key)"
-                      @dragover.prevent="isAdmin && onScenarioStepDragOver($event, scenario.key, step.key)"
-                      @drop.prevent="isAdmin && onScenarioStepDrop($event, scenario.key, step.key)"
-                      @dragend="onScenarioStepDragEnd"
-                    >
-                      <span v-if="isAdmin" class="scenario-tree-step-handle" title="拖动调整顺序">⋮⋮</span>
-                      <span v-else class="scenario-tree-step-handle scenario-tree-step-handle--placeholder"></span>
-                      <span class="scenario-tree-step-index">{{ index + 1 }}</span>
-                      <span
-                        class="scenario-tree-step-method"
-                        :class="step.type === 'script' ? 'is-script' : 'is-api'"
-                      >{{ step.type === 'script' ? 'SCRIPT' : (step.method || 'POST') }}</span>
-                      <span class="scenario-tree-step-title" :title="step.title">{{ step.title }}</span>
-                      <el-switch
-                        :model-value="interfaceStepEnabled[step.key] !== false"
-                        size="small"
-                        class="scenario-tree-step-switch"
-                        @click.stop
-                        @change="(val) => { interfaceStepEnabled[step.key] = val }"
-                      />
-                      <span
-                        class="scenario-tree-step-dot"
-                        :class="`is-${scenarioStepStatus(step.key)}`"
-                        :title="scenarioStepStatus(step.key)"
-                      ></span>
-                    </li>
-                  </ul>
-                </div>
-              </div>
-            </div>
-          </div>
-        </aside>
-
-        <main class="scenario-workbench">
-          <div class="scenario-toolbar">
-            <div class="scenario-title-block">
-              <div class="scenario-status-line">
-                <strong>{{ interfacePageMode === 'debug' ? '单接口调试' : activeInterfaceScenario.name }}</strong>
-              </div>
-              <p v-if="interfacePageMode === 'debug'">
-                汇总所有场景里出现过的接口，选择一个接口后配置真实上游请求头和请求体单独调用。
-              </p>
-              <p v-else>{{ activeInterfaceScenario.description }} · {{ enabledInterfaceStepCount }} / {{ interfaceAutomationSteps.length }} 个步骤启用</p>
-            </div>
-            <div class="scenario-run-actions">
-              <el-select v-model="connectionForm.env" class="scenario-env-select" aria-label="执行环境">
-                <el-option
-                  v-for="env in enumOptions?.environments ?? defaultEnvironments"
-                  :key="`scenario-env-${env}`"
-                  :label="env"
-                  :value="env"
-                />
-              </el-select>
-              <template v-if="interfacePageMode !== 'debug'">
-                <el-button type="primary" :icon="Promotion" :loading="scenarioExecuting" @click="handleScenarioServerExecute">服务端执行</el-button>
-                <el-button
-                  type="danger"
-                  plain
-                  :disabled="!scenarioExecuting || scenarioStopRequested"
-                  @click="handleScenarioStop"
-                >{{ scenarioStopRequested ? '停止中…' : '停止' }}</el-button>
-                <el-button v-if="isAdmin" type="primary" plain :disabled="scenarioExecuting" @click="handleScenarioSave">保存</el-button>
-              </template>
-            </div>
-          </div>
-
-          <section v-if="latestScenarioRunContext" class="scenario-panel scenario-run-context">
-            <div><span>执行环境</span><strong>{{ latestScenarioRunContext.env || '-' }}</strong></div>
-            <div><span>手机号</span><strong>{{ latestScenarioRunContext.phone_number || '-' }}</strong></div>
-            <div><span>Merchant ID</span><strong>{{ latestScenarioRunContext.merchant_id || '-' }}</strong></div>
-            <div><span>Application Unique ID</span><strong>{{ latestScenarioRunContext.application_unique_id || '-' }}</strong></div>
-          </section>
-
-          <div v-if="interfacePageMode === 'scenario' && interfaceFocusMode !== 'step'" class="scenario-tabs">
-            <button
-              v-for="tab in scenarioTabs"
-              :key="tab.key"
-              type="button"
-              :class="{ active: activeScenarioTab === tab.key }"
-              @click="activeScenarioTab = tab.key"
-            >{{ tab.label }}</button>
-          </div>
-
-          <template v-if="interfacePageMode === 'scenario' && interfaceFocusMode !== 'step'">
-          <section v-if="activeScenarioTab === 'base'" class="scenario-panel scenario-base-panel">
-            <div class="scenario-base-item">
-              <span>场景名称</span>
-              <strong>{{ activeInterfaceScenario.name }}</strong>
-              <button
-                v-if="isAdmin"
-                class="scenario-base-edit"
-                type="button"
-                title="编辑场景名称与描述"
-                @click="openScenarioMetaEditor"
-              >
-                <el-icon><Edit /></el-icon>
-              </button>
-            </div>
-            <div class="scenario-base-description scenario-base-item">
-              <span>场景描述</span>
-              <strong>{{ activeInterfaceScenario.description || '-' }}</strong>
-            </div>
-            <div class="scenario-base-item">
-              <span>步骤启用</span>
-              <strong>{{ enabledInterfaceStepCount }} / {{ interfaceAutomationSteps.length }}</strong>
-            </div>
-          </section>
-
-          <section v-else-if="activeScenarioTab === 'params'" class="scenario-panel">
-            <div class="scenario-panel-head">
-              <strong>场景变量</strong>
-              <span>变量会在执行时注入到请求体和脚本上下文。</span>
-            </div>
-            <div class="scenario-variable-table">
-              <div><span>Key</span><span>Value</span><span>Scope</span></div>
-              <div v-for="(value, key) in scenarioVariables" :key="key">
-                <strong>{{ key }}</strong>
-                <el-input v-model="scenarioVariables[key]" />
-                <span>Scenario</span>
-              </div>
-            </div>
-          </section>
-
-          <section v-else-if="activeScenarioTab === 'hooks'" class="scenario-panel scenario-hooks-panel">
-            <div>
-              <strong>前置操作</strong>
-              <p>初始化 env、session、手机号、merchant 变量；校验当前用户登录状态。</p>
-            </div>
-            <div>
-              <strong>后置操作</strong>
-              <p>写入执行历史、刷新会话摘要、保留最近响应和错误信息。</p>
-            </div>
-          </section>
-
-          <section v-else-if="activeScenarioTab === 'assertions'" class="scenario-panel">
-            <div class="scenario-panel-head">
-              <strong>统一断言</strong>
-              <span>执行结果需要同时满足 HTTP、业务成功和 trace 信息。</span>
-            </div>
-            <div class="scenario-assertion-list">
-              <label v-for="assertion in scenarioAssertions" :key="assertion.target">
-                <el-checkbox v-model="assertion.enabled" />
-                <strong>{{ assertion.target }}</strong>
-                <span>{{ assertion.rule }}</span>
-              </label>
-            </div>
-          </section>
-
-          <section v-else-if="activeScenarioTab === 'history'" class="scenario-panel">
-            <div class="scenario-panel-head">
-              <strong>执行历史</strong>
-              <span>本机持续保留服务端执行记录。</span>
-            </div>
-            <div v-if="scenarioExecutionHistory.length === 0" class="scenario-empty">暂无执行历史。</div>
-            <div v-for="item in scenarioExecutionHistory" :key="item.id" class="scenario-history-row">
-              <el-tag :type="item.status === '完成' ? 'success' : item.status === '未执行' ? 'warning' : 'danger'" effect="plain">{{ item.status }}</el-tag>
-              <strong>{{ item.scenario }}</strong>
-              <span>{{ item.env }}</span>
-              <span>{{ item.at }}</span>
-              <span>成功 {{ item.success }} / 跳过 {{ item.skipped }} / 失败 {{ item.failed }}</span>
-              <code>{{ item.duration }}</code>
-              <el-button size="small" plain @click="openScenarioHistoryDetail(item)">详情</el-button>
-            </div>
-          </section>
-
-          <section v-else-if="activeScenarioTab === 'settings'" class="scenario-panel scenario-settings-panel">
-            <label><span>失败后停止</span><el-switch v-model="scenarioSettings.stopOnFailure" /></label>
-            <label><span>保存响应详情</span><el-switch v-model="scenarioSettings.saveResponse" /></label>
-            <label><span>执行前校验 session</span><el-switch v-model="scenarioSettings.validateSession" /></label>
-            <label><span>默认超时</span><el-input v-model="scenarioSettings.timeout" /></label>
-          </section>
-          </template>
-
-          <template v-else-if="selectedInterfaceStep && (interfacePageMode === 'debug' || (interfacePageMode === 'scenario' && interfaceFocusMode === 'step'))">
-            <section class="step-editor">
-              <div v-if="interfacePageMode === 'debug'" class="debug-request-console">
-                <div class="debug-request-console-head">
-                  <div>
-                    <strong>单接口调试</strong>
-                    <span>{{ selectedInterfaceStep.title }}</span>
-                  </div>
-                  <div class="debug-request-state">
-                    <span
-                      class="step-editor-status"
-                      :class="`is-${scenarioStepStatus(selectedInterfaceStep.key)}`"
-                    >
-                      {{ scenarioStepStatus(selectedInterfaceStep.key) === 'success' ? '成功' : scenarioStepStatus(selectedInterfaceStep.key) === 'error' ? '失败' : '未执行' }}
-                    </span>
-                    <span v-if="scenarioStepResults[selectedInterfaceStep.key]?.durationMs != null" class="step-editor-duration">
-                      {{ formatStepDuration(scenarioStepResults[selectedInterfaceStep.key].durationMs) }}
-                    </span>
-                  </div>
-                </div>
-                <div class="debug-request-urlbar">
-                  <el-select model-value="HTTP" class="debug-protocol-select" disabled>
-                    <el-option label="HTTP" value="HTTP" />
-                  </el-select>
-                  <el-select v-model="debugActualMethod" class="debug-method-select">
-                    <el-option label="GET" value="GET" />
-                    <el-option label="POST" value="POST" />
-                    <el-option label="PUT" value="PUT" />
-                    <el-option label="PATCH" value="PATCH" />
-                    <el-option label="DELETE" value="DELETE" />
-                  </el-select>
-                  <el-input
-                    v-model.trim="debugActualUrlText"
-                    class="debug-url-input"
-                    placeholder="https://dpu-gateway-reg.dowsure.com/..."
-                  />
-                  <button
-                    class="step-editor-send"
-                    type="button"
-                    :disabled="debugSending"
-                    @click="handleDebugStepRun"
-                  >
-                    <el-icon><Promotion /></el-icon>
-                    <span>{{ debugSending ? '发送中' : '服务端执行' }}</span>
-                  </button>
-                  <button class="step-editor-send is-plain" type="button" :disabled="debugSending" @click="resetDebugRequestDraft()">
-                    <el-icon><Refresh /></el-icon>
-                    <span>重置</span>
-                  </button>
-                </div>
-              </div>
-              <div v-else class="step-editor-head">
-                <span class="step-editor-method" :class="methodBadgeClass(selectedInterfaceStep)">
-                  {{ selectedInterfaceStep.type === 'script' ? 'SCRIPT' : (selectedInterfaceStep.method || 'POST') }}
-                </span>
-                <code class="step-editor-endpoint" :title="selectedInterfaceStep.endpoint">{{ selectedInterfaceStep.endpoint }}</code>
-                <span
-                  class="step-editor-status"
-                  :class="`is-${scenarioStepStatus(selectedInterfaceStep.key)}`"
-                >
-                  {{ scenarioStepStatus(selectedInterfaceStep.key) === 'success' ? '成功' : scenarioStepStatus(selectedInterfaceStep.key) === 'error' ? '失败' : '未执行' }}
-                </span>
-                <span v-if="scenarioStepResults[selectedInterfaceStep.key]?.durationMs != null" class="step-editor-duration">
-                  {{ formatStepDuration(scenarioStepResults[selectedInterfaceStep.key].durationMs) }}
-                </span>
-                <button
-                  v-if="interfacePageMode === 'debug'"
-                  class="step-editor-send"
-                  type="button"
-                  :disabled="debugSending"
-                  @click="handleDebugStepRun"
-                >
-                  <el-icon><Promotion /></el-icon>
-                  <span>{{ debugSending ? '发送中' : '发送' }}</span>
-                </button>
-                <button v-if="interfacePageMode === 'debug'" class="step-editor-send is-plain" type="button" :disabled="debugSending" @click="resetDebugRequestDraft()">
-                  <el-icon><Refresh /></el-icon>
-                  <span>重置</span>
-                </button>
-              </div>
-
-              <h3 class="step-editor-title">{{ selectedInterfaceStep.title }}</h3>
-              <p class="step-editor-desc">{{ getScenarioStepDescription(selectedInterfaceStep).description }}</p>
-              <el-alert
-                v-if="debugRequestError"
-                class="debug-request-alert"
-                type="error"
-                :title="debugRequestError"
-                show-icon
-                :closable="false"
-              />
-
-              <div class="step-editor-tabs">
-                <button
-                  v-for="tab in activeStepEditorTabs"
-                  :key="tab.key"
-                  type="button"
-                  :class="{ active: stepFocusTab === tab.key }"
-                  @click="stepFocusTab = tab.key"
-                >{{ tab.label }}</button>
-              </div>
-
-              <section v-if="stepFocusTab === 'params'" class="step-editor-panel">
-                <div class="scenario-description-grid">
-                  <div>
-                    <span>Method</span>
-                    <code>{{ getScenarioStepDescription(selectedInterfaceStep).method }}</code>
-                  </div>
-                  <div>
-                    <span>Endpoint</span>
-                    <code>{{ getScenarioStepDescription(selectedInterfaceStep).endpoint }}</code>
-                  </div>
-                  <div>
-                    <span>Fields</span>
-                    <strong>
-                      {{ (selectedInterfaceStep.fields?.length || getScenarioStepDescription(selectedInterfaceStep).fieldCount) }} 个参数
-                    </strong>
-                  </div>
-                </div>
-
-                <div v-if="interfacePageMode === 'debug'" class="debug-source-summary">
-                  <strong>接口来源</strong>
-                  <span
-                    v-for="source in selectedInterfaceStep.debugSources || []"
-                    :key="`debug-source-${selectedInterfaceStep.key}-${source.scenarioKey}-${source.stepKey}`"
-                  >{{ source.scenarioName }} #{{ source.order }}</span>
-                </div>
-
-                <!-- Configurable fields (saved per user, used on next run) -->
-                <template v-else-if="selectedInterfaceStep.fields?.length">
-                  <div class="scenario-step-config-form">
-                    <div
-                      v-for="field in selectedInterfaceStep.fields"
-                      v-show="isStepFieldVisible(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
-                      :key="`step-config-${selectedInterfaceStep.key}-${field.key}`"
-                      class="scenario-step-config-row"
-                    >
-                      <label>
-                        <span>{{ field.label }}</span>
-                        <code>{{ field.key }}</code>
-                      </label>
-                      <el-select
-                        v-if="field.type === 'select'"
-                        v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
-                        class="scenario-step-config-input"
-                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
-                      >
-                        <el-option
-                          v-for="option in field.options || []"
-                          :key="`step-config-opt-${selectedInterfaceStep.key}-${field.key}-${option.value}`"
-                          :label="option.label"
-                          :value="option.value"
-                        />
-                      </el-select>
-                      <el-input
-                        v-else-if="field.type === 'number'"
-                        v-model.number="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
-                        type="number"
-                        class="scenario-step-config-input"
-                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
-                      />
-                      <el-input
-                        v-else-if="field.type === 'textarea'"
-                        v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
-                        type="textarea"
-                        :autosize="field.autosize || { minRows: 4, maxRows: 10 }"
-                        :placeholder="field.placeholder || ''"
-                        class="scenario-step-config-input"
-                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
-                      />
-                      <el-input
-                        v-else
-                        v-model="getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep)[field.key]"
-                        class="scenario-step-config-input"
-                        :disabled="isStepFieldDisabled(field, getScenarioStepOverrideDraft(activeInterfaceScenario.key, selectedInterfaceStep))"
-                      />
-                      <small v-if="field.hint" class="scenario-step-config-note">{{ field.hint }}</small>
-                    </div>
-                  </div>
-                  <div v-if="isAuthenticated" class="scenario-step-config-actions">
-                    <el-button
-                      type="primary"
-                      :loading="scenarioStepOverrideSaving[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]"
-                      @click="saveScenarioStepOverrideForStep(activeInterfaceScenario.key, selectedInterfaceStep)"
-                    >保存参数</el-button>
-                    <el-button
-                      plain
-                      :disabled="!scenarioStepOverrides[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]"
-                      @click="resetScenarioStepOverrideForStep(activeInterfaceScenario.key, selectedInterfaceStep)"
-                    >重置为默认</el-button>
-                    <span
-                      v-if="scenarioStepOverrides[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]"
-                      class="scenario-step-config-hint"
-                    >已保存自定义参数，下次执行场景会自动使用</span>
-                    <span v-else class="scenario-step-config-hint">未保存，执行时使用默认值</span>
-                  </div>
-                  <div v-else class="scenario-step-config-actions">
-                    <span class="scenario-step-config-hint">
-                      {{ scenarioStepOverrides[scenarioStepOverrideKey(activeInterfaceScenario.key, selectedInterfaceStep.key)]
-                        ? '当前使用已保存参数（只读）'
-                        : '当前使用默认参数（登录后可修改并保存）' }}
-                    </span>
-                  </div>
-                </template>
-                <div v-else-if="getScenarioStepDescription(selectedInterfaceStep).fields.length" class="scenario-field-summary">
-                  <div
-                    v-for="field in getScenarioStepDescription(selectedInterfaceStep).fields"
-                    :key="`step-editor-field-${selectedInterfaceStep.key}-${field.prop}`"
-                  >
-                    <strong>{{ field.label }}</strong>
-                    <code>{{ field.prop }}</code>
-                    <span>{{ field.type }}</span>
-                  </div>
-                </div>
-                <div v-else class="response-empty">该步骤没有可配置参数。</div>
-                <div v-if="interfacePageMode !== 'debug' && isAdmin && selectedInterfaceStep" class="scenario-step-admin-actions">
-                  <el-button
-                    plain
-                    :icon="Plus"
-                    @click="openScenarioAddStep(activeInterfaceScenario, selectedInterfaceStep)"
-                  >添加步骤</el-button>
-                  <el-button
-                    plain
-                    :icon="Edit"
-                    @click="openScenarioStepMetaEditor(activeInterfaceScenario, selectedInterfaceStep)"
-                  >编辑步骤</el-button>
-                  <el-button
-                    plain
-                    type="danger"
-                    :icon="Delete"
-                    @click="hideScenarioStepMeta(activeInterfaceScenario, selectedInterfaceStep)"
-                  >删除步骤</el-button>
-                </div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'body'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>MockAPI Request Body</strong>
-                  <el-tag size="small" effect="plain">本地封装层预览</el-tag>
-                </div>
-                <pre>{{ JSON.stringify(getDebugStepPayload(selectedInterfaceStep), null, 2) }}</pre>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'headers'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>MockAPI Request Headers</strong>
-                  <el-tag size="small" effect="plain">本地封装层预览</el-tag>
-                </div>
-                <pre>{{ JSON.stringify({ 'Content-Type': 'application/json' }, null, 2) }}</pre>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'response'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>Response</strong>
-                  <el-tag
-                    size="small"
-                    :type="getScenarioResponseState(selectedInterfaceStep).type"
-                    effect="plain"
-                  >{{ getScenarioResponseState(selectedInterfaceStep).label }}</el-tag>
-                  <span v-if="scenarioStepResults[selectedInterfaceStep.key]?.durationMs != null" class="response-meta">
-                    {{ formatStepDuration(scenarioStepResults[selectedInterfaceStep.key].durationMs) }}
-                  </span>
-                  <button
-                    v-if="getScenarioStepResponse(selectedInterfaceStep)"
-                    class="response-copy"
-                    type="button"
-                    title="复制响应"
-                    @click="copyResponseText(getScenarioStepResponse(selectedInterfaceStep))"
-                  >
-                    <el-icon><DocumentCopy /></el-icon>
-                    <span>复制</span>
-                  </button>
-                </div>
-                <pre v-if="getScenarioStepResponse(selectedInterfaceStep)">{{ JSON.stringify(getScenarioStepResponse(selectedInterfaceStep), null, 2) }}</pre>
-                <div v-else class="response-empty">执行该步骤后在这里查看最新响应。</div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'actualBody'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>实际请求体</strong>
-                  <div class="response-block-actions">
-                    <el-tag size="small" effect="plain">{{ interfacePageMode === 'debug' ? '编辑上游 URL 和 body 后发送' : '场景执行时发往上游的真实 body' }}</el-tag>
-                    <button
-                      v-if="interfacePageMode === 'debug'"
-                      class="response-copy"
-                      type="button"
-                      title="格式化 JSON"
-                      @click="prettifyDebugJsonDraft('body')"
-                    >
-                      <span>格式化 JSON</span>
-                    </button>
-                  </div>
-                </div>
-                <template v-if="interfacePageMode === 'debug'">
-                  <el-input
-                    v-model="debugRequestBodyText"
-                    type="textarea"
-                    :autosize="{ minRows: 18, maxRows: 34 }"
-                    class="debug-json-editor"
-                    spellcheck="false"
-                    placeholder="{ }"
-                  />
-                </template>
-                <template v-else-if="getScenarioStepActualRequests(selectedInterfaceStep).length">
-                  <div
-                    v-for="(req, idx) in getScenarioStepActualRequests(selectedInterfaceStep)"
-                    :key="`actual-body-${selectedInterfaceStep.key}-${idx}`"
-                    class="actual-request-item"
-                  >
-                    <div class="actual-request-meta">
-                      <el-tag
-                        v-if="getScenarioStepActualRequests(selectedInterfaceStep).length > 1"
-                        size="small"
-                        effect="plain"
-                      >#{{ idx + 1 }}</el-tag>
-                      <code class="actual-request-method">{{ req.method || 'POST' }}</code>
-                      <span class="actual-request-url">{{ req.url || '-' }}</span>
-                    </div>
-                    <pre>{{ req.body == null ? '(无 body)' : (typeof req.body === 'string' ? req.body : JSON.stringify(req.body, null, 2)) }}</pre>
-                  </div>
-                </template>
-                <div v-else class="response-empty">执行该步骤后可在这里查看真正发往上游的请求体。</div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'actualHeaders'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>实际请求头</strong>
-                  <div class="response-block-actions">
-                    <el-tag size="small" effect="plain">{{ interfacePageMode === 'debug' ? '编辑发往上游的 headers' : '场景执行时发往上游的真实 headers' }}</el-tag>
-                    <button
-                      v-if="interfacePageMode === 'debug'"
-                      class="response-copy"
-                      type="button"
-                      title="格式化 JSON"
-                      @click="prettifyDebugJsonDraft('headers')"
-                    >
-                      <span>格式化 JSON</span>
-                    </button>
-                  </div>
-                </div>
-                <template v-if="interfacePageMode === 'debug'">
-                  <el-input
-                    v-model="debugRequestHeadersText"
-                    type="textarea"
-                    :autosize="{ minRows: 14, maxRows: 28 }"
-                    class="debug-json-editor"
-                    spellcheck="false"
-                    placeholder="{ }"
-                  />
-                </template>
-                <template v-else-if="getScenarioStepActualRequests(selectedInterfaceStep).length">
-                  <div
-                    v-for="(req, idx) in getScenarioStepActualRequests(selectedInterfaceStep)"
-                    :key="`actual-headers-${selectedInterfaceStep.key}-${idx}`"
-                    class="actual-request-item"
-                  >
-                    <div class="actual-request-meta">
-                      <el-tag
-                        v-if="getScenarioStepActualRequests(selectedInterfaceStep).length > 1"
-                        size="small"
-                        effect="plain"
-                      >#{{ idx + 1 }}</el-tag>
-                      <code class="actual-request-method">{{ req.method || 'POST' }}</code>
-                      <span class="actual-request-url">{{ req.url || '-' }}</span>
-                    </div>
-                    <pre>{{ req.headers ? JSON.stringify(req.headers, null, 2) : '(无 headers)' }}</pre>
-                  </div>
-                </template>
-                <div v-else class="response-empty">执行该步骤后可在这里查看真正发往上游的请求头。</div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'actualQuery'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>Query</strong>
-                  <div class="response-block-actions">
-                    <el-tag size="small" effect="plain">发送时会拼接到实际上游 URL</el-tag>
-                    <button
-                      class="response-copy"
-                      type="button"
-                      title="格式化 JSON"
-                      @click="prettifyDebugJsonDraft('query')"
-                    >
-                      <span>格式化 JSON</span>
-                    </button>
-                  </div>
-                </div>
-                <el-input
-                  v-model="debugRequestQueryText"
-                  type="textarea"
-                  :autosize="{ minRows: 10, maxRows: 22 }"
-                  class="debug-json-editor"
-                  spellcheck="false"
-                  placeholder="{ }"
-                />
-              </section>
-
-              <section v-else-if="stepFocusTab === 'actualResponse'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>实际响应体</strong>
-                  <el-tag size="small" effect="plain">上游返回的真实 body</el-tag>
-                </div>
-                <template v-if="getScenarioStepActualResponses(selectedInterfaceStep).length">
-                  <div
-                    v-for="(resp, idx) in getScenarioStepActualResponses(selectedInterfaceStep)"
-                    :key="`actual-response-${selectedInterfaceStep.key}-${idx}`"
-                    class="actual-request-item"
-                  >
-                    <div class="actual-request-meta">
-                      <el-tag
-                        v-if="getScenarioStepActualResponses(selectedInterfaceStep).length > 1"
-                        size="small"
-                        effect="plain"
-                      >#{{ idx + 1 }}</el-tag>
-                      <code class="actual-request-method">{{ resp.status_code || 'HTTP' }}</code>
-                      <span class="actual-request-url">response body</span>
-                    </div>
-                    <pre>{{ resp.body == null ? '(无 body)' : (typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body, null, 2)) }}</pre>
-                  </div>
-                </template>
-                <div v-else class="response-empty">执行该步骤后可在这里查看真正的上游响应体。</div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'actualResponseHeaders'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>实际响应头</strong>
-                  <el-tag size="small" effect="plain">上游返回的真实 headers</el-tag>
-                </div>
-                <template v-if="getScenarioStepActualResponses(selectedInterfaceStep).length">
-                  <div
-                    v-for="(resp, idx) in getScenarioStepActualResponses(selectedInterfaceStep)"
-                    :key="`actual-response-headers-${selectedInterfaceStep.key}-${idx}`"
-                    class="actual-request-item"
-                  >
-                    <div class="actual-request-meta">
-                      <el-tag
-                        v-if="getScenarioStepActualResponses(selectedInterfaceStep).length > 1"
-                        size="small"
-                        effect="plain"
-                      >#{{ idx + 1 }}</el-tag>
-                      <code class="actual-request-method">{{ resp.status_code || 'HTTP' }}</code>
-                      <span class="actual-request-url">response headers</span>
-                    </div>
-                    <pre>{{ resp.headers ? JSON.stringify(resp.headers, null, 2) : '(无 headers)' }}</pre>
-                  </div>
-                </template>
-                <div v-else class="response-empty">执行该步骤后可在这里查看真正的上游响应头。</div>
-              </section>
-
-              <section v-else-if="stepFocusTab === 'logic'" class="step-editor-panel response-block">
-                <div class="response-block-head">
-                  <strong>底层逻辑</strong>
-                  <el-tag size="small" effect="plain">语言：{{ getScenarioStepLogic(selectedInterfaceStep)?.language || 'Python' }}</el-tag>
-                </div>
-                <div
-                  v-if="scenarioStepSourceLoading[getScenarioStepSourceEndpoint(selectedInterfaceStep)]"
-                  class="response-empty"
-                >正在读取后端 Python 源码...</div>
-                <div
-                  v-else-if="scenarioStepSourceErrors[getScenarioStepSourceEndpoint(selectedInterfaceStep)]"
-                  class="response-empty"
-                >{{ scenarioStepSourceErrors[getScenarioStepSourceEndpoint(selectedInterfaceStep)] }}</div>
-                <template v-else-if="getScenarioStepLogic(selectedInterfaceStep)?.blocks?.length">
-                  <div
-                    v-for="(block, idx) in getScenarioStepLogic(selectedInterfaceStep).blocks"
-                    :key="`step-source-${selectedInterfaceStep.key}-${idx}`"
-                    class="scenario-source-card"
-                  >
-                    <div class="scenario-source-meta">
-                      <strong>{{ block.title }}</strong>
-                      <span>{{ block.file }}:{{ block.start_line }}</span>
-                      <code>{{ block.function }}</code>
-                    </div>
-                    <pre>{{ block.source }}</pre>
-                  </div>
-                </template>
-                <div v-else class="response-empty">这个步骤没有匹配到后端路由源码。</div>
-              </section>
-            </section>
-          </template>
-
-          <section v-else-if="interfacePageMode === 'report'" class="scenario-panel">
-            <div class="scenario-panel-head">
-              <strong>执行历史</strong>
-              <span>本机持续保留服务端执行记录。</span>
-            </div>
-            <div v-if="scenarioExecutionHistory.length === 0" class="scenario-empty">暂无执行历史。</div>
-            <div v-for="item in scenarioExecutionHistory" :key="item.id" class="scenario-history-row">
-              <el-tag :type="item.status === '完成' ? 'success' : item.status === '未执行' ? 'warning' : 'danger'" effect="plain">{{ item.status }}</el-tag>
-              <strong>{{ item.scenario }}</strong>
-              <span>{{ item.env }}</span>
-              <span>{{ item.at }}</span>
-              <span>成功 {{ item.success }} / 跳过 {{ item.skipped }} / 失败 {{ item.failed }}</span>
-              <code>{{ item.duration }}</code>
-              <el-button size="small" plain @click="openScenarioHistoryDetail(item)">详情</el-button>
-            </div>
-          </section>
-        </main>
-      </div>
-
-      <el-dialog v-model="scenarioMetaEditVisible" title="编辑场景信息" width="520px" append-to-body>
-        <el-form label-position="top">
-          <el-form-item label="场景名称">
-            <el-input v-model="scenarioMetaEditForm.name" placeholder="场景显示名" maxlength="120" show-word-limit />
-          </el-form-item>
-          <el-form-item label="场景描述">
-            <el-input
-              v-model="scenarioMetaEditForm.description"
-              type="textarea"
-              :rows="4"
-              placeholder="场景说明，例如：完整 FP USD 500K 接口自动化场景"
-              maxlength="600"
-              show-word-limit
-            />
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <el-button @click="scenarioMetaEditVisible = false">取消</el-button>
-          <el-button type="primary" :loading="scenarioMetaEditSaving" @click="saveScenarioMetaEditor">保存</el-button>
-        </template>
-      </el-dialog>
-
-      <el-dialog v-model="scenarioStepMetaEditVisible" title="编辑步骤" width="520px" append-to-body>
-        <el-form label-position="top">
-          <el-form-item label="步骤名称">
-            <el-input v-model="scenarioStepMetaEditForm.title" placeholder="步骤显示名" maxlength="120" show-word-limit />
-          </el-form-item>
-          <el-form-item label="步骤描述">
-            <el-input
-              v-model="scenarioStepMetaEditForm.description"
-              type="textarea"
-              :rows="4"
-              placeholder="步骤说明，仅影响前端展示"
-              maxlength="600"
-              show-word-limit
-            />
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <el-button
-            plain
-            :loading="scenarioStepMetaEditDeleting"
-            @click="resetScenarioStepMetaEditor"
-          >恢复默认</el-button>
-          <el-button @click="scenarioStepMetaEditVisible = false">取消</el-button>
-          <el-button type="primary" :loading="scenarioStepMetaEditSaving" @click="saveScenarioStepMetaEditor">保存</el-button>
-        </template>
-      </el-dialog>
-
-      <el-dialog v-model="scenarioAddStepVisible" title="在下一步添加步骤" width="520px" append-to-body>
-        <el-form label-position="top">
-          <el-form-item label="复制哪个步骤">
-            <el-select v-model="scenarioAddStepForm.sourceStepKey" style="width: 100%">
-              <el-option
-                v-for="step in (interfaceScenarios.find((item) => item.key === scenarioAddStepForm.scenarioKey)?.steps || [])"
-                :key="`add-source-${step.key}`"
-                :label="step.title"
-                :value="step.key"
-              />
-            </el-select>
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <el-button @click="scenarioAddStepVisible = false">取消</el-button>
-          <el-button type="primary" @click="addScenarioStepAfter">添加到草稿</el-button>
-        </template>
-      </el-dialog>
-    </section>
-
-    <section v-else-if="currentView === 'aiUi'" class="tool-page-view ai-ui-view">
-      <header class="tool-page-head ai-ui-page-head">
-        <div class="head-copy">
-          <span class="eyebrow"><span class="eyebrow-dot"></span>Midscene.js</span>
-          <h2>AI UI 自动化</h2>
-          <p>用自然语言描述页面动作和视觉断言，独立执行浏览器 UI 测试。</p>
-        </div>
-        <div class="ai-ui-head-actions">
-          <div class="ai-ui-page-switch" role="tablist" aria-label="AI UI 页面切换">
-            <button
-              v-for="mode in aiUiPageModes"
-              :key="mode.key"
-              type="button"
-              role="tab"
-              :aria-selected="aiUiPageMode === mode.key"
-              :class="{ active: aiUiPageMode === mode.key }"
-              @click="switchAiUiPageMode(mode.key)"
-            >{{ mode.label }}</button>
-          </div>
-          <el-tag :type="aiUiRuntime?.dependencies && aiUiRuntime?.configured ? 'success' : 'warning'" effect="plain">
-            {{ aiUiRuntime?.dependencies && aiUiRuntime?.configured ? '运行环境就绪' : '需要配置运行环境' }}
-          </el-tag>
-          <el-button plain :icon="Refresh" :loading="aiUiLoading" @click="refreshAiUiPage">刷新</el-button>
-          <el-button plain @click="backToConsole">返回控制台</el-button>
-        </div>
-      </header>
-
-      <div v-if="aiUiError" class="ai-ui-error">{{ aiUiError }}</div>
-      <template v-if="aiUiPageMode === 'cases'">
-      <div class="ai-ui-layout">
-        <aside class="ai-ui-case-list surface-card">
-          <div class="ai-ui-section-head">
-            <div><strong>用例</strong><span>{{ aiUiCases.length }} 条</span></div>
-            <el-button type="primary" plain :icon="Plus" @click="resetAiUiForm">新建</el-button>
-          </div>
-          <div v-if="!aiUiCases.length" class="ai-ui-empty">还没有 AI UI 用例，先创建一个页面冒烟用例。</div>
-          <button
-            v-for="item in aiUiCases"
-            :key="item.id"
-            type="button"
-            class="ai-ui-case-item"
-            :class="{ active: item.id === aiUiSelectedCaseId }"
-            @click="editAiUiCase(item)"
-          >
-            <strong>{{ item.name }}</strong>
-            <small>{{ item.url }}</small>
-            <div class="ai-ui-case-meta">
-              <el-tag size="small" effect="plain">{{ aiUiEnvironmentLabel(item.environment || inferAiUiEnvironment(item.url)) }}</el-tag>
-              <span>{{ item.updated_at || item.created_at }}</span>
-            </div>
-          </button>
-        </aside>
-
-        <main class="ai-ui-editor surface-card">
-          <div class="ai-ui-section-head">
-            <div>
-              <strong>{{ aiUiForm.id ? '编辑 UI 用例' : '新建 UI 用例' }}</strong>
-              <span>步骤使用 Midscene Gherkin：Given / When / Then / And</span>
-            </div>
-            <div class="ai-ui-editor-actions">
-              <el-button
-                type="success"
-                plain
-                :disabled="!aiUiForm.id || Boolean(aiUiActiveRunId)"
-                @click="runAiUiCase()"
-              >执行</el-button>
-            </div>
-          </div>
-          <section class="ai-ui-generator">
-            <div class="ai-ui-generator-head">
-              <div>
-                <strong>自然语言生成结构化用例</strong>
-                <span>先描述场景，生成后可继续编辑，再保存执行。</span>
-              </div>
-              <el-button type="primary" plain :loading="aiUiGenerating" @click="generateAiUiStructuredCase">生成 YAML</el-button>
-            </div>
-            <el-input
-              v-model="aiUiNaturalLanguage"
-              type="textarea"
-              :rows="3"
-              placeholder="例如：UAT 手机号注册进入安全设置页，填写密码，选择第一个安全问题并输入 test，不要提交。"
-            />
-          </section>
-          <el-form label-position="top" class="ai-ui-form">
-            <el-form-item label="用例名称">
-              <el-input v-model.trim="aiUiForm.name" maxlength="200" />
-            </el-form-item>
-            <el-form-item label="运行环境">
-              <el-select
-                v-model="aiUiForm.environment"
-                aria-label="AI UI 运行环境"
-                @change="handleAiUiEnvironmentChange"
-              >
-                <el-option
-                  v-for="option in aiUiEnvironmentOptions"
-                  :key="`ai-ui-env-${option.value}`"
-                  :label="option.label"
-                  :value="option.value"
-                />
-              </el-select>
-              <span class="ai-ui-field-hint">选择环境后自动填充 OFFLINE_SIGNUP_URL_DICT 对应地址。</span>
-            </el-form-item>
-            <el-form-item label="目标 URL">
-              <el-input
-                v-model.trim="aiUiForm.url"
-                :disabled="aiUiForm.environment !== 'custom'"
-                placeholder="https://uat.example.com 或 http://127.0.0.1:8000"
-              />
-            </el-form-item>
-            <el-form-item label="测试上下文">
-              <el-input v-model="aiUiForm.context" type="textarea" :rows="3" placeholder="补充业务背景、页面规则和不应点击的区域。" />
-            </el-form-item>
-            <el-form-item label="自然语言步骤">
-              <el-input v-model="aiUiForm.prompt" type="textarea" :rows="14" class="ai-ui-prompt-input" />
-            </el-form-item>
-            <div class="ai-ui-structured-grid">
-              <el-form-item label="结构化 YAML（生成预览）">
-                <el-input v-model="aiUiStructuredYaml" type="textarea" :rows="10" class="ai-ui-prompt-input" />
-              </el-form-item>
-              <el-form-item label="变量 JSON">
-                <el-input v-model="aiUiVariablesText" type="textarea" :rows="10" class="ai-ui-prompt-input" />
-              </el-form-item>
-            </div>
-            <div class="ai-ui-options">
-              <el-form-item label="浏览器">
-                <el-switch v-model="aiUiForm.headed" active-text="显示浏览器" inactive-text="无头执行" />
-              </el-form-item>
-              <el-form-item label="视口宽度">
-                <el-input-number v-model="aiUiForm.viewport.width" :min="800" :max="2560" />
-              </el-form-item>
-              <el-form-item label="视口高度">
-                <el-input-number v-model="aiUiForm.viewport.height" :min="600" :max="1600" />
-              </el-form-item>
-            </div>
-          </el-form>
-          <div class="ai-ui-footer-actions">
-            <div class="ai-ui-footer-action-buttons">
-              <el-button type="primary" plain :loading="aiUiSaving" @click="saveAiUiCaseRecord">保存用例</el-button>
-              <el-button v-if="aiUiForm.id" type="danger" plain @click="removeAiUiCase(aiUiForm)">删除用例</el-button>
-            </div>
-            <span>执行结果会保留在右侧历史中，Midscene 会生成 HTML 报告。</span>
-          </div>
-        </main>
-      </div>
-      </template>
-
-      <section v-else class="ai-ui-report-page surface-card">
-        <div class="ai-ui-report-head">
-          <div>
-            <strong>执行历史</strong>
-            <span>查看 AI UI 案例的最近执行状态与 Midscene 报告。</span>
-          </div>
-          <el-button plain :icon="Refresh" :loading="aiUiLoading" @click="refreshAiUiPage">刷新历史</el-button>
-        </div>
-        <div v-if="!aiUiRuns.length" class="ai-ui-empty">暂无执行历史，先到“案例”页保存并执行一个用例。</div>
-        <div v-else class="ai-ui-report-list">
-          <article v-for="run in aiUiRuns" :key="run.id" class="ai-ui-report-row">
-            <div class="ai-ui-report-main">
-              <div class="ai-ui-report-title">
-                <strong>{{ run.case_name }}</strong>
-                <el-tag
-                  size="small"
-                  effect="plain"
-                  :type="run.status === 'passed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'warning' : 'info'"
-                >
-                  {{ run.status === 'passed' ? '通过' : run.status === 'failed' ? '失败' : run.status === 'running' ? '执行中' : '已停止' }}
-                </el-tag>
-              </div>
-              <div class="ai-ui-report-meta">
-                <span>开始 {{ run.started_at || '-' }}</span>
-                <span>结束 {{ run.finished_at || '-' }}</span>
-                <span>环境 {{ aiUiEnvironmentLabel(run.environment) }}</span>
-              </div>
-              <pre v-if="run.error" class="ai-ui-run-error">{{ run.error }}</pre>
-              <div v-if="run.result?.analysis" class="ai-ui-run-analysis">
-                <strong>AI 结果解析</strong>
-                <span>{{ run.result.analysis.summary }}</span>
-                <span v-if="run.result.analysis.blocker">卡点：{{ run.result.analysis.blocker }}</span>
-                <span v-if="run.result.analysis.suggestion">建议：{{ run.result.analysis.suggestion }}</span>
-              </div>
-            </div>
-            <div class="ai-ui-report-actions">
-              <el-button v-if="run.status === 'running'" size="small" type="warning" plain @click="stopAiUiCaseRun(run)">停止</el-button>
-              <el-button
-                v-if="run.result?.report_url"
-                size="small"
-                type="primary"
-                plain
-                @click="openAiUiReport(`${run.result.report_url}?username=${encodeURIComponent(authUser.username)}`)"
-              >打开报告</el-button>
-              <el-button
-                v-if="run.result?.report_url"
-                size="small"
-                plain
-                @click="openAiUiReport(`/api/ai-ui/runs/${encodeURIComponent(run.id)}/sop?username=${encodeURIComponent(authUser.username)}`)"
-              >导出 SOP</el-button>
-              <el-button size="small" plain @click="switchAiUiPageMode('cases')">查看案例</el-button>
-            </div>
-          </article>
-        </div>
-        <div class="ai-ui-runtime">
-          <strong>运行环境</strong>
-          <span>Node.js：{{ aiUiRuntime?.node ? '已找到' : '未找到' }}</span>
-          <span>Midscene / Playwright：{{ aiUiRuntime?.dependencies ? '已安装' : '未安装' }}</span>
-          <span>视觉模型：{{ aiUiRuntime?.configured ? '已配置' : '未配置' }}</span>
-          <code v-if="aiUiRuntime && !aiUiRuntime.dependencies">{{ aiUiRuntime.install_command }}</code>
-        </div>
-      </section>
-      <el-dialog v-model="aiUiRunConfirmVisible" title="执行前确认" width="520px" append-to-body>
-        <div class="ai-ui-confirm">
-          <p>即将执行用例：<strong>{{ aiUiPendingCase?.name || '-' }}</strong></p>
-          <p>环境：<strong>{{ aiUiEnvironmentLabel(aiUiPendingCase?.environment) }}</strong></p>
-          <p>目标地址：<code>{{ aiUiPendingCase?.url || '-' }}</code></p>
-          <p>执行会启动独立 Chromium，并按当前 Gherkin 步骤操作页面。</p>
-        </div>
-        <template #footer>
-          <el-button @click="aiUiRunConfirmVisible = false">取消</el-button>
-          <el-button type="primary" @click="confirmAiUiRun">确认执行</el-button>
-        </template>
-      </el-dialog>
-    </section>
-
-    <section v-else-if="currentView === 'mockApi' && isAdmin" class="tool-page-view mock-api-view">
-      <header class="tool-page-head">
-        <div class="head-copy">
-          <span class="eyebrow">
-            <span class="eyebrow-dot"></span>
-            Mock API
-          </span>
-          <h2>Mock 接口</h2>
-          <p>集中维护 DS-CNY 的经营数据参数和企业信息模板，保存后会同步到接口测试的对应下拉框。</p>
-        </div>
-        <el-button plain :icon="Refresh" @click="openInterfaceTestView">返回接口测试</el-button>
-      </header>
-
-      <el-card shadow="never" class="surface-card mock-api-card">
-        <div class="mock-api-endpoint">
-          <div>
-            <span class="mock-api-method">POST</span>
-            <code>/api/mock/shop-performance-cny-boost</code>
-          </div>
-          <span class="mock-api-count">{{ shopPerformancePresets.length }} 条店铺记录</span>
-        </div>
-        <div class="mock-api-summary-record">
-          <div>
-            <strong>经营数据参数配置</strong>
-            <span>已反显 {{ shopPerformancePresets.length }} 条店铺记录，可进入详情编辑内置配置或新增记录。</span>
-          </div>
-          <el-button type="primary" plain :icon="Edit" @click="openShopPerformanceManager">编辑配置</el-button>
-        </div>
-      </el-card>
-
-      <el-card shadow="never" class="surface-card mock-api-card">
-        <div class="mock-api-endpoint">
-          <div class="mock-api-linked-endpoints">
-            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-business-profile</code></span>
-            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-director-info</code></span>
-            <span><span class="mock-api-method">POST</span><code>/api/mock/fp-add-contact-information</code></span>
-          </div>
-          <span class="mock-api-count">{{ dowsureCnyCompanyTemplates.length }} 个公司模板</span>
-        </div>
-        <div class="mock-api-summary-record">
-          <div>
-            <strong>三接口公司模板配置</strong>
-            <span>
-              已配置 {{ dowsureCnyCompanyTemplates.length }} 条记录：{{ dowsureCnyCompanyTemplates.map((item) => item.name).join('、') }}
-            </span>
-          </div>
-          <el-button type="primary" plain :icon="Edit" @click="openDowsureCompanyTemplateManager">编辑配置</el-button>
-        </div>
-      </el-card>
-
-      <el-card shadow="never" class="surface-card mock-api-card">
-        <div class="mock-api-endpoint">
-          <div class="mock-api-linked-endpoints">
-            <span><span class="mock-api-method">IMAGE</span><code>/api/mock/fp-business-profile</code></span>
-            <span><span class="mock-api-method">IMAGE</span><code>/api/mock/fp-director-info</code></span>
-          </div>
-          <span class="mock-api-count">{{ companyImageTemplates.length }} 个图片配置</span>
-        </div>
-        <div class="mock-api-summary-record">
-          <div>
-            <strong>三接口公司图片配置</strong>
-            <span>上传企业营业执照、法人身份证正面和反面，保存后同步到接口测试的图片下拉框。</span>
-          </div>
-          <el-button type="primary" plain :icon="Edit" @click="openCompanyImageManager">编辑配置</el-button>
-        </div>
-      </el-card>
-
+    <template v-else-if="currentView === 'mockApi' && isAdmin">
+      <MockApiView
+        :shop-performance-presets="shopPerformancePresets"
+        :company-templates="dowsureCnyCompanyTemplates"
+        :company-image-templates="companyImageTemplates"
+        @back="openInterfaceTestView"
+        @edit-shop-performance="openShopPerformanceManager"
+        @edit-company-templates="openDowsureCompanyTemplateManager"
+        @edit-company-images="openCompanyImageManager"
+      />
       <el-dialog
         v-model="shopPerformanceManagerVisible"
         title="经营数据参数详情"
@@ -10048,7 +8786,7 @@ function buildAiContext() {
         class="mock-api-manager-dialog"
       >
         <div class="mock-api-dialog-toolbar">
-          <span>已反显16条内置店铺记录；编辑后保存同名 SQL 覆盖，不修改则继续使用后端原配置。</span>
+          <span>已反显 {{ shopPerformancePresets.length }} 条内置店铺记录；编辑后保存同名 SQL 覆盖，不修改则继续使用后端原配置。</span>
           <el-button type="primary" plain :icon="Plus" @click="startNewShopPerformancePreset">新增记录</el-button>
         </div>
         <div class="mock-api-preset-list">
@@ -10260,671 +8998,81 @@ function buildAiContext() {
           </div>
         </div>
       </el-dialog>
-    </section>
+    </template>
 
-    <section v-else-if="currentView === 'activity'" class="tool-page-view activity-page-view">
-      <header class="tool-page-head">
-        <div class="head-copy">
-          <span class="eyebrow">
-            <span class="eyebrow-dot"></span>
-            Usage Log
-          </span>
-          <h2>使用日志</h2>
-          <p>{{ isAdmin ? '管理员可查看所有人的历史操作记录。' : '当前账号的历史 mock 操作记录，可按手机号或 Session ID 过滤。' }}</p>
-        </div>
-        <el-button :icon="Refresh" plain :loading="auditLoading" @click="refreshAuditOperations">刷新</el-button>
-      </header>
+    <ActivityView
+      v-else-if="currentView === 'activity'"
+      v-model:query="auditQuery"
+      :operations="auditOperations"
+      :stats="auditStats"
+      :is-admin="isAdmin"
+      :loading="auditLoading"
+      :error="auditError"
+      @refresh="refreshAuditOperations"
+      @reset="resetAuditQuery"
+    />
 
-      <el-card shadow="never" class="surface-card activity-page-card">
-        <div class="usage-log-stats">
-          <article v-for="stat in auditStats" :key="stat.label" class="usage-log-stat">
-            <span>{{ stat.label }}</span>
-            <strong>{{ stat.value }}</strong>
-            <small>{{ stat.hint }}</small>
-          </article>
-        </div>
+    <EnvironmentMonitorView
+      v-else-if="currentView === 'environmentMonitor'"
+      :monitor="environmentMonitor"
+      :refresh-seconds="environmentMonitorRefreshSeconds"
+      :loading="environmentMonitorLoading"
+      :error="environmentMonitorError"
+      @refresh="refreshEnvironmentMonitor(true)"
+    />
 
-        <el-form class="audit-query-form" :inline="true" @submit.prevent="refreshAuditOperations">
-          <el-form-item label="手机号">
-            <el-input
-              v-model.trim="auditQuery.phone_number"
-              placeholder="8 位或 11 位手机号"
-              clearable
-              @keydown.enter.prevent="refreshAuditOperations"
-            />
-          </el-form-item>
-          <el-form-item label="Session ID">
-            <el-input
-              v-model.trim="auditQuery.session_id"
-              placeholder="UUID"
-              clearable
-              @keydown.enter.prevent="refreshAuditOperations"
-            />
-          </el-form-item>
-          <el-form-item>
-            <el-button type="primary" :icon="Search" :loading="auditLoading" @click="refreshAuditOperations">
-              查询
-            </el-button>
-            <el-button :icon="Refresh" plain @click="resetAuditQuery">重置</el-button>
-          </el-form-item>
-        </el-form>
+    <AboutView v-else-if="currentView === 'about'" @back="backToConsole" />
 
-        <p v-if="auditError" class="login-error">{{ auditError }}</p>
+    <ContactView
+      v-else-if="currentView === 'contact'"
+      v-model:issue-text="contactForm.issue"
+      :issues="contactIssues"
+      :env="sessionSummary?.env || connectionForm.env"
+      :phone-number="sessionSummary?.phone_number || connectionForm.phone_number || ''"
+      :session-id="activeSessionId || ''"
+      @back="backToConsole"
+      @submit="submitContactIssue"
+    />
 
-        <div class="activity-list">
-          <div v-if="!auditLoading && auditOperations.length === 0" class="session-empty">
-            <span class="session-empty__icon">
-              <el-icon><Clock /></el-icon>
-            </span>
-            <p class="session-empty__title">还没有操作记录</p>
-            <p class="session-empty__hint">登录、连接 session、执行 mock 等操作后会在这里出现。</p>
-          </div>
-          <div v-for="item in auditOperations" :key="item.id" class="activity-item">
-            <div class="activity-summary-row">
-              <span
-                class="activity-status-line"
-                :class="{
-                  success: item.success === true,
-                  failed: item.success === false,
-                }"
-              ></span>
-              <div class="activity-summary-main">
-                <div class="activity-head">
-                  <div class="activity-title-group">
-                    <strong>{{ item.operation_name || 'operation' }}</strong>
-                    <el-tag v-if="item.success === false" size="small" type="danger" effect="plain">失败</el-tag>
-                    <el-tag v-else-if="item.success === true" size="small" type="success" effect="plain">成功</el-tag>
-                    <el-tag v-else size="small" type="info" effect="plain">未知</el-tag>
-                  </div>
-                  <time>{{ item.created_at }}</time>
-                </div>
-                <div class="audit-meta">
-                  <span v-if="isAdmin"><b>用户</b>{{ item.username || '-' }}</span>
-                  <span><b>手机号</b>{{ item.phone_number || '-' }}</span>
-                  <span><b>Session</b>{{ item.session_id || '-' }}</span>
-                  <span><b>环境</b>{{ item.env || '-' }}</span>
-                  <span><b>Merchant</b>{{ item.merchant_id || '-' }}</span>
-                </div>
-              </div>
-              <el-button
-                class="activity-detail-toggle"
-                size="small"
-                plain
-                :icon="isAuditOperationExpanded(item.id) ? ArrowDown : ArrowRight"
-                @click="toggleAuditOperationDetail(item.id)"
-              >
-                {{ isAuditOperationExpanded(item.id) ? '收起详情' : '详情' }}
-              </el-button>
-            </div>
-            <div v-if="isAuditOperationExpanded(item.id)" class="activity-detail-panel">
-              <section>
-                <strong>Request</strong>
-                <pre>{{ formatJsonBlock(item.request_payload) }}</pre>
-              </section>
-              <section>
-                <strong>Response</strong>
-                <pre>{{ formatJsonBlock(item.response_payload) }}</pre>
-              </section>
-            </div>
-          </div>
-        </div>
-      </el-card>
+    <AiChatView
+      v-else-if="currentView === 'ai'"
+      v-model:input="aiInput"
+      v-model:exec-env="aiExecutionEnv"
+      v-model:model="aiModel"
+      v-model:reasoning-effort="aiReasoningEffort"
+      :messages="aiMessages"
+      :sending="aiSending"
+      :error="aiError"
+      :env-options="aiSqlDataSources"
+      :model-options="aiModelOptions"
+      :reasoning-options="aiReasoningOptions"
+      :quick-prompts="aiQuickPrompts"
+      :context="{
+        sessionId: activeSessionId,
+        env: sessionSummary?.env || connectionForm.env,
+        phoneNumber: sessionSummary?.phone_number || connectionForm.phone_number,
+        merchantId: sessionSummary?.merchant_id,
+        logStatus: logStatusText,
+      }"
+      @send="handleAiSend"
+      @clear="clearAiChat"
+      @back="backToConsole"
+    />
 
-    </section>
-
-    <section v-else-if="currentView === 'environmentMonitor'" class="tool-page-view environment-monitor-view">
-      <header class="tool-page-head">
-        <div class="head-copy">
-          <span class="eyebrow">
-            <span class="eyebrow-dot"></span>
-            Environment Monitor
-          </span>
-          <h2>环境监测</h2>
-          <p>网关检测 / 请求测试健康度。</p>
-        </div>
-        <div class="environment-monitor-actions">
-          <el-tag type="info" effect="plain">自动刷新：{{ environmentMonitorRefreshSeconds }}s</el-tag>
-          <el-button :icon="Refresh" plain :loading="environmentMonitorLoading" @click="refreshEnvironmentMonitor(true)">刷新</el-button>
-        </div>
-      </header>
-
-      <el-card shadow="never" class="surface-card environment-monitor-card">
-        <template #header>
-          <div class="card-head environment-monitor-head">
-            <div class="head-copy">
-              <h3>环境监测</h3>
-              <p>网关检测 / 请求测试健康度。</p>
-            </div>
-            <div class="environment-monitor-actions">
-              <span v-if="environmentMonitor.checked_at" class="environment-monitor-time">{{ environmentMonitor.checked_at }}</span>
-              <el-tag type="info" effect="plain">自动刷新：{{ environmentMonitorRefreshSeconds }}s</el-tag>
-              <el-button :icon="Refresh" plain :loading="environmentMonitorLoading" @click="refreshEnvironmentMonitor(true)">刷新</el-button>
-            </div>
-          </div>
-        </template>
-
-        <p v-if="environmentMonitorError" class="login-error">{{ environmentMonitorError }}</p>
-        <div class="environment-monitor-grid">
-          <article
-            v-for="item in environmentMonitorItems"
-            :key="item.env"
-            class="environment-card"
-            :class="environmentCardState(item)"
-          >
-            <div class="environment-card-head">
-              <div class="environment-badge">
-                <strong>{{ item.env === 'preprod' ? 'PPROD' : item.label }}</strong>
-              </div>
-              <div>
-                <h4>{{ item.display_env || item.env }}</h4>
-                <p>{{ item.base_url }}</p>
-              </div>
-              <el-tag
-                class="environment-status-tag"
-                :type="availabilityTagType(item.availability)"
-                effect="light"
-              >
-                {{ availabilityLabel(item.availability) }}
-              </el-tag>
-            </div>
-            <section class="environment-check-block channel-check-block">
-              <div class="environment-metrics">
-                <div>
-                  <span>请求延迟</span>
-                  <strong>{{ item.latency_ms ?? '-' }}<small>ms</small></strong>
-                </div>
-                <div>
-                  <span>端点 PING</span>
-                  <strong>{{ item.endpoint_ping_ms ?? '-' }}<small>ms</small></strong>
-                </div>
-              </div>
-              <div class="environment-availability" :class="availabilityState(item.availability)">
-                <span>网关可用性</span>
-                <strong>{{ item.availability ?? '--' }}<small v-if="item.availability !== null && item.availability !== undefined">%</small></strong>
-              </div>
-              <div class="environment-history" :class="{ empty: !item.history?.length }" aria-label="最近请求记录">
-                <template v-if="item.history?.length">
-                  <i
-                    v-for="(status, index) in item.history"
-                    :key="`${item.env}-gateway-${index}`"
-                    :class="status"
-                  ></i>
-                </template>
-                <span v-else>暂无历史请求样本</span>
-              </div>
-              <div class="environment-card-foot">
-                <span>最近 {{ item.sample_count || 0 }}/60 次请求</span>
-                <span>实时日志样本</span>
-              </div>
-            </section>
-
-            <section class="environment-check-block channel-check-block">
-              <div class="environment-channel-head">
-                <div>
-                  <span>渠道健康度</span>
-                </div>
-                <el-tag
-                  size="small"
-                  :type="availabilityTagType(item.channel_availability)"
-                  effect="light"
-                >
-                  {{ availabilityLabel(item.channel_availability) }}
-                </el-tag>
-              </div>
-              <div class="environment-availability" :class="availabilityState(item.channel_availability)">
-                <span>自动测试可用性</span>
-                <strong>{{ item.channel_availability ?? '--' }}<small v-if="item.channel_availability !== null && item.channel_availability !== undefined">%</small></strong>
-              </div>
-              <div class="environment-history channel" :class="{ empty: !item.channel_history?.length }" aria-label="最近 send-sms 自动测试记录">
-                <template v-if="item.channel_history?.length">
-                  <i
-                    v-for="(status, index) in item.channel_history"
-                    :key="`${item.env}-channel-${index}`"
-                    :class="status"
-                  ></i>
-                </template>
-                <span v-else>等待半小时自动测试样本</span>
-              </div>
-              <div class="environment-card-foot">
-                <span>最近 {{ item.channel_sample_count || 0 }}/60 次测试</span>
-                <span>{{ item.channel_checked_at || '启动后自动执行' }}</span>
-              </div>
-            </section>
-          </article>
-        </div>
-      </el-card>
-
-    </section>
-
-    <section v-else-if="currentView === 'about'" class="tool-page-view about-page-view">
-      <div class="log-system-head">
-        <div>
-          <p class="eyebrow">About</p>
-          <h2>关于我们</h2>
-          <p>DPU Mock API 操作台用于统一管理测试账号、会话上下文、DPU 状态模拟、日志检索和问题协作。</p>
-        </div>
-        <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-      </div>
-
-      <el-card shadow="never" class="surface-card tool-page-card help-page-card">
-        <div class="help-section help-callout">
-          <h3>工具定位</h3>
-          <p>DPU Mock API 操作台是面向 DPU 测试、联调和回归验证的内部控制台。它把账号注册、session 连接、workflow webhook 模拟、实时日志、历史日志检索和问题交接集中在同一个页面，减少脚本切换、手工拼请求和环境信息遗漏。</p>
-          <p>页面设计以执行效率和可追溯性为优先：所有关键操作都围绕当前环境、手机号、session、merchant 和接口结果展开，便于测试人员、研发和支持同学在同一上下文中定位问题。</p>
-        </div>
-        <div class="help-section">
-          <h3>适用场景</h3>
-          <ol>
-            <li>新建 SIT、UAT、REG 等环境的测试账号，并快速进入可执行 mock 的状态。</li>
-            <li>在指定 session 下模拟核保、审批、PSP、电子签、放款、还款、多店铺等 DPU 业务状态。</li>
-            <li>联调或回归时复现某个 webhook 节点，确认请求 URL、请求体、响应体和业务错误。</li>
-            <li>排查“页面显示成功但业务状态未推进”“接口 200 但业务失败”“session 失效或环境选错”等问题。</li>
-            <li>将问题现场沉淀到“联系我们”，让管理员或后续处理人能基于相同上下文继续跟进。</li>
-          </ol>
-        </div>
-        <div class="help-section">
-          <h3>标准使用流程</h3>
-          <ol>
-            <li>在“连接与注册”选择目标环境，输入手机号连接已有 session，或按 Journey、币种、资方代码注册新账号。</li>
-            <li>确认右侧“当前会话”中的环境、手机号、Merchant 等信息，避免跨环境或跨账号误操作。</li>
-            <li>进入“Mock 操作面板”，选择需要推进的业务节点，填写金额、状态、失败原因或 state 等参数。</li>
-            <li>执行后查看当前步骤下方的返回结果，同时进入“使用日志”确认请求已被记录。</li>
-            <li>如果结果异常，可先在“使用日志”查看操作请求和响应；需要确认环境可用性时进入“环境监测”。</li>
-            <li>需要交接时，在“联系我们”记录现象、预期、复现步骤、手机号、session、关键日志和截图线索。</li>
-          </ol>
-        </div>
-        <div class="help-section">
-          <h3>核心模块能力</h3>
-          <dl>
-            <dt>连接与注册</dt>
-            <dd>用于创建或连接测试账号上下文。注册支持 Journey、币种、资方代码和线上/线下模式选择；连接成功后会建立 session，后续 mock 操作都会绑定这个上下文。</dd>
-            <dt>Mock 操作面板</dt>
-            <dd>集中触发 DPU 关键业务节点，包括 SP/3PL 关联、核保、审批、PSP started/completed、电子签、放款、还款、系统事件和 Abandon。每个操作保留独立参数区，降低误填风险。</dd>
-            <dt>使用日志</dt>
-            <dd>用于追溯账号操作记录，重点查看每次 mock 操作的请求参数、响应结果、执行账号、手机号、session 和 merchant。</dd>
-            <dt>环境监测</dt>
-            <dd>用于查看 dev、reg、sit、uat、preprod 网关可用性、响应延迟和近期状态条，辅助判断是否为环境波动。</dd>
-            <dt>AI 助手</dt>
-            <dd>用于辅助分析当前 session、日志和 mock 结果，也可以帮助整理 SQL、接口现象和排查思路。AI 输出只作为诊断辅助，关键业务结论仍应以接口返回、日志和数据库状态为准。</dd>
-            <dt>联系我们</dt>
-            <dd>用于异步交接问题现场。建议写清楚环境、手机号、session、已执行步骤、预期状态、实际状态、错误日志和截图信息，方便管理员或后续处理人快速接手。</dd>
-            <dt>管理员登录</dt>
-            <dd>管理员入口已调整为“回复问题”，用于集中查看和回复已提交的问题，适合团队内部维护待处理事项、补充处理结论和保留协作记录。</dd>
-          </dl>
-        </div>
-        <div class="help-section">
-          <h3>数据与安全边界</h3>
-          <dl>
-            <dt>环境隔离</dt>
-            <dd>执行前必须确认当前环境。SIT、UAT、REG、DEV、PREPROD 的数据和网关地址不同，跨环境使用手机号或 session 会导致误判。</dd>
-            <dt>测试数据</dt>
-            <dd>本工具面向测试和联调用例，不应输入真实客户敏感信息。需要生产或迁移相关操作时，应按专项流程和授权要求执行。</dd>
-            <dt>结果判定</dt>
-            <dd>按钮执行成功只代表接口调用完成，不等同于完整业务链路成功。关键节点应结合返回体、使用日志和必要的数据库状态共同确认。</dd>
-            <dt>审计线索</dt>
-            <dd>使用日志用于辅助追溯，但不替代正式测试报告。重要验证结论仍应沉淀到 MeterSphere、缺陷单或版本验证记录中。</dd>
-          </dl>
-        </div>
-        <div class="help-section">
-          <h3>协作建议</h3>
-          <dl>
-            <dt>复现问题</dt>
-            <dd>先固定环境、手机号、session 和执行时间窗口，再描述失败节点。不要只写“失败了”，应说明停在哪一步、期望推进到哪一步。</dd>
-            <dt>提交信息</dt>
-            <dd>优先提供可直接排查的信息：环境、手机号、session_id、merchant_id、接口名称、请求时间、traceId、关键响应体和截图。</dd>
-            <dt>处理结论</dt>
-            <dd>管理员回复时建议包含原因判断、已采取动作、是否需要重试、是否需要研发介入，以及后续验证标准。</dd>
-          </dl>
-        </div>
-      </el-card>
-    </section>
-
-    <section v-else-if="currentView === 'contact'" class="tool-page-view contact-page-view">
-      <div class="log-system-head">
-        <div>
-          <p class="eyebrow">Ask Us</p>
-          <h2>联系我们</h2>
-          <p>把问题现场、期望结果和关键信息整理清楚，管理员会统一处理。</p>
-        </div>
-        <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-      </div>
-
-      <div class="contact-overview-grid">
-        <div class="contact-stat-card">
-          <span>问题总数</span>
-          <strong>{{ contactIssues.length }}</strong>
-          <p>当前浏览器已记录的问题总量</p>
-        </div>
-        <div class="contact-stat-card">
-          <span>待回复</span>
-          <strong>{{ pendingContactIssuesCount }}</strong>
-          <p>需要管理员继续处理的问题</p>
-        </div>
-        <div class="contact-stat-card">
-          <span>已回复</span>
-          <strong>{{ repliedContactIssuesCount }}</strong>
-          <p>已完成答复的问题</p>
-        </div>
-      </div>
-
-      <div class="contact-page-stack">
-        <el-card shadow="never" class="surface-card contact-admin-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h3>提交问题</h3>
-                <p>建议按“现象 + 预期 + 复现步骤 + 关键上下文”来写。</p>
-              </div>
-            </div>
-          </template>
-
-          <div class="contact-context">
-            <div><span>环境</span><strong>{{ sessionSummary?.env || connectionForm.env }}</strong></div>
-            <div><span>手机号</span><strong>{{ sessionSummary?.phone_number || connectionForm.phone_number || '-' }}</strong></div>
-            <div><span>Session</span><strong>{{ activeSessionId || '-' }}</strong></div>
-          </div>
-
-          <el-form label-position="top" class="tight-form contact-question-form">
-            <el-form-item label="问题描述">
-              <el-input
-                v-model="contactForm.issue"
-                type="textarea"
-                :rows="8"
-                placeholder="例如：reg 环境下已执行审批和 PSP started，但没有推进到 eSign。期望继续到签约完成。手机号 / session / 报错如下..."
-              />
-            </el-form-item>
-            <el-button type="primary" :icon="Position" @click="submitContactIssue">提交问题</el-button>
-          </el-form>
-        </el-card>
-
-        <el-card shadow="never" class="surface-card contact-admin-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h3>问题记录</h3>
-                <p>按最新提交时间倒序展示，已回复内容会保留在对应问题下方。</p>
-              </div>
-              <el-tag type="info" effect="plain">{{ contactIssues.length }} 条</el-tag>
-            </div>
-          </template>
-
-          <section class="contact-issue-list">
-            <div v-if="contactIssues.length === 0" class="contact-empty">还没有提交的问题。</div>
-            <article v-for="item in contactIssues" :key="item.id" class="contact-issue-item">
-              <div class="contact-issue-head">
-                <el-tag :type="item.status === '已回复' ? 'success' : 'warning'" effect="plain">{{ item.status }}</el-tag>
-                <span>{{ item.created_at }}</span>
-              </div>
-              <p class="contact-issue-text">{{ item.issue }}</p>
-              <div class="contact-issue-meta">
-                <span>{{ item.env }}</span>
-                <span>{{ item.phone_number }}</span>
-                <span>{{ item.session_id }}</span>
-              </div>
-              <div v-if="item.reply" class="contact-reply-result">
-                <span>回复 {{ item.replied_at }}</span>
-                <p>{{ item.reply }}</p>
-              </div>
-            </article>
-          </section>
-        </el-card>
-      </div>
-    </section>
-
-    <section v-else-if="currentView === 'ai'" class="ai-page-view">
-      <div class="ai-page-shell">
-        <main class="ai-conversation-panel">
-          <div class="ai-conversation-head">
-            <div>
-              <p class="eyebrow">DPU Chat</p>
-              <h2>AI 助手</h2>
-              <p>像聊天一样提问，也可以直接执行只读 SQL、查询 merchant、分析最近日志和当前 session。</p>
-            </div>
-            <div class="ai-conversation-actions">
-              <el-select v-model="aiExecutionEnv" class="ai-exec-select" aria-label="AI 执行环境">
-                <el-option
-                  v-for="env in aiSqlDataSources"
-                    :key="`ai-${env}`"
-                    :label="env"
-                    :value="env"
-                />
-              </el-select>
-              <el-tag size="large" :type="aiSending ? 'warning' : 'success'">{{ aiSending ? '处理中' : '就绪' }}</el-tag>
-              <el-button :icon="Delete" plain @click="clearAiChat">清空对话</el-button>
-              <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-            </div>
-          </div>
-
-          <div class="ai-context-strip">
-            <div><span>Session</span><strong>{{ activeSessionId || '-' }}</strong></div>
-            <div><span>环境</span><strong>{{ sessionSummary?.env || connectionForm.env }}</strong></div>
-            <div><span>手机号</span><strong>{{ sessionSummary?.phone_number || connectionForm.phone_number || '-' }}</strong></div>
-            <div><span>Merchant</span><strong>{{ sessionSummary?.merchant_id || '-' }}</strong></div>
-            <div><span>实时日志</span><strong>{{ logStatusText }}</strong></div>
-          </div>
-
-          <div v-if="aiMessages.length === 0" class="ai-empty-state">
-            <p>可以直接问业务问题，也可以粘贴 SQL。比如“帮我看当前 session 为什么没推进到 eSign”，或者直接输入一条 SELECT。</p>
-            <p>助手会带上当前环境、Session、手机号、Merchant 和最近日志上下文；需要切换查询环境时，直接改上方环境选择。</p>
-            <div class="ai-prompt-grid">
-              <button v-for="prompt in aiQuickPrompts" :key="prompt" type="button" @click="useAiPrompt(prompt)">
-                {{ prompt }}
-              </button>
-            </div>
-          </div>
-
-          <div class="ai-chat-body ai-page-chat-body">
-            <template v-for="message in aiMessages" :key="message.id">
-              <div v-if="message.role === 'system'" class="chat-model-switch">
-                <span class="chat-model-switch-icon">⇌</span>
-                <span>{{ message.content }}</span>
-              </div>
-              <div v-else class="chat-message" :class="message.role">
-              <div class="chat-avatar" :class="message.role">
-                <el-icon v-if="message.role === 'user'"><User /></el-icon>
-                <svg v-else viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
-                  <path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zm-9.022 12.61a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365 2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/>
-                </svg>
-              </div>
-              <div class="chat-content">
-                <div class="chat-meta">
-                  <span>{{ message.at }}</span>
-                </div>
-                <div class="chat-bubble" v-html="renderMarkdown(message.content)" @click="onChatBubbleClick"></div>
-                <details v-if="message.meta?.rendered" class="chat-detail">
-                  <summary>已执行 SQL / 脚本</summary>
-                  <pre>{{ message.meta.rendered }}</pre>
-                </details>
-                <details v-if="message.meta?.execution" class="chat-detail">
-                  <summary>模板执行结果</summary>
-                  <pre>{{ JSON.stringify(message.meta.execution, null, 2) }}</pre>
-                </details>
-                <details v-if="message.meta?.tool_result" class="chat-detail">
-                  <summary>工具结果</summary>
-                  <pre>{{ JSON.stringify(message.meta.tool_result, null, 2) }}</pre>
-                </details>
-              </div>
-            </div>
-            </template>
-          </div>
-
-          <div v-if="aiError" class="chat-error">{{ aiError }}</div>
-
-          <div class="ai-page-input">
-            <div class="ai-composer">
-              <el-input
-                v-model="aiInput"
-                type="textarea"
-                :rows="4"
-                resize="none"
-                placeholder="问 DPU 问题、让它分析日志，或直接输入 SQL，例如：select merchant_id from dpu_users where phone_number='...'"
-                @keydown.enter.exact.prevent="handleAiSend"
-              />
-              <div class="ai-composer-toolbar">
-                <div class="ai-composer-trailing">
-                  <el-select
-                    v-model="aiModel"
-                    size="small"
-                    class="ai-composer-select ai-composer-select-model"
-                    aria-label="推理模型"
-                  >
-                    <el-option
-                      v-for="opt in aiModelOptions"
-                      :key="opt.value"
-                      :label="opt.label"
-                      :value="opt.value"
-                    />
-                  </el-select>
-                  <el-select
-                    v-model="aiReasoningEffort"
-                    size="small"
-                    class="ai-composer-select ai-composer-select-effort"
-                    aria-label="思考级别"
-                  >
-                    <el-option
-                      v-for="opt in aiReasoningOptions"
-                      :key="opt.value"
-                      :label="opt.label"
-                      :value="opt.value"
-                    />
-                  </el-select>
-                  <button
-                    type="button"
-                    class="ai-composer-send"
-                    :class="{ disabled: !aiInput.trim() || aiSending }"
-                    :disabled="!aiInput.trim() || aiSending"
-                    aria-label="发送"
-                    @click="handleAiSend"
-                  >
-                    <el-icon v-if="aiSending"><Loading /></el-icon>
-                    <el-icon v-else><Top /></el-icon>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </main>
-      </div>
-    </section>
-
-    <section v-else-if="currentView === 'promptTemplates'" class="tool-page-view prompt-templates-view">
-      <div class="log-system-head">
-        <div class="head-copy">
-          <span class="eyebrow"><span class="eyebrow-dot"></span> PROMPT TEMPLATES</span>
-          <h2>提示词模板</h2>
-          <p>
-            {{ isAdmin
-              ? '维护可执行的 SQL / HTTP / Python 模板，用户在 AI 助手描述需求后会自动填参并执行。'
-              : 'admin 预设的可执行模板，描述你的需求，AI 会自动填参并执行对应 SQL / HTTP / Python。' }}
-          </p>
-        </div>
-        <div class="prompt-templates-head-actions">
-          <el-input
-            v-model="promptTemplateSearch"
-            class="prompt-templates-search"
-            placeholder="按名称/描述搜索模板"
-            clearable
-            :prefix-icon="Search"
-          />
-          <el-button :icon="Refresh" plain :loading="promptTemplatesLoading" @click="refreshPromptTemplates">刷新</el-button>
-          <el-button v-if="isAdmin" type="primary" :icon="Plus" @click="openPromptTemplateForm(null)">新建模板</el-button>
-        </div>
-      </div>
-
-      <p v-if="promptTemplatesError" class="login-error" style="margin: 0 0 12px">{{ promptTemplatesError }}</p>
-
-      <div v-if="!promptTemplatesLoading && promptTemplates.length === 0" class="session-empty">
-        <span class="session-empty__icon"><el-icon><Tickets /></el-icon></span>
-        <p class="session-empty__title">还没有模板</p>
-        <p class="session-empty__hint">
-          {{ isAdmin ? '点击右上角「新建模板」开始维护可执行脚本。' : '请联系管理员先创建提示词模板。' }}
-        </p>
-      </div>
-
-      <div v-else-if="!promptTemplatesLoading && promptTemplatesTotal === 0" class="session-empty">
-        <span class="session-empty__icon"><el-icon><Search /></el-icon></span>
-        <p class="session-empty__title">没有匹配的模板</p>
-        <p class="session-empty__hint">换个关键词，或清空搜索框查看全部。</p>
-      </div>
-
-      <div v-else-if="promptTemplatesTotal > 0" class="prompt-templates-grid">
-        <article
-          v-for="template in pagedPromptTemplates"
-          :key="template.id"
-          class="prompt-template-card"
-          :class="{ 'is-disabled': template.is_disabled }"
-        >
-          <header class="prompt-template-card__head">
-            <div>
-              <div class="prompt-template-card__tags">
-                <el-tag size="small" effect="dark" :type="template.logic_type === 'sql' ? 'success' : (template.logic_type === 'http' ? 'warning' : 'info')">
-                  {{ template.logic_type?.toUpperCase() || 'SQL' }}
-                </el-tag>
-                <el-tag v-if="template.is_disabled" size="small" type="danger" effect="plain">已禁用</el-tag>
-              </div>
-              <h3>{{ template.title }}</h3>
-            </div>
-            <div class="prompt-template-card__meta">
-              <span>{{ template.created_by || '-' }}</span>
-              <span>{{ template.updated_at || template.created_at }}</span>
-            </div>
-          </header>
-          <p class="prompt-template-card__desc">{{ template.description || '（无描述）' }}</p>
-          <div class="prompt-template-card__body">
-            <section class="prompt-template-card__column">
-              <div class="prompt-template-card__column-head">
-                <strong>底层逻辑</strong>
-                <small>admin 写入，AI 会按描述填参</small>
-              </div>
-              <pre class="prompt-template-card__logic">{{ template.logic }}</pre>
-            </section>
-            <section class="prompt-template-card__column">
-              <div class="prompt-template-card__column-head">
-                <strong>完整提示词</strong>
-                <small>可直接复制到 AI 助手触发同样逻辑</small>
-                <el-button
-                  v-if="template.example_prompt"
-                  size="small"
-                  plain
-                  :icon="DocumentCopy"
-                  @click="copyPromptToAi(template)"
-                >发送到 AI 助手</el-button>
-              </div>
-              <pre v-if="template.example_prompt" class="prompt-template-card__logic">{{ template.example_prompt }}</pre>
-              <div v-else class="prompt-template-card__empty">未配置完整提示词</div>
-            </section>
-          </div>
-          <footer class="prompt-template-card__actions">
-            <el-button
-              type="primary"
-              :icon="Promotion"
-              :disabled="template.is_disabled"
-              @click="openPromptTemplateUse(template)"
-            >使用</el-button>
-            <template v-if="isAdmin">
-              <el-button plain :icon="Document" @click="openPromptTemplateForm(template)">编辑</el-button>
-              <el-button
-                plain
-                :type="template.is_disabled ? 'success' : 'warning'"
-                :icon="template.is_disabled ? SwitchButton : SwitchButton"
-                @click="togglePromptTemplateDisabled(template)"
-              >{{ template.is_disabled ? '启用' : '禁用' }}</el-button>
-              <el-button plain type="danger" :icon="Delete" @click="removePromptTemplate(template)">删除</el-button>
-            </template>
-          </footer>
-        </article>
-      </div>
-
-      <div v-if="promptTemplatesTotal > promptTemplatePageSize" class="prompt-templates-pagination">
-        <el-pagination
-          layout="prev, pager, next, total"
-          background
-          :total="promptTemplatesTotal"
-          :page-size="promptTemplatePageSize"
-          :current-page="promptTemplatePage"
-          @current-change="(pg) => (promptTemplatePage = pg)"
-        />
-      </div>
+    <template v-else-if="currentView === 'promptTemplates'">
+      <PromptTemplatesView
+        :templates="promptTemplates"
+        :is-admin="isAdmin"
+        :loading="promptTemplatesLoading"
+        :error="promptTemplatesError"
+        @refresh="refreshPromptTemplates"
+        @create="openPromptTemplateForm(null)"
+        @edit="openPromptTemplateForm"
+        @use="openPromptTemplateUse"
+        @toggle="togglePromptTemplateDisabled"
+        @remove="removePromptTemplate"
+        @send-to-ai="copyPromptToAi"
+      />
 
       <el-dialog
         v-model="promptTemplateFormVisible"
@@ -11122,784 +9270,38 @@ function buildAiContext() {
           </el-button>
         </template>
       </el-dialog>
-    </section>
+    </template>
 
-    <section v-else-if="currentView === 'userManagement'" class="tool-page-view user-management-view">
-      <div class="log-system-head">
-        <div>
-          <p class="eyebrow"><span class="eyebrow-dot"></span> USER MANAGEMENT</p>
-          <h2>用户管理</h2>
-          <p>查看、编辑所有注册账号，可修改账号名、密码、备注，或永久删除账号。</p>
-        </div>
-        <el-button plain :icon="Refresh" :loading="adminUsersLoading" @click="refreshAdminUsers">刷新</el-button>
+    <UserManagementView
+      v-else-if="currentView === 'userManagement'"
+      v-model:edit-visible="adminUserEditVisible"
+      v-model:edit-form="adminUserEditForm"
+      :users="adminUsers"
+      :loading="adminUsersLoading"
+      :error="adminUsersError"
+      :edit-saving="adminUserEditSaving"
+      @refresh="refreshAdminUsers"
+      @approve="approveUser"
+      @reject="rejectUser"
+      @edit="openAdminUserEdit"
+      @remove="removeAdminUser"
+      @save="saveAdminUserEdit"
+    />
+
+    <ContactAdminView
+      v-else-if="currentView === 'contactAdmin'"
+      v-model:reply-text="contactAdminForm.reply"
+      :issues="pendingContactIssues"
+      :operator-name="authDisplayName"
+      :error="contactAdminError"
+      @back="backToConsole"
+      @delete="deleteContactIssue"
+      @reply="replyContactIssue"
+    />
+
+    <ConsoleView v-else />
       </div>
-
-      <p v-if="adminUsersError" class="login-error" style="margin: 0 0 12px">{{ adminUsersError }}</p>
-
-      <el-card shadow="never" class="surface-card">
-        <div v-if="adminUsersLoading && adminUsers.length === 0" class="session-empty">
-          <span class="session-empty__icon"><el-icon><Setting /></el-icon></span>
-          <p class="session-empty__title">加载中…</p>
-        </div>
-        <div v-else-if="adminUsers.length === 0" class="session-empty">
-          <span class="session-empty__icon"><el-icon><User /></el-icon></span>
-          <p class="session-empty__title">暂无账号</p>
-        </div>
-        <div v-else class="user-management-table">
-          <div class="user-table-head user-table-row">
-            <span class="col-username">账号</span>
-            <span class="col-role">角色</span>
-            <span class="col-status">状态</span>
-            <span class="col-notes">备注</span>
-            <span class="col-created">注册时间</span>
-            <span class="col-login">最近登录</span>
-            <span class="col-actions"></span>
-          </div>
-          <article
-            v-for="user in adminUsersPagedData"
-            :key="user.id"
-            class="user-table-row"
-            :class="{ 'is-admin-row': user.role === 'admin', 'is-pending-row': user.status === 'pending' }"
-          >
-            <span class="col-username">
-              <code>{{ user.username }}</code>
-              <el-tag v-if="user.role === 'admin'" size="small" type="success" effect="plain" style="margin-left: 6px;">管理员</el-tag>
-            </span>
-            <span class="col-role">{{ user.role === 'admin' ? '管理员' : '普通用户' }}</span>
-            <span class="col-status">
-              <el-tag
-                size="small"
-                effect="plain"
-                :type="user.status === 'active' ? 'success' : user.status === 'pending' ? 'warning' : 'danger'"
-              >{{ user.status === 'active' ? '正常' : user.status === 'pending' ? '待审核' : '已拒绝' }}</el-tag>
-            </span>
-            <span class="col-notes user-notes-cell">{{ user.notes || '—' }}</span>
-            <span class="col-created">{{ user.created_at || '—' }}</span>
-            <span class="col-login">{{ user.last_login_at || '从未登录' }}</span>
-            <span class="col-actions">
-              <template v-if="user.status === 'pending'">
-                <el-button size="small" type="success" plain :icon="Check" @click="approveUser(user)">通过</el-button>
-                <el-button size="small" type="danger" plain @click="rejectUser(user)">拒绝</el-button>
-              </template>
-              <template v-else>
-                <el-button size="small" plain :icon="Edit" @click="openAdminUserEdit(user)">编辑</el-button>
-                <el-button
-                  size="small"
-                  plain
-                  type="danger"
-                  :icon="Delete"
-                  :disabled="user.role === 'admin'"
-                  :title="user.role === 'admin' ? '不能删除管理员账号' : ''"
-                  @click="removeAdminUser(user)"
-                >删除</el-button>
-              </template>
-            </span>
-          </article>
-          <div v-if="adminUsers.length > adminUsersPageSize" class="user-table-pagination">
-            <el-pagination
-              v-model:current-page="adminUsersPage"
-              v-model:page-size="adminUsersPageSize"
-              :page-sizes="[10, 20, 50]"
-              :total="adminUsers.length"
-              layout="total, sizes, prev, pager, next"
-              background
-              small
-            />
-          </div>
-        </div>
-      </el-card>
-
-      <!-- Edit user dialog -->
-      <el-dialog
-        v-model="adminUserEditVisible"
-        title="编辑账号"
-        width="480px"
-      >
-        <el-form label-position="top" class="prompt-template-form">
-          <el-form-item label="账号名">
-            <el-input v-model.trim="adminUserEditForm.new_username" placeholder="账号名" autocomplete="off" />
-          </el-form-item>
-          <el-form-item label="新密码（留空不修改）">
-            <el-input
-              v-model="adminUserEditForm.new_password"
-              type="password"
-              show-password
-              placeholder="留空则不更改密码"
-              autocomplete="new-password"
-            />
-          </el-form-item>
-          <el-form-item label="备注">
-            <el-input
-              v-model="adminUserEditForm.notes"
-              type="textarea"
-              :rows="3"
-              placeholder="填写备注，例如：负责 UAT 环境 / 内部测试账号"
-            />
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <el-button @click="adminUserEditVisible = false">取消</el-button>
-          <el-button type="primary" :loading="adminUserEditSaving" @click="saveAdminUserEdit">保存</el-button>
-        </template>
-      </el-dialog>
-    </section>
-
-    <section v-else-if="currentView === 'contactAdmin'" class="tool-page-view contact-admin-view">
-      <div class="log-system-head">
-        <div>
-          <p class="eyebrow">Admin</p>
-          <h2>回复问题</h2>
-          <p>管理员在这里统一回复“联系我们”提交的问题。</p>
-        </div>
-        <el-button plain :icon="Refresh" @click="backToConsole">返回控制台</el-button>
-      </div>
-
-      <div class="contact-admin-grid contact-admin-grid-stack">
-        <el-card shadow="never" class="surface-card contact-admin-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h3>待处理问题</h3>
-                <p>这里只显示未回复的问题；回复后会回显到“联系我们”的问题记录里。</p>
-              </div>
-              <el-tag type="info" effect="plain">{{ pendingContactIssues.length }} 条</el-tag>
-            </div>
-          </template>
-
-          <section class="contact-issue-list contact-issue-list-admin">
-            <div v-if="pendingContactIssues.length === 0" class="contact-empty">暂无待处理问题。</div>
-            <article v-for="item in pendingContactIssues" :key="item.id" class="contact-issue-item">
-              <div class="contact-issue-head">
-                <div class="contact-issue-state">
-                  <el-tag :type="item.status === '已回复' ? 'success' : 'warning'" effect="plain">{{ item.status }}</el-tag>
-                  <span>{{ item.created_at }}</span>
-                </div>
-                <el-button
-                  type="danger"
-                  plain
-                  :icon="Delete"
-                  @click="deleteContactIssue(item.id)"
-                >删除</el-button>
-              </div>
-              <p class="contact-issue-text">{{ item.issue }}</p>
-              <div class="contact-issue-meta">
-                <span>{{ item.env }}</span>
-                <span>{{ item.phone_number }}</span>
-                <span>{{ item.session_id }}</span>
-              </div>
-              <div v-if="item.reply" class="contact-reply-result">
-                <span>回复 {{ item.replied_at }}</span>
-                <p>{{ item.reply }}</p>
-              </div>
-              <el-button
-                type="primary"
-                plain
-                :icon="ChatLineRound"
-                @click="replyContactIssue(item)"
-              >回复该问题</el-button>
-            </article>
-          </section>
-        </el-card>
-
-        <el-card shadow="never" class="surface-card contact-admin-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h3>回复问题</h3>
-                <p>先填写回复内容，再在上方选择一个待处理问题。</p>
-              </div>
-              <el-tag type="success" effect="plain">{{ authDisplayName }} 已登录</el-tag>
-            </div>
-          </template>
-
-          <div class="contact-reply-box">
-            <el-input
-              v-model="contactAdminForm.reply"
-              type="textarea"
-              :rows="5"
-              placeholder="输入回复内容，然后在上方选择一个待回复问题。"
-            />
-          </div>
-
-          <p v-if="contactAdminError" class="contact-error">{{ contactAdminError }}</p>
-        </el-card>
-      </div>
-    </section>
-
-    <section v-else class="workspace-grid">
-      <div class="workspace-row">
-        <el-card shadow="never" class="surface-card workspace-row__main connection-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h2>连接与注册</h2>
-                <p>先建立 session，再执行 mock 操作。</p>
-              </div>
-              <el-space>
-                <el-button :icon="Refresh" plain :loading="loadingHealth || loadingSessions" @click="loadSessions(); refreshHealth()">
-                  刷新状态
-                </el-button>
-                <el-button :icon="Delete" type="danger" plain :disabled="!activeSessionId" :loading="disconnecting" @click="handleDisconnect">
-                  断开会话
-                </el-button>
-              </el-space>
-            </div>
-          </template>
-
-          <div class="dual-panel">
-            <div class="form-block">
-              <h3><el-icon><Connection /></el-icon> 会话连接</h3>
-              <el-form label-position="top" class="tight-form">
-                <el-form-item label="环境">
-                  <el-select v-model="connectionForm.env">
-                    <el-option
-                      v-for="env in enumOptions?.environments ?? defaultEnvironments"
-                      :key="env"
-                      :label="env"
-                      :value="env"
-                    />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="手机号">
-                  <el-input v-model.trim="connectionForm.phone_number" placeholder="8位或11位数字" />
-                </el-form-item>
-                <el-button type="primary" :icon="Connection" :loading="connecting" @click="handleConnect">
-                  连接 session
-                </el-button>
-              </el-form>
-            </div>
-
-            <div class="form-block">
-              <h3><el-icon><Document /></el-icon> 新账号注册</h3>
-              <el-form label-position="top" class="tight-form">
-                <el-form-item label="环境">
-                  <el-select v-model="registerForm.env">
-                    <el-option
-                      v-for="env in enumOptions?.environments ?? defaultEnvironments"
-                      :key="`reg-${env}`"
-                      :label="env"
-                      :value="env"
-                    />
-                  </el-select>
-                </el-form-item>
-                <div class="form-row register-fields" :class="{ 'is-offline': registerForm.offline }">
-                  <el-form-item v-if="!registerForm.offline" label="Journey">
-                    <el-select v-model="registerForm.journey">
-                      <el-option
-                        v-for="journey in enumOptions?.journeys ?? defaultJourneys"
-                        :key="journey"
-                        :label="journeyLabel(journey)"
-                        :value="journey"
-                      />
-                    </el-select>
-                  </el-form-item>
-                  <el-form-item label="币种" :class="{ 'full-row': registerForm.offline }">
-                    <el-select v-model="registerForm.currency">
-                      <el-option
-                        v-for="currency in enumOptions?.currencies ?? defaultCurrencies"
-                        :key="currency"
-                        :label="currency"
-                        :value="currency"
-                      />
-                    </el-select>
-                  </el-form-item>
-                  <el-form-item label="资方代码" class="full-row">
-                    <el-select v-model="registerForm.funder_resource">
-                      <el-option
-                        v-for="funderResource in enumOptions?.funder_resources ?? defaultFunderResources"
-                        :key="funderResource"
-                        :label="funderResource"
-                        :value="funderResource"
-                      />
-                    </el-select>
-                  </el-form-item>
-                </div>
-                <el-form-item>
-                  <el-switch v-model="registerForm.offline" active-text="线下模式" inactive-text="线上模式" />
-                </el-form-item>
-                <div class="register-actions">
-                  <el-button
-                    type="primary"
-                    :icon="Promotion"
-                    :loading="registering"
-                    :disabled="onlineUsdHsbcBlocked"
-                    :title="onlineUsdHsbcBlocked ? onlineUsdHsbcBlockedReason : ''"
-                    @click="handleRegister"
-                  >
-                    执行注册
-                  </el-button>
-                  <el-button
-                    type="primary"
-                    plain
-                    :icon="Connection"
-                    :loading="registeringAndBinding"
-                    :disabled="registerAndBindingBlocked"
-                    :title="registerAndBindingBlocked ? registerAndBindingBlockedReason : ''"
-                    @click="handleRegisterAndRunMultiShop"
-                  >
-                    注册并完成绑店
-                  </el-button>
-                </div>
-              </el-form>
-            </div>
-          </div>
-
-        </el-card>
-
-        <el-card shadow="never" class="surface-card workspace-row__side session-card">
-          <template #header>
-            <div class="card-head">
-              <div class="head-copy">
-                <h2>当前会话</h2>
-                <p>活动连接与最近状态。</p>
-              </div>
-            </div>
-          </template>
-
-          <div v-if="sessionSummary" class="session-summary">
-            <div class="summary-row"><span>Session ID</span><strong>{{ sessionSummary.session_id }}</strong></div>
-            <div class="summary-row"><span>环境</span><strong>{{ sessionSummary.env }}</strong></div>
-            <div class="summary-row"><span>手机号</span><strong>{{ sessionSummary.phone_number }}</strong></div>
-            <div class="summary-row"><span>Merchant</span><strong>{{ sessionSummary.merchant_id || '-' }}</strong></div>
-            <div class="summary-row"><span>选中申请单</span><strong>{{ selectedApplicationUniqueId || '-' }}</strong></div>
-            <div class="summary-row"><span>申请单数量</span><strong>{{ applicationOptions.length }}</strong></div>
-          </div>
-          <div v-else class="session-empty">
-            <span class="session-empty__icon">
-              <el-icon><Bell /></el-icon>
-            </span>
-            <p class="session-empty__title">还没有活动会话</p>
-            <p class="session-empty__hint">连接 session 后会显示 ID、Merchant 与申请单。</p>
-          </div>
-        </el-card>
-      </div>
-
-      <el-card shadow="never" class="surface-card mock-panel-card">
-        <template #header>
-          <div class="card-head">
-              <div class="head-copy">
-                <h2>Mock 操作面板</h2>
-                <p>{{ mockOperationEditMode ? '排版模式：拖动模块调整顺序，保存后全局生效。' : '按当前 session 执行 webhook 模拟操作，执行结果会保留在对应步骤下方。' }}</p>
-              </div>
-              <div v-if="isAdmin" class="mock-layout-actions">
-                <el-tag v-if="mockOperationEditMode" size="small" type="warning" effect="plain">排版中</el-tag>
-                <el-button v-if="mockOperationEditMode" size="small" @click="cancelMockOperationLayout">取消</el-button>
-                <el-button v-if="mockOperationEditMode" size="small" type="primary" @click="saveMockOperationLayout">保存排版</el-button>
-                <span v-else class="mock-layout-hint">长按模块进入排版</span>
-              </div>
-            </div>
-          </template>
-
-          <div class="operation-context">
-            <div>
-              <span>环境</span>
-              <strong>{{ sessionSummary?.env || connectionForm.env }}</strong>
-            </div>
-            <div>
-              <span>手机号</span>
-              <strong>{{ sessionSummary?.phone_number || connectionForm.phone_number || '-' }}</strong>
-            </div>
-            <div>
-              <span>Merchant ID</span>
-              <strong>{{ sessionSummary?.merchant_id || '-' }}</strong>
-            </div>
-          </div>
-
-          <div v-if="sessionSummary" class="application-selector">
-            <span class="application-selector-label">申请单</span>
-            <div class="application-selector-current">
-              <div>
-                <span>Application</span>
-                <strong>{{ selectedApplicationUniqueId || sessionSummary?.application_unique_id || '-' }}</strong>
-              </div>
-              <div>
-                <span>Currency</span>
-                <strong>{{ selectedApplicationCurrency }}</strong>
-              </div>
-              <div>
-                <span>Lender</span>
-                <strong>{{ selectedApplication?.lender_code || sessionSummary?.lender_code || '-' }}</strong>
-              </div>
-              <div>
-                <span>Status</span>
-                <strong>{{ selectedApplication?.application_status || sessionSummary?.application_status || '-' }}</strong>
-              </div>
-            </div>
-            <el-select
-              v-if="applicationOptions.length > 1"
-              v-model="selectedApplicationUniqueId"
-              filterable
-              class="application-select"
-              popper-class="application-select-popper"
-              :popper-options="{ modifiers: [{ name: 'preventOverflow', options: { boundary: 'clippingParents' } }] }"
-            >
-              <el-option
-                v-for="application in applicationOptions"
-                :key="application.application_unique_id"
-                :label="application.application_unique_id"
-                :value="application.application_unique_id"
-              >
-                <div class="application-option">
-                  <strong>{{ application.application_unique_id }}</strong>
-                  <span>{{ application.finance_product_currency || selectedApplicationCurrency }}</span>
-                  <span>{{ application.application_status || '-' }}</span>
-                  <span>{{ application.lender_code || '-' }}</span>
-                </div>
-              </el-option>
-            </el-select>
-            <span v-else class="application-single-note">默认最新申请单</span>
-          </div>
-
-          <div class="operation-panels operation-button-list">
-            <template v-for="operation in visibleOperations" :key="operation.key">
-            <div
-              class="operation-row"
-              :class="{ active: activeOperationKey === operation.key, disabled: isOperationDisabled(operation), 'is-layout-item': mockOperationEditMode, 'is-layout-dragging': mockOperationDragState === operation.key }"
-              :draggable="isAdmin && mockOperationEditMode"
-              @pointerdown="startMockOperationLongPress"
-              @pointerup="stopMockOperationLongPress"
-              @pointerleave="stopMockOperationLongPress"
-              @pointercancel="stopMockOperationLongPress"
-              @dragstart="onMockOperationDragStart($event, operation.key)"
-              @dragover.prevent="isAdmin && mockOperationEditMode"
-              @drop="onMockOperationDrop($event, operation.key)"
-              @dragend="onMockOperationDragEnd"
-            >
-              <button
-                type="button"
-                class="operation-toggle"
-                :aria-expanded="activeOperationKey === operation.key"
-                :aria-disabled="isOperationDisabled(operation)"
-                :disabled="isOperationDisabled(operation)"
-                :title="isOperationDisabled(operation) ? operationDisabledReason(operation) : operation.description"
-                @click="toggleOperationPanel(operation.key)"
-              >
-                <span class="operation-toggle-main">
-                  <span class="operation-toggle-badge">
-                    <el-icon><CaretRight /></el-icon>
-                  </span>
-                  <span class="operation-toggle-text">
-                    <b>{{ operation.title }}</b>
-                    <code>{{ operation.endpoint }}</code>
-                  </span>
-                </span>
-                <span class="operation-toggle-meta">
-                  <span v-if="isOperationDisabled(operation)" class="operation-disabled-chip">{{ operationDisabledChip(operation) }}</span>
-                  <el-icon class="operation-toggle-arrow"><component :is="activeOperationKey === operation.key ? ArrowDown : ArrowRight" /></el-icon>
-                </span>
-              </button>
-            </div>
-
-            <div
-              v-if="activeOperationKey === operation.key && activeOperation"
-              class="operation-detail-dock"
-            >
-            <div class="operation-detail-head">
-              <div>
-                <p>{{ activeOperation.title }}</p>
-                <span>{{ activeOperation.description }}</span>
-              </div>
-              <el-button size="small" text @click="toggleOperationPanel(activeOperation.key)">
-                收起
-              </el-button>
-            </div>
-            <div
-              class="operation-body"
-              :class="{ 'dowsure-credit-body': activeOperation.key === 'dowsureCreditResult' }"
-            >
-              <code class="endpoint-chip">{{ activeOperation.endpoint }}</code>
-              <el-form label-position="top" class="tight-form">
-                <div v-if="shouldShowPspAuthorizationRows" class="psp-status-panel">
-                  <div class="psp-status-head">
-                    <span>店铺授权状态</span>
-                    <el-button size="small" text :loading="loadingPspAuthorizationRows" @click="loadPspAuthorizationRows">
-                      刷新
-                    </el-button>
-                  </div>
-                  <div class="psp-status-table">
-                    <div class="psp-status-row psp-status-header">
-                      <span>merchant_account_id</span>
-                      <span>SP authorization_id</span>
-                      <span>SP 状态</span>
-                      <span>3P 状态</span>
-                      <span>PSP 状态</span>
-                      <span>选择</span>
-                    </div>
-                    <div v-if="!loadingPspAuthorizationRows && pspAuthorizationRows.length === 0" class="psp-status-empty">
-                      暂无店铺授权记录。
-                    </div>
-                    <div
-                      v-for="row in pspAuthorizationRows"
-                      :key="row.merchant_account_id"
-                      class="psp-status-row"
-                      :class="{ selected: row.merchant_account_id === selectedPspMerchantAccountId }"
-                    >
-                      <strong>{{ row.merchant_account_id || '-' }}</strong>
-                      <strong>{{ row.sp_authorization_id || '-' }}</strong>
-                      <span>{{ row.sp_status || '-' }}</span>
-                      <span>{{ row.three_pl_status || '-' }}</span>
-                      <span>{{ row.psp_status || '-' }}</span>
-                      <el-button
-                        size="small"
-                        :type="row.merchant_account_id === selectedPspMerchantAccountId ? 'primary' : 'default'"
-                        :disabled="!isPspRowSelectable(row)"
-                        @click="selectPspAuthorizationRow(row)"
-                      >
-                        {{ row.merchant_account_id === selectedPspMerchantAccountId ? '已选中' : '选择' }}
-                      </el-button>
-                    </div>
-                  </div>
-                </div>
-
-                <div v-if="shouldShowLimitApplications" class="limit-applications-panel">
-                  <div class="psp-status-head">
-                    <span>核保单</span>
-                    <el-button size="small" text :loading="loadingLimitApplications" @click="loadLimitApplications">
-                      刷新
-                    </el-button>
-                  </div>
-                  <div class="limit-applications-table">
-                    <div class="limit-applications-row limit-applications-header">
-                      <span>limit_application_unique_id</span>
-                      <span>status</span>
-                      <span>created_at</span>
-                      <span>选择</span>
-                    </div>
-                    <div v-if="!loadingLimitApplications && limitApplicationRows.length === 0" class="psp-status-empty">
-                      暂无核保单记录，默认执行时会使用最新核保单。
-                    </div>
-                    <div
-                      v-for="row in limitApplicationRows"
-                      :key="row.limit_application_unique_id"
-                      class="limit-applications-row"
-                      :class="{ selected: row.limit_application_unique_id === selectedLimitApplicationUniqueId }"
-                    >
-                      <strong>{{ row.limit_application_unique_id || '-' }}</strong>
-                      <span>{{ row.status || '-' }}</span>
-                      <span>{{ row.created_at || '-' }}</span>
-                      <el-button
-                        size="small"
-                        :type="row.limit_application_unique_id === selectedLimitApplicationUniqueId ? 'primary' : 'default'"
-                        @click="selectLimitApplicationRow(row)"
-                      >
-                        {{ row.limit_application_unique_id === selectedLimitApplicationUniqueId ? '已选中' : '选择' }}
-                      </el-button>
-                    </div>
-                  </div>
-                </div>
-
-                <div v-if="shouldShowDrawdownRepaymentRows" class="drawdown-repayment-panel">
-                  <div class="psp-status-head">
-                    <span>还款单</span>
-                    <el-button size="small" text :loading="loadingDrawdownRepaymentRows" @click="loadDrawdownRepaymentRows">
-                      刷新
-                    </el-button>
-                  </div>
-                  <div class="drawdown-repayment-table">
-                    <div class="drawdown-repayment-row drawdown-repayment-header">
-                      <span>lender_loan_id</span>
-                      <span>{{ activeOperation.key === 'cgbRepaymentResult' ? 'CGB loanCode（lender_drawdown_id）' : 'WEBANK loanCode' }}</span>
-                      <span>total_interest_rate</span>
-                      <span>outstanding_amount</span>
-                      <span>repayment_status</span>
-                      <span>选择</span>
-                    </div>
-                    <div v-if="!loadingDrawdownRepaymentRows && drawdownRepaymentRows.length === 0" class="psp-status-empty">
-                      暂无还款单记录，默认执行时会使用最新 dpu_drawdown 记录。
-                    </div>
-                    <div
-                      v-for="row in drawdownRepaymentRows"
-                      :key="`${row.lender_loan_id || row.lender_drawdown_id}-${row.lender_drawdown_id || ''}`"
-                      class="drawdown-repayment-row"
-                      :class="{ selected: repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode }"
-                    >
-                      <strong>{{ row.lender_loan_id || '-' }}</strong>
-                      <span>{{ row.lender_drawdown_id || '-' }}</span>
-                      <span>{{ row.total_interest_rate ?? '-' }}</span>
-                      <span>{{ row.outstanding_amount ?? '-' }}</span>
-                      <span>{{ row.repayment_status || '-' }}</span>
-                      <el-button
-                        size="small"
-                        :type="repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode ? 'primary' : 'default'"
-                        @click="selectDrawdownRepaymentRow(row)"
-                      >
-                        {{ repaymentRowSelectionKey(row) === selectedDowsureRepaymentLoanCode ? '已选中' : '选择' }}
-                      </el-button>
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  v-if="activeOperation.key === 'dowsureCreditResult'"
-                  class="operation-fields"
-                  :class="{ empty: activeOperation.fields.length === 0 }"
-                >
-                  <template v-if="activeOperation.fields.length">
-                    <template v-for="field in activeOperation.fields" :key="`${activeOperation.key}-${field.prop}`">
-                      <el-form-item v-if="!field.visible || field.visible(operationForms[activeOperation.key])" :label="field.label">
-                        <el-input
-                          v-if="field.type === 'text'"
-                          v-model="operationForms[activeOperation.key][field.prop]"
-                          :placeholder="field.placeholder"
-                        />
-                        <el-input-number
-                          v-else-if="field.type === 'number'"
-                          v-model="operationForms[activeOperation.key][field.prop]"
-                          :min="field.min"
-                          :step="field.step || 1"
-                          controls-position="right"
-                          class="full-width"
-                        />
-                        <el-select v-else-if="field.type === 'select'" v-model="operationForms[activeOperation.key][field.prop]">
-                          <el-option
-                            v-for="option in fieldOptions(field)"
-                            :key="`${field.prop}-${option.value}`"
-                            :label="option.label"
-                            :value="option.value"
-                          />
-                        </el-select>
-                      </el-form-item>
-                    </template>
-                  </template>
-                  <div v-else class="no-params">这个操作不需要额外参数。</div>
-                </div>
-
-                <div v-if="shouldShowDowsureMerchantAccounts" class="dowsure-accounts-panel">
-                  <div class="psp-status-head">
-                    <span>DOWSURE 店铺额度（offerId / sellerId 自动带出）</span>
-                    <el-button size="small" text :loading="loadingDowsureMerchantAccounts" @click="loadDowsureMerchantAccounts">
-                      刷新
-                    </el-button>
-                  </div>
-                  <div class="dowsure-accounts-table">
-                    <div class="dowsure-accounts-row dowsure-accounts-header">
-                      <span>offerId</span>
-                      <span>sellerId</span>
-                      <span>amount</span>
-                    </div>
-                    <div v-if="!loadingDowsureMerchantAccounts && operationForms.dowsureCreditResult.creditResultList.length === 0" class="psp-status-empty">
-                      暂无 DOWSURE 店铺记录。
-                    </div>
-                    <div
-                      v-for="row in operationForms.dowsureCreditResult.creditResultList"
-                      :key="row.offerId || row.sellerId"
-                      class="dowsure-accounts-row"
-                    >
-                      <strong>{{ row.offerId || '-' }}</strong>
-                      <strong>{{ row.sellerId || '-' }}</strong>
-                      <el-input-number
-                        v-model="row.amount"
-                        :min="0"
-                        :step="1000"
-                        controls-position="right"
-                        class="full-width"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div v-if="shouldShowWebankSellerOffers" class="dowsure-accounts-panel">
-                  <div class="psp-status-head">
-                    <span>WEBANK 店铺额度</span>
-                    <el-button size="small" text :loading="loadingWebankSellerOffers" @click="loadWebankSellerOffers">
-                      刷新
-                    </el-button>
-                  </div>
-                  <div class="dowsure-accounts-table webank-seller-offers-table">
-                    <div class="dowsure-accounts-row dowsure-accounts-header">
-                      <span>offer_id</span>
-                      <span>seller_id</span>
-                      <span>marketplace_country</span>
-                      <span>准入状态</span>
-                      <span>applySellerBusinessSum</span>
-                    </div>
-                    <div v-if="!loadingWebankSellerOffers && operationForms.webankCreditResult.seller_offers.length === 0" class="psp-status-empty">
-                      暂无 WEBANK 店铺记录。
-                    </div>
-                    <div
-                      v-for="row in operationForms.webankCreditResult.seller_offers"
-                      :key="row.offer_id || row.seller_id"
-                      class="dowsure-accounts-row"
-                    >
-                      <strong>{{ row.offer_id || '-' }}</strong>
-                      <strong>{{ row.seller_id || '-' }}</strong>
-                      <span>{{ row.marketplace_country || '-' }}</span>
-                      <el-select v-model="row.admissionStatus" class="full-width">
-                        <el-option label="准入" value="ADMITTED" />
-                        <el-option label="不准入" value="NOT_ADMITTED" />
-                      </el-select>
-                      <el-input-number
-                        v-model="row.applySellerBusinessSum"
-                        :min="0"
-                        :step="1000"
-                        controls-position="right"
-                        class="full-width"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  v-if="activeOperation.key !== 'dowsureCreditResult'"
-                  class="operation-fields"
-                  :class="{ empty: activeOperation.fields.length === 0 }"
-                >
-                  <template v-if="activeOperation.fields.length">
-                    <template v-for="field in activeOperation.fields" :key="`${activeOperation.key}-${field.prop}`">
-                      <el-form-item v-if="!field.visible || field.visible(operationForms[activeOperation.key])" :label="field.label">
-                        <el-input
-                          v-if="field.type === 'text'"
-                          v-model="operationForms[activeOperation.key][field.prop]"
-                          :placeholder="field.placeholder"
-                        />
-                        <el-input-number
-                          v-else-if="field.type === 'number'"
-                          v-model="operationForms[activeOperation.key][field.prop]"
-                          :min="field.min"
-                          :step="field.step || 1"
-                          controls-position="right"
-                          class="full-width"
-                        />
-                        <el-select v-else-if="field.type === 'select'" v-model="operationForms[activeOperation.key][field.prop]">
-                          <el-option
-                            v-for="option in fieldOptions(field)"
-                            :key="`${field.prop}-${option.value}`"
-                            :label="option.label"
-                            :value="option.value"
-                          />
-                        </el-select>
-                      </el-form-item>
-                    </template>
-                  </template>
-                  <div v-else class="no-params">这个操作不需要额外参数。</div>
-                </div>
-
-                <el-button
-                  class="operation-run-button"
-                  type="primary"
-                  :disabled="!activeSessionId || isOperationDisabled(activeOperation)"
-                  :loading="runningOperationKey === activeOperation.key"
-                  :title="isOperationDisabled(activeOperation) ? operationDisabledReason(activeOperation) : ''"
-                  @click="handleOperationRun(activeOperation)"
-                >
-                  执行 {{ activeOperation.title }}
-                </el-button>
-              </el-form>
-
-              <div
-                v-if="operationResults[activeOperation.key]"
-                class="result-strip"
-                :class="{ 'result-strip-error': operationResults[activeOperation.key]?.success === false }"
-              >
-                <span class="result-title">最近一次执行结果</span>
-                <pre>{{ JSON.stringify(operationResults[activeOperation.key], null, 2) }}</pre>
-              </div>
-            </div>
-          </div>
-            </template>
-          </div>
-      </el-card>
-    </section>
+    </Transition>
 
     </template>
 

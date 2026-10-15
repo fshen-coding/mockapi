@@ -215,6 +215,7 @@ class WebankSellerOffer(BaseModel):
 class WebankCreditResultRequest(MockBaseRequest):
     application_code: Optional[str] = None
     businessSum: Optional[float] = Field(None, ge=0)
+    frontProductId: Optional[str] = Field(None, max_length=64)
     seller_offers: list[WebankSellerOffer] = Field(default_factory=list)
 
 

@@ -1000,6 +1000,7 @@ async def send_webank_credit_result(req: WebankCreditResultRequest):
         service.send_webank_credit_result_web,
         application_code=req.application_code,
         business_sum=req.businessSum,
+        front_product_id=req.frontProductId,
         seller_offers=[item.model_dump() for item in req.seller_offers],
     )
     msg = "operation succeeded" if result.get("success") else "operation failed"

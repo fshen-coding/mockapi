@@ -4868,6 +4868,7 @@ class WebDPUMockService(DPUMockService):
         application_code: str,
         business_sum: Optional[float] = None,
         seller_offers: Optional[list] = None,
+        front_product_id: Optional[str] = None,
     ) -> dict:
         """Send WEBANK credit-result callback (reuses DOWSURE credit-result endpoint).
 
@@ -4917,7 +4918,7 @@ class WebDPUMockService(DPUMockService):
                 "repayAcctBankNo": "WEBANK",
                 "productList": [
                     {
-                        "frontProductId": "501026D",
+                        "frontProductId": str(front_product_id or "").strip() or "501026D",
                         "projectId": "MOCK001",
                         "businessSum": total_str,
                         "availableSum": total_str,
