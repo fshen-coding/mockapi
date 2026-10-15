@@ -1,0 +1,98 @@
+# SIT 测试环境：与生产共用 PostgreSQL（postgres-credentials）和 mockapi-env，
+# /app/web/data 使用独立 PVC。由 gateway 按 sit.mockapi.fshencoding.cn 路由。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mockapi-sit-data
+  namespace: mockapi
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mockapi-sit
+  namespace: mockapi
+spec:
+  selector:
+    app: mockapi-sit
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockapi-sit
+  namespace: mockapi
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mockapi-sit
+  template:
+    metadata:
+      labels:
+        app: mockapi-sit
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: mockapi
+          image: ghcr.io/fshen-coding/mockapi:sit
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: mockapi-env
+          env:
+            - name: MOCKAPI_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: MOCKAPI_DATABASE_URL
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            failureThreshold: 36
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /app/web/data
+            - name: shared-memory
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mockapi-sit-data
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi

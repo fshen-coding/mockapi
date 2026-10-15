@@ -153,6 +153,21 @@ restrict,command="/opt/mockapi-deploy/ci-ssh-entrypoint.sh" ssh-ed25519 AAAA... 
 | `DEPLOY_SSH_KEY` | 单独生成的 Ed25519 私钥全文 |
 | `DEPLOY_KNOWN_HOSTS` | 已核验的服务器 SSH host key 行 |
 
+## SIT 测试环境
+
+- 入口：`https://sit.mockapi.fshencoding.cn`，由 `gateway.yaml` 中独立的 `server_name` 转发到 `Service/mockapi-sit`。
+- `app-sit.yaml` 定义 `Deployment/mockapi-sit`、`Service/mockapi-sit` 和 PVC `mockapi-sit-data`。
+- 与生产共用 PostgreSQL（`postgres-credentials`）和 `mockapi-env`；`/app/web/data` 使用独立 PVC。SIT 上的数据改动会直接出现在生产库中。
+- 推送 `developer-fshen`：执行检查，构建并推送 `sha-<SHA>` 与 `sit` 标签，然后经 `sit` Environment 自动发布到 `mockapi-sit`。
+- 发布命令为 `deploy-mockapi-sit <受信 GHCR SHA 镜像>`，由同一个受限 SSH key 执行；`deploy-image.sh` 第二个参数只接受 `production` 或 `sit`。
+- GitHub 仓库需新建 `sit` Environment，并配置与 `production` 相同的四个 Secrets（或改为仓库级 Secrets）。
+
+手动发布 SIT：
+
+```sh
+/opt/mockapi-deploy/deploy-image.sh ghcr.io/fshen-coding/mockapi:sha-<40位 SHA> sit
+```
+
 建议为 `production` Environment 配置 required reviewers。若当前 GitHub 套餐不支持 required reviewers，`workflow_dispatch` 本身仍保留手工发布步骤。
 
 原应用有部分仅基于用户名判断角色的接口，本次没有改变其业务鉴权逻辑。

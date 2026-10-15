@@ -36,6 +36,47 @@ data:
             proxy_buffering off;
         }
     }
+    server {
+        listen 443 ssl;
+        server_name feishu.fshencoding.cn;
+        ssl_certificate /etc/nginx/tls-feishu/tls.crt;
+        ssl_certificate_key /etc/nginx/tls-feishu/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        server_tokens off;
+        client_max_body_size 25m;
+        location / {
+            proxy_pass http://feishu-admin.feishu-agent.svc.cluster.local:8790;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+        }
+    }
+    server {
+        listen 443 ssl;
+        server_name sit.mockapi.fshencoding.cn;
+        ssl_certificate /etc/nginx/tls/tls.crt;
+        ssl_certificate_key /etc/nginx/tls/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        server_tokens off;
+        client_max_body_size 25m;
+        location / {
+            proxy_pass http://mockapi-sit:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+            proxy_buffering off;
+        }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -85,6 +126,12 @@ spec:
             - name: tls
               mountPath: /etc/nginx/tls
               readOnly: true
+            - name: tls-feishu
+              mountPath: /etc/nginx/tls-feishu
+              readOnly: true
+            - name: auth-feishu
+              mountPath: /etc/nginx/auth-feishu
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -92,3 +139,9 @@ spec:
         - name: tls
           secret:
             secretName: gateway-tls
+        - name: tls-feishu
+          secret:
+            secretName: gateway-feishu-tls
+        - name: auth-feishu
+          secret:
+            secretName: gateway-feishu-auth

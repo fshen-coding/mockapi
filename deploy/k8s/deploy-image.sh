@@ -2,16 +2,28 @@
 set -Eeuo pipefail
 
 readonly NAMESPACE="mockapi"
-readonly DEPLOYMENT="mockapi"
 readonly CONTAINER="mockapi"
 readonly ROLLOUT_TIMEOUT="1200s"
 readonly ROLLBACK_TIMEOUT="300s"
 
 image="${1:-}"
+target="${2:-production}"
+
 if [[ ! "$image" =~ ^ghcr\.io/fshen-coding/mockapi:sha-[0-9a-f]{40}$ ]]; then
   echo "Refusing unexpected image: $image" >&2
   exit 64
 fi
+
+case "$target" in
+  production) DEPLOYMENT="mockapi" ;;
+  sit) DEPLOYMENT="mockapi-sit" ;;
+  *)
+    echo "Refusing unexpected target: $target" >&2
+    exit 64
+    ;;
+esac
+readonly DEPLOYMENT
+readonly APP_LABEL="app=$DEPLOYMENT"
 
 previous_image="$(kubectl -n "$NAMESPACE" get deployment "$DEPLOYMENT" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].image}")"
 previous_pull_policy="$(kubectl -n "$NAMESPACE" get deployment "$DEPLOYMENT" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].imagePullPolicy}")"
@@ -31,18 +43,18 @@ print_rollout_diagnostics() {
   echo "--- deployment ---" >&2
   kubectl -n "$NAMESPACE" get deployment "$DEPLOYMENT" -o wide >&2 || true
   echo "--- pods ---" >&2
-  kubectl -n "$NAMESPACE" get pods -l app=mockapi -o wide >&2 || true
+  kubectl -n "$NAMESPACE" get pods -l "$APP_LABEL" -o wide >&2 || true
   echo "--- recent events ---" >&2
   kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -40 >&2 || true
   echo "--- container logs ---" >&2
-  kubectl -n "$NAMESPACE" logs -l app=mockapi --all-containers=true --tail=200 >&2 || true
+  kubectl -n "$NAMESPACE" logs -l "$APP_LABEL" --all-containers=true --tail=200 >&2 || true
 }
 
-echo "Deploying $image (current: $previous_image)"
+echo "Deploying $image to $target/$DEPLOYMENT (current: $previous_image)"
 patch_image "$image" "IfNotPresent"
 
 if kubectl -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout="$ROLLOUT_TIMEOUT"; then
-  kubectl -n "$NAMESPACE" get pods -l app=mockapi -o wide
+  kubectl -n "$NAMESPACE" get pods -l "$APP_LABEL" -o wide
   exit 0
 fi
 
