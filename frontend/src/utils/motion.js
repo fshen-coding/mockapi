@@ -4,7 +4,7 @@ import { ScrollTrigger } from 'gsap/ScrollTrigger'
 gsap.registerPlugin(ScrollTrigger)
 
 const VIEW_ROOTS = '.tool-page-view, .workspace-grid, .interface-test-view, .ai-page-view'
-const REVEAL_TARGETS = '.surface-card, .prompt-template-card, .environment-card, .usage-log-stat, .operation-row'
+const REVEAL_TARGETS = '.surface-card, .prompt-template-card, .environment-card, .usage-log-stat'
 
 export const prefersReducedMotion = () =>
   typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -13,6 +13,15 @@ let motionContext = null
 let revealTriggers = []
 let revealTargets = []
 let refreshFrame = 0
+let layoutObserver = null
+
+function scheduleRefresh() {
+  if (refreshFrame) return
+  refreshFrame = requestAnimationFrame(() => {
+    refreshFrame = 0
+    ScrollTrigger.refresh()
+  })
+}
 
 function killReveals() {
   revealTriggers.forEach((trigger) => trigger.kill())
@@ -21,6 +30,8 @@ function killReveals() {
   revealTargets = []
   motionContext?.revert()
   motionContext = null
+  layoutObserver?.disconnect()
+  layoutObserver = null
   if (refreshFrame) cancelAnimationFrame(refreshFrame)
   refreshFrame = 0
 }
@@ -55,10 +66,12 @@ export function playViewEnter(scope) {
     })
   }, view)
 
-  refreshFrame = requestAnimationFrame(() => {
-    refreshFrame = 0
-    ScrollTrigger.refresh()
-  })
+  // 面板展开/收起会改变页面高度，触发位置必须随之重算，否则移回视口的元素会一直保持隐藏。
+  if (revealTriggers.length && typeof ResizeObserver !== 'undefined') {
+    layoutObserver = new ResizeObserver(scheduleRefresh)
+    layoutObserver.observe(view)
+  }
+  scheduleRefresh()
 }
 
 // 卡片聚光：把指针位置写进 CSS 变量，由 style.css 里的 ::before 渲染光斑。
