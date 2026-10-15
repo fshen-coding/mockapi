@@ -1,0 +1,723 @@
+/*
+ * 视觉覆盖层：按 taste-skill 的产品界面规则（minimalist/soft）收敛排版、配色和卡片。
+ * 只覆盖样式，放在 style.css 之后加载；删掉 main.js 里的引入即可回退。
+ */
+
+:root {
+  --font-sans: 'Geist Variable', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-serif: 'Instrument Serif', 'Songti SC', 'STSong', serif;
+  --font-mono: 'Geist Mono Variable', 'Cascadia Code', Consolas, monospace;
+
+  --ink: #111111;
+  --ink-soft: #2f3437;
+  --ink-muted: #787774;
+  --paper: #fbfbfa;
+  --paper-warm: #f7f6f3;
+  --hairline: #eaeaea;
+  --accent: #1f6c9f;
+  --accent-soft: #e1f3fe;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --text: var(--ink-soft);
+  --muted: var(--ink-muted);
+  --line: var(--hairline);
+  --el-color-primary: #1f6c9f;
+  --el-font-family: var(--font-sans);
+  --el-border-radius-base: 6px;
+
+  font-family: var(--font-sans);
+  background: var(--paper);
+  letter-spacing: -0.005em;
+}
+
+:root.mockapi-dark {
+  --ink: #f2f1ee;
+  --ink-soft: #d9d7d2;
+  --ink-muted: #96938d;
+  --paper: #0f0f0e;
+  --paper-warm: #161614;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --accent: #7cc4f0;
+  --accent-soft: rgba(124, 196, 240, 0.12);
+  background: var(--paper);
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink-soft);
+  line-height: 1.6;
+}
+
+/* 页面背景：极淡的暖色光斑，避免大片纯色空底 */
+.app-shell:not(:has(.login-view))::before {
+  background:
+    radial-gradient(900px circle at 12% -10%, rgba(214, 178, 120, 0.06), transparent 60%),
+    radial-gradient(700px circle at 100% 20%, rgba(31, 108, 159, 0.04), transparent 60%),
+    var(--paper) !important;
+}
+
+pre,
+code,
+kbd,
+.status-card code {
+  font-family: var(--font-mono);
+}
+
+/* ---- Hero：白蓝渐变底 + 深蓝标题，Aurora 只做氛围 ---- */
+.hero-panel {
+  border-radius: 16px;
+  background: linear-gradient(135deg, #ffffff 0%, #eff6ff 45%, #dbeafe 100%);
+  color: #0f2a4a;
+  box-shadow: 0 12px 32px rgba(37, 99, 235, 0.08);
+  border: 1px solid #dbe7f7;
+}
+
+.hero-panel::before {
+  inset: 0;
+  border-radius: inherit;
+  border: 0;
+  background-color: transparent;
+  background-image:
+    linear-gradient(rgba(37, 99, 235, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 99, 235, 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 70% 40%, #000 15%, transparent 70%);
+  backdrop-filter: none;
+}
+
+.hero-panel::after {
+  background: radial-gradient(circle, rgba(96, 165, 250, 0.22) 0%, transparent 65%);
+}
+
+.hero-aurora {
+  opacity: 0.45;
+  mix-blend-mode: multiply !important;
+}
+
+.theme-dark .hero-panel {
+  background: linear-gradient(135deg, #0f1b2d 0%, #12243d 55%, #173257 100%);
+  color: #e6efff;
+  border-color: rgba(148, 197, 255, 0.14);
+  box-shadow: none;
+}
+
+.theme-dark .hero-aurora {
+  mix-blend-mode: screen !important;
+}
+
+/* Instrument Serif 没有中文字形，"操作台"会回落到宋体，中西文混排很割裂，标题统一走无衬线 */
+.hero-panel h1,
+.hero-panel .hero-title {
+  font-family: 'Geist Variable', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+  font-weight: 650;
+  font-size: clamp(34px, 3.6vw, 52px);
+  line-height: 1.12;
+  letter-spacing: -0.03em;
+  color: #0b2547;
+  font-variation-settings: 'wght' 650;
+  text-rendering: optimizeLegibility;
+  text-shadow: none;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'ss01', 'cv11';
+}
+
+/* ---- Hero 背景动画：三团蓝色光斑缓慢漂移 + 一道斜向扫光 ---- */
+.hero-panel .hero-orbs {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.hero-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(48px);
+  opacity: 0.55;
+  will-change: transform;
+}
+
+.hero-orb.orb-a {
+  width: 420px;
+  height: 420px;
+  top: -160px;
+  right: 8%;
+  background: radial-gradient(circle, #93c5fd 0%, transparent 70%);
+  animation: hero-orb-a 18s ease-in-out infinite alternate;
+}
+
+.hero-orb.orb-b {
+  width: 360px;
+  height: 360px;
+  bottom: -180px;
+  left: 18%;
+  background: radial-gradient(circle, #bfdbfe 0%, transparent 70%);
+  animation: hero-orb-b 22s ease-in-out infinite alternate;
+}
+
+.hero-orb.orb-c {
+  width: 260px;
+  height: 260px;
+  top: 10%;
+  right: 36%;
+  background: radial-gradient(circle, #a5b4fc 0%, transparent 70%);
+  opacity: 0.35;
+  animation: hero-orb-c 26s ease-in-out infinite alternate;
+}
+
+.hero-sweep {
+  position: absolute;
+  top: -50%;
+  left: -40%;
+  width: 40%;
+  height: 200%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
+  transform: rotate(18deg) translate3d(-100%, 0, 0);
+  animation: hero-sweep 9s ease-in-out 1.2s infinite;
+}
+
+@keyframes hero-orb-a {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(-120px, 60px, 0) scale(1.15); }
+}
+
+@keyframes hero-orb-b {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(160px, -40px, 0) scale(0.9); }
+}
+
+@keyframes hero-orb-c {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-80px, 50px, 0); }
+}
+
+@keyframes hero-sweep {
+  0%, 60% { transform: rotate(18deg) translate3d(-100%, 0, 0); }
+  100%    { transform: rotate(18deg) translate3d(420%, 0, 0); }
+}
+
+.theme-dark .hero-orb { opacity: 0.22; }
+.theme-dark .hero-sweep { background: linear-gradient(90deg, transparent, rgba(148, 197, 255, 0.12), transparent); }
+
+/* ---- 标题：英文深蓝、中文蓝色渐变，逐字模糊浮现 ---- */
+.hero-title-latin,
+.hero-title-accent {
+  display: inline-block;
+}
+
+/* 入场动画只用 backwards 填充：结束后不再占用 transform/filter，留给鼠标互动 */
+.hero-char {
+  --p: 0;
+  display: inline-block;
+  animation: hero-char-in 800ms var(--ease-out-expo) backwards;
+  animation-delay: calc(var(--i) * 34ms + 80ms);
+  transform: translate3d(0, calc(var(--p) * -0.14em), 0) scale(calc(1 + var(--p) * 0.16));
+  color: color-mix(in srgb, #2563eb calc(var(--p) * 100%), #0b2547);
+  text-shadow: 0 0 calc(var(--p) * 18px) rgba(37, 99, 235, calc(var(--p) * 0.45));
+  transition:
+    transform 260ms var(--ease-out-expo),
+    color 260ms ease,
+    text-shadow 260ms ease,
+    filter 260ms ease;
+}
+
+.hero-panel .hero-title {
+  cursor: default;
+  user-select: none;
+}
+
+.theme-dark .hero-char {
+  color: color-mix(in srgb, #93c5fd calc(var(--p) * 100%), #f1f6ff);
+  text-shadow: 0 0 calc(var(--p) * 20px) rgba(147, 197, 253, calc(var(--p) * 0.55));
+}
+
+.hero-title-accent {
+  margin-left: 0.12em;
+  font-weight: 700;
+}
+
+.hero-title-accent .hero-char {
+  background: linear-gradient(120deg, #1d4ed8 0%, #2563eb 40%, #38bdf8 100%);
+  background-size: 300% 100%;
+  background-position: calc(var(--j) * 50%) 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: none;
+  filter: drop-shadow(0 0 calc(var(--p) * 14px) rgba(56, 189, 248, calc(var(--p) * 0.6)));
+  animation:
+    hero-char-in 800ms var(--ease-out-expo) backwards,
+    hero-accent-flow 6s ease-in-out 1.4s infinite alternate;
+  animation-delay: calc(var(--i) * 34ms + 80ms), 1.4s;
+}
+
+@keyframes hero-char-in {
+  from { opacity: 0; transform: translate3d(0, 0.5em, 0); filter: blur(8px); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); filter: blur(0); }
+}
+
+@keyframes hero-accent-flow {
+  from { background-position: 0% 0; }
+  to   { background-position: 100% 0; }
+}
+
+.theme-dark .hero-title-accent .hero-char {
+  color: transparent;
+  text-shadow: none;
+  background-image: linear-gradient(120deg, #93c5fd 0%, #60a5fa 45%, #7dd3fc 100%);
+}
+
+/* 说明文字里的英文术语用等宽字体做轻量标记 */
+.hero-term {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #1e4f8f;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.theme-dark .hero-term {
+  background: rgba(148, 197, 255, 0.12);
+  color: #bfdbfe;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-orb,
+  .hero-sweep,
+  .hero-char,
+  .hero-title-accent .hero-char {
+    animation: none;
+    transition: none;
+  }
+  .hero-sweep { display: none; }
+}
+
+.hero-copy {
+  max-width: 640px;
+  margin-top: 16px;
+  color: #4a6080;
+  font-family: 'Geist Variable', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.75;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+.theme-dark .hero-panel h1,
+.theme-dark .hero-panel .hero-title {
+  color: #f1f6ff;
+}
+
+.theme-dark .hero-copy {
+  color: rgba(214, 228, 248, 0.7);
+}
+
+/* 标题逐字出现后，说明文字淡入上浮 */
+@keyframes hero-rise {
+  from { opacity: 0; transform: translate3d(0, 10px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+.hero-intro .hero-copy {
+  animation: hero-rise 700ms var(--ease-out-expo) 420ms both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-intro .hero-copy {
+    animation: none;
+  }
+}
+
+.hero-action {
+  border-radius: 6px;
+  border-color: #cfe0f5;
+  background: rgba(255, 255, 255, 0.7);
+  color: #0f2a4a;
+  backdrop-filter: none;
+}
+
+.hero-action:hover,
+.hero-action.active {
+  background: #ffffff;
+}
+
+.hero-action span {
+  font-weight: 500;
+}
+
+/* ---- 卡片：1px 细线、小圆角、几乎无阴影 ---- */
+.surface-card,
+.prompt-template-card,
+.environment-card {
+  border: 1px solid var(--hairline) !important;
+  border-radius: 12px !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  transition: box-shadow 200ms ease, border-color 200ms ease;
+}
+
+.surface-card:hover,
+.prompt-template-card:hover,
+.environment-card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04) !important;
+}
+
+.theme-dark .surface-card,
+.theme-dark .prompt-template-card,
+.theme-dark .environment-card {
+  background: var(--paper-warm) !important;
+}
+
+.surface-card .el-card__header {
+  background: transparent;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.theme-dark .surface-card .el-card__header {
+  background: transparent;
+  border-bottom-color: var(--hairline);
+}
+
+.surface-card::before,
+.prompt-template-card::before,
+.environment-card::before {
+  background: radial-gradient(360px circle at var(--spot-x, 50%) var(--spot-y, 50%), rgba(31, 108, 159, 0.05), transparent 60%);
+}
+
+.theme-dark .surface-card::before,
+.theme-dark .prompt-template-card::before,
+.theme-dark .environment-card::before {
+  background: radial-gradient(360px circle at var(--spot-x, 50%) var(--spot-y, 50%), rgba(124, 196, 240, 0.07), transparent 60%);
+}
+
+.card-head h2,
+.card-head h3,
+.tool-page-view h2 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+/* ---- 侧栏 ---- */
+.side-tool-action {
+  border-radius: 6px;
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.side-tool-action::before {
+  background: var(--ink);
+}
+
+/* ---- Element Plus 主按钮：墨色实心 ---- */
+.el-button--primary:not(.is-plain):not(.is-link):not(.is-text) {
+  --el-button-bg-color: var(--ink);
+  --el-button-border-color: var(--ink);
+  --el-button-hover-bg-color: #333333;
+  --el-button-hover-border-color: #333333;
+  --el-button-active-bg-color: #000000;
+  --el-button-text-color: #ffffff;
+  border-radius: 6px;
+}
+
+.theme-dark .el-button--primary:not(.is-plain):not(.is-link):not(.is-text) {
+  --el-button-bg-color: #f2f1ee;
+  --el-button-border-color: #f2f1ee;
+  --el-button-hover-bg-color: #ffffff;
+  --el-button-text-color: #111111;
+}
+
+.el-button:active {
+  transform: scale(0.98);
+}
+
+.el-tag {
+  border-radius: 9999px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .el-button:active { transform: none; }
+}
+
+/* 导航转场快速收放，内容本身仍可立即阅读和操作。 */
+.view-transition-stage {
+  min-width: 0;
+}
+
+.view-transition-enter-active,
+.view-transition-leave-active {
+  transition: opacity 180ms ease, transform 240ms var(--ease-out-expo);
+}
+
+.view-transition-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.view-transition-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-transition-enter-active,
+  .view-transition-leave-active {
+    transition: none;
+  }
+
+  .surface-card::before,
+  .prompt-template-card::before,
+  .environment-card::before {
+    transition: none;
+  }
+}
+
+/* ---- 登录页：鼠标驱动的卡片 3D 倾斜、跟随高光与远景视差 ---- */
+.login-scene {
+  --tilt-x: 0deg;
+  --tilt-y: 0deg;
+  --para-x: 0px;
+  --para-y: 0px;
+  --glow-x: 50%;
+  --glow-y: 30%;
+}
+
+
+/* ---- 登录页：卡片随鼠标 3D 倾斜 + 跟随高光 + 背景视差 ---- */
+.login-scene {
+  --tilt-x: 0deg;
+  --tilt-y: 0deg;
+  --glow-x: 50%;
+  --glow-y: 50%;
+  --para-x: 0px;
+  --para-y: 0px;
+}
+
+.login-area {}
+
+/* 不对卡片做 3D 旋转：rotateX/rotateY 叠加 backdrop-filter 会让浏览器的点击命中区域偏移，输入框点不中 */
+.login-card-outer {
+  position: relative;
+}
+
+.login-card-outer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(420px circle at var(--glow-x) var(--glow-y), rgba(255, 255, 255, 0.55), transparent 45%);
+  opacity: 0;
+  transition: opacity 300ms ease;
+  mix-blend-mode: soft-light;
+}
+
+.login-scene:hover .login-card-outer::after {
+  opacity: 1;
+}
+
+.login-skyscape__mountain--mid,
+.login-skyscape__mountain--near,
+.login-skyscape__mountain--front {
+  transition: translate 600ms var(--ease-out-expo, cubic-bezier(0.16, 1, 0.3, 1));
+}
+.login-skyscape__mountain--mid   { translate: calc(var(--para-x) * 0.3) calc(var(--para-y) * 0.3); }
+.login-skyscape__mountain--near  { translate: calc(var(--para-x) * 0.6) calc(var(--para-y) * 0.6); }
+.login-skyscape__mountain--front { translate: var(--para-x) var(--para-y); }
+
+@media (prefers-reduced-motion: reduce) {
+  .login-card-outer { transform: none; transition: none; }
+  .login-card-outer::after { display: none; }
+  .login-skyscape__mountain--mid,
+  .login-skyscape__mountain--near,
+  .login-skyscape__mountain--front { translate: none; }
+}
+
+/* ===== 登录页（参考设计稿）：左侧品牌 + 右侧玻璃卡片，背景为 3D 节点网络 ===== */
+.login-view { background: #eef2fb; }
+.theme-dark .login-view { background: #0b1424; }
+
+.login-scene {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
+  align-items: center;
+  gap: clamp(24px, 6vw, 120px);
+  padding: 0 clamp(24px, 8vw, 150px);
+}
+
+.login-mist {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 50% at 18% 20%, rgba(255, 255, 255, 0.9), transparent 70%),
+    radial-gradient(50% 45% at 85% 75%, rgba(167, 139, 250, 0.16), transparent 70%),
+    linear-gradient(180deg, #f4f6fc 0%, #e8eefa 100%);
+}
+.theme-dark .login-mist {
+  background:
+    radial-gradient(60% 50% at 18% 20%, rgba(59, 130, 246, 0.16), transparent 70%),
+    radial-gradient(50% 45% at 85% 75%, rgba(124, 108, 240, 0.16), transparent 70%),
+    linear-gradient(180deg, #0d1729 0%, #0a1322 100%);
+}
+
+.login-brand {
+  position: relative;
+  z-index: 2;
+  align-self: center;
+  margin-top: -8vh;
+  transform: translate3d(calc(var(--para-x) * -0.4), calc(var(--para-y) * -0.4), 0);
+  transition: transform 600ms var(--ease-out-expo, cubic-bezier(0.16, 1, 0.3, 1));
+  pointer-events: none;
+}
+.login-brand {
+  max-width: 560px;
+}
+/* 品牌字：整体用 Geist 无衬线，api 只换成渐变色作为点缀 */
+.login-brand__name {
+  margin: 0 0 0 -0.04em;
+  font-family: 'Geist Variable', 'Segoe UI', sans-serif;
+  font-size: clamp(68px, 8.8vw, 144px);
+  font-weight: 640;
+  font-variation-settings: 'wght' 640;
+  line-height: 0.92;
+  letter-spacing: -0.05em;
+  color: #0f1f3d;
+  white-space: nowrap;
+}
+.login-brand__name span {
+  display: inline-block;
+}
+.login-brand__tagline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 26px 0 0;
+  font-family: 'Geist Variable', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: clamp(15px, 1.25vw, 19px);
+  font-weight: 500;
+  letter-spacing: 0.42em;
+  color: #3b4a66;
+}
+.login-brand__rule {
+  flex: none;
+  width: 44px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #1f5fe0, #8b6cf6);
+}
+.theme-dark .login-brand__name { color: #eef3ff; }
+.theme-dark .login-brand__tagline { color: rgba(214, 228, 248, 0.78); }
+.theme-dark .login-brand__rule { background: linear-gradient(90deg, #7fb0ff, #b9a4ff); }
+
+.login-scene .login-area {
+  justify-self: end;
+  width: 100%;
+  max-width: 460px;
+  margin: 0;
+}
+
+.login-scene .login-card-outer {
+  padding: 0;
+  border-radius: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.62), rgba(236, 242, 252, 0.42));
+  box-shadow:
+    0 40px 90px rgba(46, 76, 140, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+}
+.login-scene .login-card-inner {
+  padding: clamp(36px, 5vh, 56px) clamp(28px, 3vw, 44px);
+  background: transparent;
+  box-shadow: none;
+  border: 0;
+}
+.login-scene .login-title {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #111827;
+}
+.login-scene .login-subtitle { margin-top: 10px; color: #4b5563; font-size: 15px; }
+.login-scene .login-card-head { margin-bottom: 30px; }
+
+/* 下划线式输入框 */
+.login-scene .login-form .el-form-item__label { display: none; }
+.login-scene .login-form .captcha-item .el-form-item__label {
+  display: block;
+  margin-bottom: 6px;
+  color: #374151;
+  font-size: 14px;
+  font-weight: 600;
+}
+.theme-dark .login-scene .login-form .captcha-item .el-form-item__label { color: rgba(214, 228, 248, 0.85); }
+.login-scene .login-form .el-form-item { margin-bottom: 22px; }
+.login-scene .login-form .el-input__wrapper {
+  min-height: 52px;
+  padding: 0 2px;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  border-bottom: 1px solid rgba(100, 116, 139, 0.35);
+  transition: border-color 200ms ease;
+}
+.login-scene .login-form .el-input__wrapper:hover { box-shadow: none; border-bottom-color: rgba(100, 116, 139, 0.6); }
+.login-scene .login-form .el-input__wrapper.is-focus { box-shadow: 0 1px 0 0 #1f5fe0; border-bottom-color: #1f5fe0; }
+.login-scene .login-form .el-input__inner { font-size: 16px; color: #111827; }
+.login-scene .login-form .el-input__inner::placeholder { color: #6b7280; }
+
+.login-scene .login-meta-row { margin: 8px 0 28px; }
+.login-scene .login-forgot { color: #1f5fe0; }
+
+.login-scene .login-main-button.el-button {
+  height: 54px;
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #2f6bea 0%, #1f55d6 100%);
+  box-shadow: 0 14px 30px rgba(31, 85, 214, 0.32);
+  font-size: 17px;
+  letter-spacing: 0.08em;
+}
+.login-scene .login-main-button.el-button:hover {
+  background: linear-gradient(180deg, #3a77f0 0%, #2560e0 100%);
+  box-shadow: 0 18px 36px rgba(31, 85, 214, 0.4);
+}
+.login-scene .login-secure-pill { display: none; }
+.login-scene .login-switch { margin-top: 22px; text-align: center; color: #374151; }
+.login-scene .login-switch button { color: #1f5fe0; }
+
+.theme-dark .login-scene .login-card-outer {
+  border-color: rgba(148, 197, 255, 0.18);
+  background: linear-gradient(160deg, rgba(22, 36, 62, 0.72), rgba(12, 22, 40, 0.55));
+  box-shadow: 0 40px 90px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(148, 197, 255, 0.12);
+}
+.theme-dark .login-scene .login-title { color: #eef3ff; }
+.theme-dark .login-scene .login-subtitle,
+.theme-dark .login-scene .login-switch { color: rgba(214, 228, 248, 0.72); }
+.theme-dark .login-scene .login-form .el-input__wrapper { background: transparent; border-bottom-color: rgba(148, 197, 255, 0.25); }
+.theme-dark .login-scene .login-form .el-input__inner { color: #eef3ff; }
+
+@media (max-width: 900px) {
+  .login-scene { grid-template-columns: 1fr; padding: 32px 20px; gap: 28px; align-content: center; }
+  .login-brand { margin-top: 0; text-align: center; }
+  .login-brand__name { font-size: 64px; }
+  .login-brand__tagline { justify-content: center; }
+  .login-scene .login-area { justify-self: center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-brand { transform: none; transition: none; }
+  .login-brand__name span, .login-brand__tagline { animation: none; }
+}

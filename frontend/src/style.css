@@ -100,38 +100,6 @@ pre {
   display: none;
 }
 
-.console-skyscape {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  overflow: hidden;
-}
-
-.console-skyscape__mountain {
-  position: absolute;
-  inset-inline: 0;
-  bottom: 0;
-}
-
-.console-skyscape__mountain--haze {
-  height: 43%;
-  background: #b3d5fb;
-  clip-path: polygon(0 44%, 9% 38%, 17% 52%, 29% 40%, 39% 57%, 50% 47%, 61% 58%, 73% 36%, 85% 50%, 95% 34%, 100% 38%, 100% 100%, 0 100%);
-}
-
-.console-skyscape__mountain--mid {
-  height: 39%;
-  background: #65b7ef;
-  clip-path: polygon(0 53%, 8% 43%, 19% 49%, 29% 26%, 38% 47%, 50% 63%, 61% 49%, 73% 55%, 87% 31%, 100% 45%, 100% 100%, 0 100%);
-}
-
-.console-skyscape__mountain--near {
-  height: 29%;
-  background: rgba(7, 91, 144, 0.9);
-  clip-path: polygon(0 64%, 10% 54%, 22% 70%, 32% 59%, 43% 75%, 52% 62%, 63% 69%, 76% 56%, 88% 72%, 100% 58%, 100% 100%, 0 100%);
-}
-
 .theme-dark .app-shell::before {
   background: linear-gradient(180deg, #061226 0%, #0d2548 34%, #16335f 58%, #0a1c3a 100%);
 }
@@ -142,9 +110,6 @@ pre {
     radial-gradient(circle at 82% 10%, rgba(125, 165, 255, 0.1), transparent 24%);
 }
 
-.theme-dark .console-skyscape__mountain--haze { background: #1e3a66; }
-.theme-dark .console-skyscape__mountain--mid { background: #163566; }
-.theme-dark .console-skyscape__mountain--near { background: rgba(11, 31, 60, 0.95); }
 
 .app-shell {
   width: min(1520px, calc(100% - 32px));
@@ -314,18 +279,26 @@ pre {
   opacity: 0;
   transform: translateY(-1rem);
   pointer-events: none;
+  visibility: hidden;
+}
+
+.login-access,
+.login-register {
+  transition: opacity 0.4s ease, transform 0.4s ease, visibility 0.4s;
 }
 
 .login-scene.active .login-access {
   opacity: 0;
   transform: translateY(-1rem);
   pointer-events: none;
+  visibility: hidden;
 }
 
 .login-scene.active .login-register {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
+  visibility: visible;
 }
 
 .login-card-outer {
@@ -1796,6 +1769,13 @@ pre {
 .log-system-head .head-copy,
 .tool-page-head .head-copy {
   min-width: 0;
+}
+
+.page-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
 }
 
 .log-system-head h2,
@@ -6287,7 +6267,7 @@ pre {
   min-height: 66px;
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
-  background: #ffffff;
+  background: var(--surface-strong);
 }
 
 .scenario-title-block {
@@ -6351,6 +6331,14 @@ pre {
 
 .scenario-tabs button.active {
   color: #7e409b;
+}
+
+.theme-dark .scenario-tabs button.active {
+  color: #d6a8f0;
+}
+
+.theme-dark .scenario-tabs button.active::after {
+  background: #d6a8f0;
 }
 
 .scenario-tabs button.active::after {
@@ -8477,6 +8465,14 @@ pre {
 
 /* ── User management view ────────────────────────────────────────── */
 
+@media (max-width: 1023px) {
+  .app-shell.rail-open {
+    position: relative;
+    left: 0;
+    width: min(1520px, calc(100% - 32px));
+  }
+}
+
 .user-management-view .surface-card .el-card__body {
   padding: 0;
 }
@@ -8747,4 +8743,95 @@ pre {
 
 .mockapi-dark .register-review-icon-wrap.rejected {
   background: rgba(192, 57, 43, 0.18);
+}
+
+.page-error {
+  margin: 0 0 12px;
+}
+
+/* ---- 动效层：Aurora 背景、标题 3D 拆字、卡片聚光 ---- */
+.hero-aurora {
+  position: absolute !important;
+  inset: 0;
+  z-index: 0 !important;
+  border-radius: inherit;
+  overflow: hidden;
+  opacity: 0.75;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+.split-parent {
+  display: inline-block;
+  overflow: hidden;
+  white-space: normal;
+}
+
+.hero-panel h1.split-parent {
+  display: block;
+  perspective: 600px;
+}
+
+.hero-panel .split-char {
+  transform-origin: 50% 100%;
+}
+
+.surface-card,
+.prompt-template-card,
+.environment-card {
+  position: relative;
+}
+
+.surface-card::before,
+.prompt-template-card::before,
+.environment-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background: radial-gradient(420px circle at var(--spot-x, 50%) var(--spot-y, 50%), rgba(99, 102, 241, 0.12), transparent 60%);
+  opacity: 0;
+  transition: opacity 260ms ease;
+  pointer-events: none;
+}
+
+.surface-card:hover::before,
+.prompt-template-card:hover::before,
+.environment-card:hover::before {
+  opacity: 1;
+}
+
+.theme-dark .surface-card::before,
+.theme-dark .prompt-template-card::before,
+.theme-dark .environment-card::before {
+  background: radial-gradient(420px circle at var(--spot-x, 50%) var(--spot-y, 50%), rgba(56, 189, 248, 0.14), transparent 60%);
+}
+
+.side-tool-action,
+.hero-action {
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1), background-color 180ms ease, box-shadow 180ms ease;
+}
+
+.side-tool-action:hover,
+.hero-action:hover {
+  transform: translateY(-2px);
+}
+
+.side-tool-action:active,
+.hero-action:active {
+  transform: translateY(0) scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-panel::after { animation: none; }
+  .side-tool-action:hover,
+  .hero-action:hover { transform: none; }
+}
+
+.surface-card > *,
+.prompt-template-card > *,
+.environment-card > * {
+  position: relative;
+  z-index: 1;
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily MockAPI TLS certificate renewal check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+Unit=acme-renew.service
+
+[Install]
+WantedBy=timers.target
