@@ -3638,6 +3638,8 @@ watch(
       // Clear cached overrides on logout so the next user doesn't see them.
       Object.keys(scenarioStepOrders).forEach((key) => { delete scenarioStepOrders[key] })
       Object.keys(scenarioStepOrderDraft).forEach((key) => { delete scenarioStepOrderDraft[key] })
+      Object.keys(scenarioStepStructureDraft).forEach((key) => { delete scenarioStepStructureDraft[key] })
+      Object.keys(scenarioStepStructureDeleted).forEach((key) => { delete scenarioStepStructureDeleted[key] })
       Object.keys(scenarioStepMetaOverrides).forEach((key) => { delete scenarioStepMetaOverrides[key] })
       Object.keys(scenarioStepOverrides).forEach((key) => {
         delete scenarioStepOverrides[key]
@@ -5547,18 +5549,18 @@ async function handleScenarioSave() {
       scenarioStepOrders[scenarioKey] = draftOrder
       delete scenarioStepOrderDraft[scenarioKey]
     }
-    await saveScenarioStepOrder({
-      username: authUser.value.username,
-      scenario_key: `${scenarioKey}::structure`,
-      step_order: [
-        JSON.stringify({
-          added: scenarioStepStructureDraft[scenarioKey] || [],
-          deleted: scenarioStepStructureDeleted[scenarioKey] || [],
-        }),
-      ],
-    })
-    delete scenarioStepStructureDraft[scenarioKey]
-    delete scenarioStepStructureDeleted[scenarioKey]
+    if (isAdmin.value) {
+      await saveScenarioStepOrder({
+        username: authUser.value.username,
+        scenario_key: `${scenarioKey}::structure`,
+        step_order: [
+          JSON.stringify({
+            added: scenarioStepStructureDraft[scenarioKey] || [],
+            deleted: scenarioStepStructureDeleted[scenarioKey] || [],
+          }),
+        ],
+      })
+    }
     scenarioSaveState.value = `已保存 ${new Date().toLocaleTimeString()}`
     pushActivity('scenario', `${scenario.name} 已保存`, {
       scenario: scenario.name,
@@ -6537,6 +6539,8 @@ async function refreshScenarioStepOrders() {
     Object.keys(scenarioStepOrderDraft).forEach((key) => {
       delete scenarioStepOrderDraft[key]
     })
+    Object.keys(scenarioStepStructureDraft).forEach((key) => { delete scenarioStepStructureDraft[key] })
+    Object.keys(scenarioStepStructureDeleted).forEach((key) => { delete scenarioStepStructureDeleted[key] })
     if (Array.isArray(rows)) {
       for (const row of rows) {
         if (!row?.scenario_key) continue
