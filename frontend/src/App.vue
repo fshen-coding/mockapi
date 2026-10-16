@@ -120,7 +120,7 @@ const AiUiView = defineAsyncComponent(() => import('./views/AiUiView.vue'))
 const MockApiView = defineAsyncComponent(() => import('./views/MockApiView.vue'))
 const InterfaceTestView = defineAsyncComponent(() => import('./views/InterfaceTestView.vue'))
 const WorkflowScene = defineAsyncComponent(() => import('./components/bits/WorkflowScene.vue'))
-const heroTitleLatin = Array.from('Mock API ')
+const heroTitleLatin = Array.from('Mockapi ')
 const heroTitleAccent = Array.from('操作台')
 const heroTitleMotionReduced = typeof window !== 'undefined'
   && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
@@ -168,6 +168,7 @@ function onHeroTitleClick(event) {
   })
 }
 const LoginScene3D = defineAsyncComponent(() => import('./components/bits/LoginScene3D.vue'))
+const IntroSplash = defineAsyncComponent(() => import('./components/bits/IntroSplash.vue'))
 
 // 登录卡片随鼠标轻微 3D 倾斜，并在卡片上跟随一束高光
 let loginTiltFrame = 0
@@ -3637,6 +3638,8 @@ watch(
       // Clear cached overrides on logout so the next user doesn't see them.
       Object.keys(scenarioStepOrders).forEach((key) => { delete scenarioStepOrders[key] })
       Object.keys(scenarioStepOrderDraft).forEach((key) => { delete scenarioStepOrderDraft[key] })
+      Object.keys(scenarioStepStructureDraft).forEach((key) => { delete scenarioStepStructureDraft[key] })
+      Object.keys(scenarioStepStructureDeleted).forEach((key) => { delete scenarioStepStructureDeleted[key] })
       Object.keys(scenarioStepMetaOverrides).forEach((key) => { delete scenarioStepMetaOverrides[key] })
       Object.keys(scenarioStepOverrides).forEach((key) => {
         delete scenarioStepOverrides[key]
@@ -5546,18 +5549,18 @@ async function handleScenarioSave() {
       scenarioStepOrders[scenarioKey] = draftOrder
       delete scenarioStepOrderDraft[scenarioKey]
     }
-    await saveScenarioStepOrder({
-      username: authUser.value.username,
-      scenario_key: `${scenarioKey}::structure`,
-      step_order: [
-        JSON.stringify({
-          added: scenarioStepStructureDraft[scenarioKey] || [],
-          deleted: scenarioStepStructureDeleted[scenarioKey] || [],
-        }),
-      ],
-    })
-    delete scenarioStepStructureDraft[scenarioKey]
-    delete scenarioStepStructureDeleted[scenarioKey]
+    if (isAdmin.value) {
+      await saveScenarioStepOrder({
+        username: authUser.value.username,
+        scenario_key: `${scenarioKey}::structure`,
+        step_order: [
+          JSON.stringify({
+            added: scenarioStepStructureDraft[scenarioKey] || [],
+            deleted: scenarioStepStructureDeleted[scenarioKey] || [],
+          }),
+        ],
+      })
+    }
     scenarioSaveState.value = `已保存 ${new Date().toLocaleTimeString()}`
     pushActivity('scenario', `${scenario.name} 已保存`, {
       scenario: scenario.name,
@@ -6536,6 +6539,8 @@ async function refreshScenarioStepOrders() {
     Object.keys(scenarioStepOrderDraft).forEach((key) => {
       delete scenarioStepOrderDraft[key]
     })
+    Object.keys(scenarioStepStructureDraft).forEach((key) => { delete scenarioStepStructureDraft[key] })
+    Object.keys(scenarioStepStructureDeleted).forEach((key) => { delete scenarioStepStructureDeleted[key] })
     if (Array.isArray(rows)) {
       for (const row of rows) {
         if (!row?.scenario_key) continue
@@ -8415,6 +8420,7 @@ provide('consoleContext', {
     >
       <el-icon><Moon v-if="darkMode" /><Sunny v-else /></el-icon>
     </button>
+    <IntroSplash v-if="!isAuthenticated" />
     <section v-if="!isAuthenticated" class="login-view">
       <el-card shadow="never" class="login-panel">
         <div
@@ -8426,9 +8432,9 @@ provide('consoleContext', {
           <div class="login-mist" aria-hidden="true"></div>
           <LoginScene3D :key="darkMode ? 'dark' : 'light'" :dark="darkMode" />
           <div class="login-brand">
-            <h2 class="login-brand__name" aria-label="mockapi">
+            <h2 class="login-brand__name" aria-label="Mockapi">
               <span
-                v-for="(ch, i) in 'mockapi'"
+                v-for="(ch, i) in 'Mockapi'"
                 :key="i"
                 aria-hidden="true"
                 :style="{ '--i': i }"
@@ -8662,7 +8668,7 @@ provide('consoleContext', {
       <div class="hero-intro">
         <h1
           class="hero-title"
-          aria-label="Mock API 操作台"
+          aria-label="Mockapi 操作台"
           @pointermove="onHeroTitlePointerMove"
           @pointerleave="onHeroTitlePointerLeave"
           @click="onHeroTitleClick"
