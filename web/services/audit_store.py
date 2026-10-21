@@ -456,6 +456,16 @@ class AuditStore:
                     )
                     """
                 )
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS scenario_execution_history (
+                        username TEXT NOT NULL REFERENCES app_users(username) ON UPDATE CASCADE ON DELETE CASCADE,
+                        record_id TEXT NOT NULL,
+                        record JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (username, record_id)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_scenario_history_user_created ON scenario_execution_history(username, created_at DESC, record_id DESC)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_username ON user_sessions(username)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_phone ON user_sessions(phone_number)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_user_operations_session ON user_operations(session_id)")
@@ -1185,6 +1195,33 @@ class AuditStore:
                 (template_id,),
             )
         return result.rowcount > 0
+
+    def save_scenario_execution(self, username: str, record: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO scenario_execution_history (username, record_id, record)
+                   VALUES (%s, %s, %s::jsonb)
+                   ON CONFLICT (username, record_id) DO NOTHING""",
+                (username, record["id"], json.dumps(record, ensure_ascii=False)),
+            )
+
+    def list_scenario_executions(self, username: str, limit: int, offset: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT record - 'steps' - 'variables' - 'context' AS record
+                   FROM scenario_execution_history WHERE username = %s
+                   ORDER BY created_at DESC, record_id DESC LIMIT %s OFFSET %s""",
+                (username, limit, offset),
+            ).fetchall()
+        return [row["record"] for row in rows]
+
+    def get_scenario_execution(self, username: str, record_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT record FROM scenario_execution_history WHERE username = %s AND record_id = %s",
+                (username, record_id),
+            ).fetchone()
+        return row["record"] if row else None
 
     def list_scenario_step_overrides(self, username: str) -> list[dict[str, Any]]:
         if not self.enabled or not (username or "").strip():

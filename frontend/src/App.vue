@@ -49,6 +49,9 @@ import {
   fetchDrawdownRepaymentRows,
   fetchEnvironmentMonitor,
   fetchHealth,
+  fetchScenarioExecutionHistory,
+  fetchScenarioExecutionRecord,
+  saveScenarioExecutionRecord,
   fetchContactIssues,
   fetchApplicationCodes,
   fetchDowsureMerchantAccounts,
@@ -905,6 +908,11 @@ const mockOperationEditMode = ref(false)
 const mockOperationDragState = ref('')
 let mockOperationLongPressTimer = null
 const scenarioExecutionHistory = ref([])
+const scenarioHistoryLoading = ref(false)
+const scenarioHistoryError = ref('')
+const scenarioHistoryHasMore = ref(false)
+const pendingScenarioRecords = new Map()
+let scenarioHistoryRequest = 0
 const scenarioStepResults = reactive({})
 const scenarioStepSourceCache = reactive({})
 const scenarioStepSourceLoading = reactive({})
@@ -3597,7 +3605,11 @@ watch(filteredDebugInterfaceSteps, (steps) => {
   }
 })
 
-watch(scenarioExecutionHistory, persistScenarioExecutionHistory, { deep: true })
+watch([interfacePageMode, activeScenarioTab], () => {
+  if (interfacePageMode.value === 'report' || activeScenarioTab.value === 'history') {
+    void loadScenarioExecutionHistory()
+  }
+})
 
 onMounted(async () => {
   const savedTheme = window.localStorage.getItem('mockapi-theme')
@@ -3612,7 +3624,6 @@ onMounted(async () => {
   motionPreferenceQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
   motionPreferenceHandler = () => { reducedMotion.value = motionPreferenceQuery.matches }
   motionPreferenceQuery.addEventListener?.('change', motionPreferenceHandler)
-  restoreScenarioExecutionHistory()
   restoreAuthUser()
   disposeSpotlight = installSpotlight()
   loadContactIssues()
@@ -3628,7 +3639,15 @@ onMounted(async () => {
 watch(
   () => authUser.value?.username,
   (username) => {
+    scenarioHistoryRequest += 1
+    scenarioExecutionHistory.value = []
+    scenarioHistoryError.value = ''
+    scenarioHistoryHasMore.value = false
+    scenarioHistoryLoading.value = false
+    selectedScenarioHistoryRecord.value = null
+    scenarioHistoryDetailVisible.value = false
     if (username) {
+      void loadScenarioExecutionHistory()
       refreshScenarioStepOverrides()
       refreshScenarioMetaOverrides()
       refreshScenarioStepMetaOverrides()
@@ -5367,24 +5386,43 @@ async function copyResponseText(payload) {
   }
 }
 
-function restoreScenarioExecutionHistory() {
+async function loadScenarioExecutionHistory(append = false) {
+  const username = authUser.value?.username
+  if (!username || scenarioHistoryLoading.value) return
+  const request = ++scenarioHistoryRequest
+  scenarioHistoryLoading.value = true
+  scenarioHistoryError.value = ''
   try {
+    // Import the legacy browser cache once. Idempotent writes make retries safe.
     const raw = window.localStorage.getItem(scenarioHistoryStorageKey)
-    if (!raw) return
-    const parsed = JSON.parse(raw)
-    if (Array.isArray(parsed)) {
-      scenarioExecutionHistory.value = parsed
+    if (raw) {
+      let legacy = []
+      try { legacy = JSON.parse(raw) } catch { /* Ignore corrupt legacy data. */ }
+      if (Array.isArray(legacy)) {
+        for (const record of legacy.slice().reverse()) {
+          if (!record?.id || !record?.scenario || !record?.status) continue
+          await saveScenarioExecutionRecord(username, record)
+        }
+      }
+      window.localStorage.removeItem(scenarioHistoryStorageKey)
     }
+    for (const [key, pending] of pendingScenarioRecords) {
+      if (pending.username !== username) continue
+      await saveScenarioExecutionRecord(username, pending.record)
+      pendingScenarioRecords.delete(key)
+    }
+    const data = await fetchScenarioExecutionHistory({
+      username, limit: 100, offset: append ? scenarioExecutionHistory.value.length : 0,
+    })
+    if (request !== scenarioHistoryRequest || authUser.value?.username !== username) return
+    const items = append ? [...scenarioExecutionHistory.value, ...data.items] : data.items
+    scenarioExecutionHistory.value = [...new Map(items.map((item) => [item.id, item])).values()]
+    scenarioHistoryHasMore.value = data.has_more
   } catch (error) {
-    window.localStorage.removeItem(scenarioHistoryStorageKey)
-  }
-}
-
-function persistScenarioExecutionHistory() {
-  try {
-    window.localStorage.setItem(scenarioHistoryStorageKey, JSON.stringify(scenarioExecutionHistory.value))
-  } catch (error) {
-    pushActivity('error', '执行历史保存失败', normalizeError(error))
+    if (request !== scenarioHistoryRequest) return
+    scenarioHistoryError.value = `执行历史同步失败，请点击刷新重试：${normalizeError(error)}`
+  } finally {
+    if (request === scenarioHistoryRequest) scenarioHistoryLoading.value = false
   }
 }
 
@@ -5418,14 +5456,39 @@ function buildScenarioRunStepSnapshots(enabledSteps) {
   return enabledSteps.map((step) => buildScenarioStepSnapshot(step, step.enabled === false ? 'skipped' : 'idle'))
 }
 
-function addScenarioExecutionRecord(record) {
-  scenarioExecutionHistory.value = [record, ...scenarioExecutionHistory.value]
+async function addScenarioExecutionRecord(record, username = authUser.value?.username) {
+  const key = `${username}:${record.id}`
+  pendingScenarioRecords.set(key, { username, record })
+  try {
+    await saveScenarioExecutionRecord(username, record)
+    pendingScenarioRecords.delete(key)
+    if (authUser.value?.username === username) {
+      // Invalidate a list request that started before this record was saved.
+      scenarioHistoryRequest += 1
+      scenarioHistoryLoading.value = false
+      await loadScenarioExecutionHistory()
+    }
+  } catch (error) {
+    if (authUser.value?.username === username) {
+      scenarioExecutionHistory.value = [record, ...scenarioExecutionHistory.value]
+      scenarioHistoryError.value = '本次执行历史未保存到服务端，请点击刷新重试，成功前请勿关闭页面。'
+      ElMessage.error(scenarioHistoryError.value)
+    }
+  }
 }
 
-function openScenarioHistoryDetail(record) {
-  selectedScenarioHistoryRecord.value = record
-  scenarioHistoryDetailPayloadMode.value = 'mock'
-  scenarioHistoryDetailVisible.value = true
+async function openScenarioHistoryDetail(record) {
+  const username = authUser.value?.username
+  try {
+    const pending = pendingScenarioRecords.get(`${username}:${record.id}`)
+    const detail = pending?.record || await fetchScenarioExecutionRecord(record.id, username)
+    if (authUser.value?.username !== username) return
+    selectedScenarioHistoryRecord.value = detail
+    scenarioHistoryDetailPayloadMode.value = 'mock'
+    scenarioHistoryDetailVisible.value = true
+  } catch (error) {
+    ElMessage.error(`执行详情加载失败：${normalizeError(error)}`)
+  }
 }
 
 // Build a human-readable summary block for the scenario history drawer.
@@ -5596,9 +5659,10 @@ function handleScenarioAddStep() {
 
 async function handleScenarioServerExecute() {
   if (scenarioExecuting.value) return
+  const executionUsername = authUser.value?.username
   if (scenarioSettings.validateSession && !activeSessionId.value) {
     const record = {
-      id: `${Date.now()}`,
+      id: `${Date.now()}-${crypto.randomUUID()}`,
       scenario: activeInterfaceScenario.value.name,
       env: connectionForm.env,
       at: new Date().toLocaleString(),
@@ -5610,7 +5674,7 @@ async function handleScenarioServerExecute() {
       context: cloneScenarioPayload(latestScenarioRunContext.value),
       steps: buildScenarioRunStepSnapshots(interfaceAutomationSteps.value.filter((step) => step.enabled)),
     }
-    addScenarioExecutionRecord(record)
+    await addScenarioExecutionRecord(record, executionUsername)
     ElMessage.warning('执行前校验失败：请先连接 session')
     pushActivity('scenario', `${record.scenario} 执行前校验失败`, record)
     activeScenarioTab.value = 'history'
@@ -5737,7 +5801,7 @@ async function handleScenarioServerExecute() {
     }
 
     const record = {
-      id: `${Date.now()}`,
+      id: `${Date.now()}-${crypto.randomUUID()}`,
       scenario: activeInterfaceScenario.value.name,
       env: connectionForm.env,
       at: startedAt.toLocaleString(),
@@ -5750,7 +5814,7 @@ async function handleScenarioServerExecute() {
       variables: cloneScenarioPayload(scenarioVariables),
       steps: buildScenarioRunStepSnapshots(enabledSteps),
     }
-    addScenarioExecutionRecord(record)
+    await addScenarioExecutionRecord(record, executionUsername)
     activeScenarioTab.value = 'history'
     pushActivity('scenario', `${record.scenario} 服务端执行${record.status}`, record)
     ElMessage({
@@ -8300,6 +8364,10 @@ provide('interfaceTestContext', {
   scenarioDragState,
   scenarioExecuting,
   scenarioExecutionHistory,
+  scenarioHistoryLoading,
+  scenarioHistoryError,
+  scenarioHistoryHasMore,
+  loadScenarioExecutionHistory,
   scenarioMetaEditForm,
   scenarioMetaEditSaving,
   scenarioMetaEditVisible,

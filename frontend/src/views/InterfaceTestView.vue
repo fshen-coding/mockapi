@@ -79,6 +79,10 @@ const {
   scenarioDragState,
   scenarioExecuting,
   scenarioExecutionHistory,
+  scenarioHistoryLoading,
+  scenarioHistoryError,
+  scenarioHistoryHasMore,
+  loadScenarioExecutionHistory,
   scenarioMetaEditForm,
   scenarioMetaEditSaving,
   scenarioMetaEditVisible,
@@ -405,9 +409,12 @@ const {
       <section v-else-if="activeScenarioTab === 'history'" class="scenario-panel">
         <div class="scenario-panel-head">
           <strong>执行历史</strong>
-          <span>本机持续保留服务端执行记录。</span>
+          <span>执行记录保存在服务端，按当前账号加载。</span>
+          <el-button size="small" :loading="scenarioHistoryLoading" @click="loadScenarioExecutionHistory()">刷新</el-button>
         </div>
-        <div v-if="scenarioExecutionHistory.length === 0" class="scenario-empty">暂无执行历史。</div>
+        <div v-if="scenarioHistoryError" role="alert" class="scenario-empty">{{ scenarioHistoryError }}</div>
+        <div v-else-if="scenarioExecutionHistory.length === 0" class="scenario-empty">{{ scenarioHistoryLoading ? '加载执行历史中…' : '暂无执行历史。' }}</div>
+        <el-button v-if="scenarioHistoryHasMore" size="small" :loading="scenarioHistoryLoading" @click="loadScenarioExecutionHistory(true)">加载更多</el-button>
         <div v-for="item in scenarioExecutionHistory" :key="item.id" class="scenario-history-row">
           <el-tag :type="item.status === '完成' ? 'success' : item.status === '未执行' ? 'warning' : 'danger'" effect="plain">{{ item.status }}</el-tag>
           <strong>{{ item.scenario }}</strong>
@@ -910,9 +917,12 @@ const {
       <section v-else-if="interfacePageMode === 'report'" class="scenario-panel">
         <div class="scenario-panel-head">
           <strong>执行历史</strong>
-          <span>本机持续保留服务端执行记录。</span>
+          <span>执行记录保存在服务端，按当前账号加载。</span>
+          <el-button size="small" :loading="scenarioHistoryLoading" @click="loadScenarioExecutionHistory()">刷新</el-button>
         </div>
-        <div v-if="scenarioExecutionHistory.length === 0" class="scenario-empty">暂无执行历史。</div>
+        <div v-if="scenarioHistoryError" role="alert" class="scenario-empty">{{ scenarioHistoryError }}</div>
+        <div v-else-if="scenarioExecutionHistory.length === 0" class="scenario-empty">{{ scenarioHistoryLoading ? '加载执行历史中…' : '暂无执行历史。' }}</div>
+        <el-button v-if="scenarioHistoryHasMore" size="small" :loading="scenarioHistoryLoading" @click="loadScenarioExecutionHistory(true)">加载更多</el-button>
         <div v-for="item in scenarioExecutionHistory" :key="item.id" class="scenario-history-row">
           <el-tag :type="item.status === '完成' ? 'success' : item.status === '未执行' ? 'warning' : 'danger'" effect="plain">{{ item.status }}</el-tag>
           <strong>{{ item.scenario }}</strong>

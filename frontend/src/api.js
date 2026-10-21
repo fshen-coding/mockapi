@@ -45,6 +45,18 @@ export async function fetchHealth() {
   return response.data
 }
 
+export async function fetchScenarioExecutionHistory(params) {
+  return unwrap(await client.get('/api/scenario-overrides/execution-history', { params }))
+}
+
+export async function fetchScenarioExecutionRecord(id, username) {
+  return unwrap(await client.get(`/api/scenario-overrides/execution-history/${encodeURIComponent(id)}`, { params: { username } }))
+}
+
+export async function saveScenarioExecutionRecord(username, record) {
+  return unwrap(await client.post('/api/scenario-overrides/execution-history', { username, record }))
+}
+
 export async function fetchEnums() {
   const response = await client.get('/api/enums')
   return unwrap(response)
