@@ -18,7 +18,7 @@ import re
 import textwrap
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from web.models.responses import ApiResponse
@@ -50,6 +50,43 @@ class ScenarioOverrideUpsertRequest(BaseModel):
     scenario_key: str = Field(..., min_length=1, max_length=120)
     step_key: str = Field(..., min_length=1, max_length=200)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScenarioExecutionRecord(BaseModel):
+    model_config = {"extra": "allow"}
+    id: str = Field(..., min_length=1, max_length=160)
+    scenario: str = Field(..., min_length=1, max_length=200)
+    status: str = Field(..., min_length=1, max_length=40)
+
+
+class ScenarioExecutionSaveRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=120)
+    record: ScenarioExecutionRecord
+
+
+@router.get("/execution-history", response_model=ApiResponse)
+async def list_scenario_execution_history(
+    username: str, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0),
+):
+    caller = require_valid_username(username)
+    rows = await asyncio.to_thread(audit_store.list_scenario_executions, caller, limit + 1, offset)
+    return ApiResponse(success=True, message="执行历史加载成功", data={"items": rows[:limit], "has_more": len(rows) > limit})
+
+
+@router.post("/execution-history", response_model=ApiResponse)
+async def save_scenario_execution_history(req: ScenarioExecutionSaveRequest):
+    caller = require_valid_username(req.username)
+    await asyncio.to_thread(audit_store.save_scenario_execution, caller, req.record.model_dump())
+    return ApiResponse(success=True, message="执行历史保存成功", data={"id": req.record.id})
+
+
+@router.get("/execution-history/{record_id}", response_model=ApiResponse)
+async def get_scenario_execution_history(record_id: str, username: str):
+    caller = require_valid_username(username)
+    record = await asyncio.to_thread(audit_store.get_scenario_execution, caller, record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    return ApiResponse(success=True, message="执行详情加载成功", data=record)
 
 
 class ScenarioOverrideDeleteRequest(BaseModel):
