@@ -8488,7 +8488,7 @@ provide('consoleContext', {
     >
       <el-icon><Moon v-if="darkMode" /><Sunny v-else /></el-icon>
     </button>
-    <IntroSplash v-if="!isAuthenticated" />
+    <IntroSplash v-if="!isAuthenticated" :dark="darkMode" />
     <section v-if="!isAuthenticated" class="login-view">
       <el-card shadow="never" class="login-panel">
         <div
